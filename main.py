@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import shlex
 import ssl
 import subprocess
 import tempfile
@@ -18,7 +20,7 @@ API_BASE = "https://api.elevenlabs.io/v1"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 PLACEHOLDER_TEXT = "Paste text here (⌘V)..."
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Redcupss/sonoscript/main/latest.json"
 
 
@@ -44,6 +46,7 @@ def save_config(config):
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f)
+    os.chmod(CONFIG_PATH, 0o600)
 
 
 class HoverButton(AppKit.NSButton):
@@ -621,6 +624,7 @@ class AppDelegate(NSObject):
             "available": version_tuple(remote_version) > version_tuple(APP_VERSION),
             "version": remote_version,
             "download_url": manifest.get("download_url", ""),
+            "sha256": manifest.get("sha256", ""),
             "notes": manifest.get("notes", ""),
         }
         self.performSelectorOnMainThread_withObject_waitUntilDone_("handleUpdateResult:", result, False)
@@ -637,13 +641,15 @@ class AppDelegate(NSObject):
             if response == AppKit.NSAlertFirstButtonReturn and result["download_url"]:
                 self.setStatus_("Downloading update...")
                 threading.Thread(
-                    target=self._installUpdateWorker, args=(result["download_url"],), daemon=True
+                    target=self._installUpdateWorker,
+                    args=(result["download_url"], result["sha256"]),
+                    daemon=True,
                 ).start()
         elif not result["silent"]:
             self.showError_("You're up to date! SonoScript " + APP_VERSION)
 
     @objc.python_method
-    def _installUpdateWorker(self, download_url):
+    def _installUpdateWorker(self, download_url, expected_sha256):
         req = urllib.request.Request(download_url)
         try:
             with urllib.request.urlopen(req, timeout=120, context=SSL_CONTEXT) as resp:
@@ -653,6 +659,16 @@ class AppDelegate(NSObject):
                 "handleVoiceFetchError:", f"Update download failed: {e}", False
             )
             return
+
+        if expected_sha256:
+            actual_sha256 = hashlib.sha256(data).hexdigest()
+            if actual_sha256.lower() != expected_sha256.lower():
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "handleVoiceFetchError:",
+                    "The downloaded update failed verification and was not installed.",
+                    False,
+                )
+                return
 
         tmp_dir = tempfile.mkdtemp()
         zip_path = os.path.join(tmp_dir, "update.zip")
@@ -681,14 +697,20 @@ class AppDelegate(NSObject):
             return
 
         current_app_path = str(AppKit.NSBundle.mainBundle().bundlePath())
+        if not current_app_path or not current_app_path.endswith(".app"):
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "handleVoiceFetchError:", "Could not determine the app location; update aborted.", False
+            )
+            return
+
         script_path = os.path.join(tmp_dir, "install_update.sh")
         script = (
             "#!/bin/sh\n"
             "sleep 1\n"
-            f'rm -rf "{current_app_path}"\n'
-            f'mv "{extracted_app}" "{current_app_path}"\n'
-            f'open "{current_app_path}"\n'
-            f'rm -f "{script_path}"\n'
+            f"rm -rf {shlex.quote(current_app_path)}\n"
+            f"mv {shlex.quote(extracted_app)} {shlex.quote(current_app_path)}\n"
+            f"open {shlex.quote(current_app_path)}\n"
+            f"rm -f {shlex.quote(script_path)}\n"
         )
         with open(script_path, "w") as f:
             f.write(script)
