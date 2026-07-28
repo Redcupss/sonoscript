@@ -1,6 +1,7 @@
 import json
 import os
 import ssl
+import subprocess
 import tempfile
 import threading
 import urllib.error
@@ -16,6 +17,19 @@ CONFIG_PATH = os.path.expanduser("~/Library/Application Support/ClaudeReader/con
 API_BASE = "https://api.elevenlabs.io/v1"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 PLACEHOLDER_TEXT = "Paste text here (⌘V)..."
+
+APP_VERSION = "1.0.0"
+UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Redcupss/sonoscript/main/latest.json"
+
+
+def version_tuple(version_string):
+    parts = []
+    for piece in version_string.split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
 
 
 def load_config():
@@ -123,6 +137,8 @@ class AppDelegate(NSObject):
         else:
             self.fetchVoices()
 
+        self.checkForUpdates(silent=True)
+
     def build_main_menu(self):
         main_menu = AppKit.NSMenu.alloc().init()
 
@@ -134,6 +150,11 @@ class AppDelegate(NSObject):
         )
         api_key_item.setTarget_(self)
         app_menu.addItem_(api_key_item)
+        update_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Check for Updates...", "checkForUpdatesClicked:", ""
+        )
+        update_item.setTarget_(self)
+        app_menu.addItem_(update_item)
         app_menu.addItem_(AppKit.NSMenuItem.separatorItem())
         quit_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit SonoScript", "terminate:", "q"
@@ -573,6 +594,111 @@ class AppDelegate(NSObject):
         if 0 <= index < len(self.voice_ids):
             self.config["voice_id"] = self.voice_ids[index]
             save_config(self.config)
+
+    def checkForUpdatesClicked_(self, sender):
+        self.checkForUpdates(silent=False)
+
+    @objc.python_method
+    def checkForUpdates(self, silent):
+        threading.Thread(target=self._checkForUpdatesWorker, args=(silent,), daemon=True).start()
+
+    @objc.python_method
+    def _checkForUpdatesWorker(self, silent):
+        req = urllib.request.Request(UPDATE_MANIFEST_URL)
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as resp:
+                manifest = json.load(resp)
+        except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
+            if not silent:
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "handleVoiceFetchError:", "Could not check for updates. Check your internet connection.", False
+                )
+            return
+
+        remote_version = manifest.get("version", APP_VERSION)
+        result = {
+            "silent": silent,
+            "available": version_tuple(remote_version) > version_tuple(APP_VERSION),
+            "version": remote_version,
+            "download_url": manifest.get("download_url", ""),
+            "notes": manifest.get("notes", ""),
+        }
+        self.performSelectorOnMainThread_withObject_waitUntilDone_("handleUpdateResult:", result, False)
+
+    def handleUpdateResult_(self, result):
+        if result["available"]:
+            alert = AppKit.NSAlert.alloc().init()
+            alert.setMessageText_(f"SonoScript {result['version']} is available")
+            notes = result["notes"] or "A new version is ready to install."
+            alert.setInformativeText_(notes)
+            alert.addButtonWithTitle_("Update Now")
+            alert.addButtonWithTitle_("Later")
+            response = alert.runModal()
+            if response == AppKit.NSAlertFirstButtonReturn and result["download_url"]:
+                self.setStatus_("Downloading update...")
+                threading.Thread(
+                    target=self._installUpdateWorker, args=(result["download_url"],), daemon=True
+                ).start()
+        elif not result["silent"]:
+            self.showError_("You're up to date! SonoScript " + APP_VERSION)
+
+    @objc.python_method
+    def _installUpdateWorker(self, download_url):
+        req = urllib.request.Request(download_url)
+        try:
+            with urllib.request.urlopen(req, timeout=120, context=SSL_CONTEXT) as resp:
+                data = resp.read()
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "handleVoiceFetchError:", f"Update download failed: {e}", False
+            )
+            return
+
+        tmp_dir = tempfile.mkdtemp()
+        zip_path = os.path.join(tmp_dir, "update.zip")
+        with open(zip_path, "wb") as f:
+            f.write(data)
+
+        extract_dir = os.path.join(tmp_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+        try:
+            subprocess.run(["ditto", "-x", "-k", zip_path, extract_dir], check=True)
+        except subprocess.CalledProcessError:
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "handleVoiceFetchError:", "Could not unpack the update.", False
+            )
+            return
+
+        extracted_app = None
+        for name in os.listdir(extract_dir):
+            if name.endswith(".app"):
+                extracted_app = os.path.join(extract_dir, name)
+                break
+        if not extracted_app:
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "handleVoiceFetchError:", "The update package did not contain an app.", False
+            )
+            return
+
+        current_app_path = str(AppKit.NSBundle.mainBundle().bundlePath())
+        script_path = os.path.join(tmp_dir, "install_update.sh")
+        script = (
+            "#!/bin/sh\n"
+            "sleep 1\n"
+            f'rm -rf "{current_app_path}"\n'
+            f'mv "{extracted_app}" "{current_app_path}"\n'
+            f'open "{current_app_path}"\n'
+            f'rm -f "{script_path}"\n'
+        )
+        with open(script_path, "w") as f:
+            f.write(script)
+        os.chmod(script_path, 0o755)
+
+        subprocess.Popen(["/bin/sh", script_path], start_new_session=True)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_("terminateApp:", None, False)
+
+    def terminateApp_(self, sender):
+        AppKit.NSApp.terminate_(None)
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, app):
         return True
