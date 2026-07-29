@@ -11,28 +11,24 @@ below gets picked.
 
 ## Planned
 
-1. **Text preprocessing pass** — filename/extension periods (`example.file`)
-   currently get read as sentence-ending pauses; camelCase words like
-   GitHub/SonoScript get mispronounced or paused around. Fix: a shared
-   preprocessing step before any provider gets the text, plus a small
-   pronunciation-override dictionary for known problem words.
-2. **Speed range widen to 0.5x–1.5x** (from 0.7x–1.2x), clamped per-provider
+1. **Speed range widen to 0.5x–1.5x** (from 0.7x–1.2x), clamped per-provider
    — Kokoro/System can go wider, but ElevenLabs' API caps lower and would
    reject the extremes if sent through unclamped.
-3. **Graduated Kokoro chunk sizing** — smaller first chunk for an even
+2. **Graduated Kokoro chunk sizing** — smaller first chunk for an even
    faster first sound, growing on subsequent chunks once prefetch has a
    comfortable time cushion.
-4. **Per-voice custom defaults** — a config table so a voice (e.g. Puck)
+3. **Per-voice custom defaults** — a config table so a voice (e.g. Puck)
    can have its own baseline speed/pitch that the UI's controls adjust on
    top of, instead of one global default for every voice.
-5. **Pitch-shift DSP** — Kokoro's model has no native pitch parameter (only
+4. **Pitch-shift DSP** — Kokoro's model has no native pitch parameter (only
    input_ids/style/speed), so this means shifting the generated waveform
    after the fact. The riskiest item here (real audio-quality risk if done
-   naively) and what #4 needs to have something to set a default *for*.
+   naively) and what #3 needs to have something to set a default *for*.
    Note: taming one specific voice's trained sentence-initial pitch rise
    (Puck) isn't achievable this way or any other — that's baked into the
-   model weights, not a tunable parameter. Picking a different voice is the
-   realistic option there.
+   model weights, not a tunable parameter, same root cause as SonoScript's
+   remaining sentence-final rise (see CHANGELOG.md 1.6.1). Picking a
+   different voice is the realistic option for Puck.
 
 ## Ideas / maybe
 

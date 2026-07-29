@@ -4,6 +4,25 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.6.1] (build 25) — 2026-07-28
+
+### Added
+- Text preprocessing pass, applied before any provider gets the text (so
+  it covers System/Kokoro/ElevenLabs/OpenAI alike): filenames with
+  extensions ("example.file", "report.pdf") no longer read the period as
+  a sentence-ending pause — a period with no surrounding whitespace is
+  reworded to "dot" instead. A small pronunciation-override dictionary
+  fixes specific words that were coming out wrong or with a pause around
+  an internal capital letter ("GitHub" -> "git hub", "SonoScript" -> "Sono
+  Script") — picked from several rendered candidates by ear, not guessed.
+
+### Known limitation
+- "SonoScript"'s fix isn't complete: testing multiple phrasings showed the
+  odd rise it had was actually sentence-position prosody (same word
+  mid-sentence sounds fine; landing as the very last word before a period
+  can still occasionally rise). No exposed parameter controls this — same
+  root cause as Puck's sentence-initial pitch rise noted on the roadmap.
+
 ## [1.6.0] (build 24) — 2026-07-28
 
 ### Added

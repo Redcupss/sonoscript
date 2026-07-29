@@ -29,6 +29,7 @@ from Foundation import (
 
 from chunking import chunk_text, CHUNK_TARGET_CHARS, CHUNK_TARGET_CHARS_KOKORO
 from config import load_config, save_config
+from text_prep import sanitize_for_speech
 from ui_helpers import white, fix_anchor, build_waveform_bars, make_label, symbol_image, format_playback_time
 from widgets import (
     ClickThroughTextField, ScrubberView, HoverButton, icon_button, text_button, cta_button,
@@ -36,8 +37,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.6.0"
-APP_BUILD = "24"
+APP_VERSION = "1.6.1"
+APP_BUILD = "25"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -1312,6 +1313,7 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _requestTTS(self, text):
+        text = sanitize_for_speech(text)
         provider = self.config.get("provider", "ElevenLabs")
         key = self.config.get("api_key", "")
         voice = self.config.get("voice_id", "")
