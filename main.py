@@ -38,8 +38,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.7.1"
-APP_BUILD = "27"
+APP_VERSION = "1.7.2"
+APP_BUILD = "28"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -279,7 +279,11 @@ class AppDelegate(NSObject):
     def _showDropdown(self, anchor, rows, width=None, align="right", direction="up"):
         """rows: list of {title, selected, on_click} dicts, or None for a separator line."""
         self._closeDropdownImmediate()
-        row_h, sep_h, pad, gap, max_h = 30, 10, 10, 14, 260
+        # pad is the margin between the panel's own border and the first/last row's text —
+        # smaller here (not max_h) is what actually brings a scrolled-to-the-edge row's fading
+        # text closer to the panel border, reinforcing "there's more this way" rather than
+        # leaving a gap of empty padding between the fade and the edge.
+        row_h, sep_h, pad, gap, max_h = 30, 10, 3, 14, 260
         if width is not None:
             w = width
         else:
@@ -296,9 +300,24 @@ class AppDelegate(NSObject):
             # (kerning/subpixel rounding), which was clipping "Check for Updates" to
             # "Check for" since its label had zero slack beyond the measured width.
             w = max(max_text_w + 40, anchor.frame().size.width, 90)
-        content_h = pad * 2 + sum(sep_h if r is None else row_h for r in rows)
-        height = min(content_h, max_h)
+        heights = [sep_h if r is None else row_h for r in rows]
+        content_h = pad * 2 + sum(heights)
         needs_scroll = content_h > max_h
+        if needs_scroll:
+            # Snap the visible height down to a whole number of rows (counted from the
+            # list's own end) instead of an arbitrary max_h cutoff — otherwise whatever
+            # row lands right at the scroll boundary gets sliced mid-row, leaving a
+            # useless sliver of a name poking out below the fade. With a whole-row
+            # height, the row closest to the edge is always complete: it just fades via
+            # opacity, the same as every other faded row, never gets physically cut.
+            running = 0
+            for h in reversed(heights):
+                if running + h + pad * 2 > max_h:
+                    break
+                running += h
+            height = pad * 2 + running
+        else:
+            height = content_h
 
         anchor_screen = anchor.window().convertRectToScreen_(
             anchor.convertRect_toView_(anchor.bounds(), None))
@@ -413,8 +432,78 @@ class AppDelegate(NSObject):
             # this layout is exactly the BOTTOM of the list, not the top. Every dropdown that
             # actually needs scrolling (28 Kokoro voices, long ElevenLabs voice lists) was
             # opening pre-scrolled to its last few rows instead of its first.
-            scroll.contentView().scrollToPoint_(NSMakePoint(0, content_h - height))
-            scroll.reflectScrolledClipView_(scroll.contentView())
+            clip = scroll.contentView()
+            clip.scrollToPoint_(NSMakePoint(0, content_h - height))
+            scroll.reflectScrolledClipView_(clip)
+
+            # Edge fade signals "more rows this way" the same way Claude's own chat scroll
+            # does — rows visibly fade out approaching whichever edge still has hidden content,
+            # gone entirely at whichever edge is the actual end of the list. This has to be a
+            # real alpha MASK on the scroll view's own layer, not a colored gradient drawn on
+            # top of it: the panel's background is a live translucent blur (NSVisualEffectView),
+            # not a flat color, so painting an opaque patch — even one color-matched to a
+            # screenshot sample — reads as a visible layer sitting on top rather than the rows
+            # actually dissolving into the real backdrop behind them. A mask instead reveals
+            # whatever's truly behind the scroll view at each masked-out pixel.
+            fade_h = 72.0
+            scroll.setWantsLayer_(True)
+            mask = Quartz.CAGradientLayer.layer()
+            mask.setFrame_(scroll.bounds())
+            mask.setStartPoint_(NSMakePoint(0.5, 0.0))
+            mask.setEndPoint_(NSMakePoint(0.5, 1.0))
+            # 4 fixed stops (bottom edge / bottom-of-plateau / top-of-plateau / top edge) —
+            # the plateau (full white, fully visible) is everything more than fade_h away from
+            # either edge. Only the two EDGE stops' own alpha changes as scrolling happens; the
+            # locations themselves never move.
+            mask.setLocations_([0.0, fade_h / height, 1.0 - fade_h / height, 1.0])
+            scroll.layer().setMask_(mask)
+
+            def edge_colors(bottom_alpha, top_alpha):
+                # Empirically, location 0.0 renders at the visual TOP of the scroll view and
+                # location 1.0 at the visual BOTTOM here — the opposite of a plain content
+                # layer's usual bottom-to-top convention, most likely because NSScrollView's
+                # own layer has a flipped coordinate space. Confirmed by testing (not
+                # re-derived blind a second time): scrolled to the true top, the top row was
+                # showing the fade meant for the bottom edge, and vice versa.
+                return [
+                    AppKit.NSColor.whiteColor().colorWithAlphaComponent_(top_alpha).CGColor(),
+                    AppKit.NSColor.whiteColor().CGColor(),
+                    AppKit.NSColor.whiteColor().CGColor(),
+                    AppKit.NSColor.whiteColor().colorWithAlphaComponent_(bottom_alpha).CGColor(),
+                ]
+
+            def update_edge_mask(note=None):
+                try:
+                    origin_y = clip.bounds().origin.y
+                    max_origin = max(0.0, content_h - height)
+                    # 1.0 (fully opaque, no visible fade) right at a true edge with nothing
+                    # more that way; ramps down to 0 once scrolled fade_h away from it — so
+                    # the fade genuinely shrinks to nothing approaching the true edge, rather
+                    # than snapping off at some fixed point. Since height is now snapped to a
+                    # whole number of rows, the row nearest the edge is always complete, so
+                    # fading it to 0 reads as "dissolving into the backdrop," not a dead gap.
+                    bottom_alpha = 1.0 - max(0.0, min(1.0, origin_y / fade_h))
+                    top_alpha = 1.0 - max(0.0, min(1.0, (max_origin - origin_y) / fade_h))
+                    # CALayer property changes are implicitly animated by default — without
+                    # disabling that here, the very first call (setting up the initial
+                    # scrolled-to-top state) doesn't actually take visual effect until some
+                    # later transaction commits, e.g. the next real scroll gesture. Which read
+                    # as "the bottom fade doesn't show up until you scroll a little," exactly
+                    # backwards from the intent (it should be there immediately, since being
+                    # scrolled to the top is precisely when there's the most content below).
+                    AppKit.CATransaction.begin()
+                    AppKit.CATransaction.setDisableActions_(True)
+                    mask.setColors_(edge_colors(bottom_alpha, top_alpha))
+                    AppKit.CATransaction.commit()
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+                    sys.stderr.flush()
+
+            update_edge_mask()
+            clip.setPostsBoundsChangedNotifications_(True)
+            shadow_observer = AppKit.NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
+                AppKit.NSViewBoundsDidChangeNotification, clip, None, update_edge_mask)
+            self.dropdown_scroll_observers.append(shadow_observer)
 
         panel.setContentView_(outer)
         self.dropdown_panel = panel

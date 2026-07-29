@@ -4,6 +4,52 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.7.2] (build 28) — 2026-07-29
+
+### Added
+- Dropdown rows now fade out approaching whichever edge still has more
+  hidden content (same idea as Claude's own chat scroll), gone entirely at
+  the actual top/bottom of the list — shrinking smoothly to nothing as you
+  approach the true edge rather than snapping off. Only shows up on
+  dropdowns long enough to scroll (the 28-voice Kokoro list, long
+  ElevenLabs voice lists).
+- Implemented as a real alpha mask on the scroll view's own layer, not a
+  colored gradient drawn on top of the rows. First attempt used a colored
+  overlay (even color-matched to a real screenshot sample, RGB
+  0.29/0.29/0.29) but the panel's background is a live translucent blur
+  (NSVisualEffectView), not a flat color — any painted overlay still read
+  as a visible patch sitting on top rather than rows genuinely dissolving
+  into the real backdrop behind them. A mask reveals whatever's actually
+  there instead.
+- Dropdown internal top/bottom padding tightened (10pt -> 6pt, then -> 3pt)
+  so a scrolled-to-the-edge row's fading text sits close to the panel's
+  actual border instead of leaving a gap of blank padding between the fade
+  and the edge — reinforcing "there's more this way" rather than
+  undercutting it.
+- Dropdown visible height now snaps down to a whole number of rows instead
+  of an arbitrary fixed cutoff, so the row nearest a scroll boundary is
+  always complete. Previously the cutoff could land mid-row, leaving a
+  sliced sliver of a name at the edge that was also deep in the steepest
+  part of the fade — reading as an empty gap rather than a name. A
+  complete row that simply fades via opacity reads correctly at both ends.
+- Fade zone deepened (48pt -> 72pt) so more of the dropdown is visibly
+  involved in the dissolve, closer to the strength of Claude's own chat
+  scroll shadow rather than a single-row hint.
+
+### Fixed (during development, before landing)
+- The gradient's two edges were mapped backwards twice over: first the
+  in-strip direction (an early colored-overlay attempt), then — after
+  switching to the mask approach — location 0.0 vs 1.0 on the mask itself,
+  since NSScrollView's layer has a flipped coordinate space, opposite of
+  a plain content layer's usual convention. Confirmed by testing rather
+  than re-deriving blind a second time.
+- The initial (scrolled-to-top) mask state didn't visually apply until
+  triggered by an actual scroll gesture — CALayer property changes are
+  implicitly animated by default, so the very first color update landed
+  in a transaction that didn't commit until later. Now wrapped in an
+  explicit disabled-actions transaction, same pattern already used in
+  ScrubberView for instant (non-animated) updates.
+
 ## [1.7.1] (build 27) — 2026-07-29
 
 ### Fixed
