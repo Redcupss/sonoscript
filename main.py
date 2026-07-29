@@ -38,8 +38,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.7.0"
-APP_BUILD = "26"
+APP_VERSION = "1.7.1"
+APP_BUILD = "27"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -405,6 +405,16 @@ class AppDelegate(NSObject):
             row._suppress_hover = suppress_hover
             hover_rows.append(row)
             container.addSubview_(row)
+
+        if needs_scroll:
+            # Rows are laid out with the first one at the TOP of the container (highest y,
+            # since cy counts down from content_h) and the last one at the bottom (near y=0)
+            # — but NSScrollView's clip view defaults its visible origin to (0, 0), which in
+            # this layout is exactly the BOTTOM of the list, not the top. Every dropdown that
+            # actually needs scrolling (28 Kokoro voices, long ElevenLabs voice lists) was
+            # opening pre-scrolled to its last few rows instead of its first.
+            scroll.contentView().scrollToPoint_(NSMakePoint(0, content_h - height))
+            scroll.reflectScrolledClipView_(scroll.contentView())
 
         panel.setContentView_(outer)
         self.dropdown_panel = panel

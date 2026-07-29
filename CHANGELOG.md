@@ -4,6 +4,16 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.7.1] (build 27) — 2026-07-29
+
+### Fixed
+- Any dropdown long enough to scroll (the 28-voice Kokoro list, long
+  ElevenLabs voice lists) opened pre-scrolled to its last few rows instead
+  of the top. Rows are laid out first-item-at-top/last-item-at-bottom, but
+  NSScrollView's clip view defaults its visible origin to (0, 0) — exactly
+  the bottom in that layout. Now explicitly scrolled to the top when the
+  dropdown opens.
+
 ## [1.7.0] (build 26) — 2026-07-29
 
 ### Added
