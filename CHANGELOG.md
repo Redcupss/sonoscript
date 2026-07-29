@@ -4,6 +4,23 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.7.3] (build 29) — 2026-07-29
+
+### Added
+- The welcome screen's provider pills (System/Kokoro/ElevenLabs/OpenAI/
+  Other) now live in a fixed-width strip that scrolls horizontally
+  instead of forcing the whole window to grow to fit every pill. Adding
+  "Other" had pushed the row past a comfortable width, so the window's
+  centered layout column grew to match — which read as "the window got
+  wider," even though the window's own size never changed in code; it
+  had just started overflowing it. Same edge-fade affordance as the
+  scrollable dropdowns (see 1.7.2), rotated 90 degrees: pills dissolve
+  toward whichever side has more scrolled off, fully opaque at the true
+  left/right end of the list.
+- Re-opening this screen with an off-strip provider already selected
+  (e.g. "Other") scrolls it into view automatically instead of leaving it
+  hidden with no indication it's there.
+
 ## [1.7.2] (build 28) — 2026-07-29
 
 ### Added

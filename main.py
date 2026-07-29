@@ -38,8 +38,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.7.2"
-APP_BUILD = "28"
+APP_VERSION = "1.7.3"
+APP_BUILD = "29"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -88,6 +88,7 @@ class AppDelegate(NSObject):
         self.overlay_card = None
         self.esc_monitor = None
         self.welcome_esc_monitor = None
+        self.welcome_pill_observer = None
         self._fade_timers = {}
         self.update_info = None  # dict: tag, notes, asset_url, asset_size
         self.current_screen = None
@@ -592,9 +593,12 @@ class AppDelegate(NSObject):
         # the empty margin above the icon always matches the empty margin below the lowest
         # visible element — with vs without Cancel changes what that lowest element is, so ch
         # must be recomputed per case or the whole cluster reads as top- or bottom-heavy.
-        # Provider pills are measured before cw is fixed: a wider pill row (adding System, and
-        # later Kokoro) must widen the whole centered column, rather than spill past a
-        # hardcoded width and get clipped at both edges by the container.
+        # Provider pills are measured up front to lay out the scrollable strip below, but no
+        # longer widen the window itself. That worked while there were only 3-4 short names,
+        # but adding "Other" pushed the row past a comfortable width, and the whole window grew
+        # to fit it — which read as "the window got wider," even though the window's own sizing
+        # never changed. Pills now live in a fixed-width strip that scrolls horizontally
+        # instead, with the same edge-fade affordance as the scrollable dropdowns.
         pill_h, gap, h_pad = 26, 10, 18
         pill_font = AppKit.NSFont.systemFontOfSize_weight_(11, AppKit.NSFontWeightMedium)
         pill_widths = []
@@ -604,7 +608,8 @@ class AppDelegate(NSObject):
             pill_widths.append(text_w + h_pad * 2)
         pills_total = sum(pill_widths) + gap * (len(PROVIDERS) - 1)
 
-        cw = max(340, pills_total + 20)
+        cw = 340
+        pill_strip_w = 300
         mx, my = cw / 2.0, 237.0  # my: local y equivalent to the old window-center reference
         icon_top = my + 103.0
         bottom_edge = 32.0 if can_cancel else (my - 175.0)
@@ -653,16 +658,51 @@ class AppDelegate(NSObject):
 
         # provider pills — content-sized (not fixed-width) so short labels like "Other" don't
         # carry the same padding as "ElevenLabs", matching the reference's pill proportions.
-        # Font/widths already measured above, before cw was sized to fit them.
+        # Font/widths already measured above. Laid out into a document view that's wider than
+        # the visible strip; the strip scrolls (trackpad/wheel) to reveal whatever doesn't fit.
         self.pill_buttons = []
-        px = mx - pills_total / 2.0
+        pill_doc = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, pills_total, pill_h))
+        px = 0.0
         for name, w_ in zip(PROVIDERS, pill_widths):
-            btn = text_button(name, NSMakeRect(px, my - 75, w_, pill_h), "providerClicked:", self,
+            btn = text_button(name, NSMakeRect(px, 0, w_, pill_h), "providerClicked:", self,
                               pill_font, 0.04, 0.14, 13.0, white(0.55))
             btn.layer().setBorderWidth_(1.0)
             self.pill_buttons.append(btn)
-            container.addSubview_(btn)
+            pill_doc.addSubview_(btn)
             px += w_ + gap
+
+        needs_pill_scroll = pills_total > pill_strip_w
+        if needs_pill_scroll:
+            pill_scroll = AppKit.NSScrollView.alloc().initWithFrame_(
+                NSMakeRect(mx - pill_strip_w / 2.0, my - 75, pill_strip_w, pill_h))
+            pill_scroll.setBorderType_(AppKit.NSNoBorder)
+            pill_scroll.setHasHorizontalScroller_(False)
+            pill_scroll.setHasVerticalScroller_(False)
+            pill_scroll.setDrawsBackground_(False)
+            pill_scroll.setDocumentView_(pill_doc)
+            container.addSubview_(pill_scroll)
+
+            # Reveal whichever provider is already selected even if it would otherwise land
+            # off-strip — e.g. re-opening this screen with "Other" already chosen shouldn't
+            # bury it at the far edge with no hint it's there.
+            sel_idx = PROVIDERS.index(self.provider) if self.provider in PROVIDERS else 0
+            sel_x = sum(pill_widths[:sel_idx]) + gap * sel_idx
+            sel_right = sel_x + pill_widths[sel_idx]
+            max_origin_x = max(0.0, pills_total - pill_strip_w)
+            origin_x = 0.0
+            if sel_right > origin_x + pill_strip_w:
+                origin_x = sel_right - pill_strip_w
+            if sel_x < origin_x:
+                origin_x = sel_x
+            origin_x = max(0.0, min(origin_x, max_origin_x))
+            clip = pill_scroll.contentView()
+            clip.scrollToPoint_(NSMakePoint(origin_x, 0))
+            pill_scroll.reflectScrolledClipView_(clip)
+
+            self._installHorizontalEdgeFade(pill_scroll, pills_total, pill_strip_w)
+        else:
+            pill_doc.setFrame_(NSMakeRect(mx - pills_total / 2.0, my - 75, pills_total, pill_h))
+            container.addSubview_(pill_doc)
         self._stylePills()
 
         field_w, field_h = 300, 38
@@ -903,6 +943,51 @@ class AppDelegate(NSObject):
             btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_attributes_(str(btn.title()), attrs))
             btn._base_alpha = 0.16 if sel else 0.04
 
+    @objc.python_method
+    def _installHorizontalEdgeFade(self, scroll, content_w, viewport_w):
+        # Same idea as the scrollable dropdown's vertical edge fade (see _showDropdown), turned
+        # 90 degrees: pills dissolve toward whichever side still has more scrolled off, and go
+        # fully opaque at the true left/right end of the strip. Kept as its own copy rather than
+        # sharing code with _showDropdown — that implementation is tuned and shipped, and this
+        # is a different axis on a different screen, not worth the risk of a shared abstraction
+        # regressing it.
+        fade_w = 48.0
+        scroll.setWantsLayer_(True)
+        mask = Quartz.CAGradientLayer.layer()
+        mask.setFrame_(scroll.bounds())
+        mask.setStartPoint_(NSMakePoint(0.0, 0.5))
+        mask.setEndPoint_(NSMakePoint(1.0, 0.5))
+        mask.setLocations_([0.0, fade_w / viewport_w, 1.0 - fade_w / viewport_w, 1.0])
+        scroll.layer().setMask_(mask)
+        clip = scroll.contentView()
+
+        def edge_colors(left_alpha, right_alpha):
+            return [
+                AppKit.NSColor.whiteColor().colorWithAlphaComponent_(left_alpha).CGColor(),
+                AppKit.NSColor.whiteColor().CGColor(),
+                AppKit.NSColor.whiteColor().CGColor(),
+                AppKit.NSColor.whiteColor().colorWithAlphaComponent_(right_alpha).CGColor(),
+            ]
+
+        def update_edge_mask(note=None):
+            try:
+                origin_x = clip.bounds().origin.x
+                max_origin = max(0.0, content_w - viewport_w)
+                left_alpha = 1.0 - max(0.0, min(1.0, origin_x / fade_w))
+                right_alpha = 1.0 - max(0.0, min(1.0, (max_origin - origin_x) / fade_w))
+                AppKit.CATransaction.begin()
+                AppKit.CATransaction.setDisableActions_(True)
+                mask.setColors_(edge_colors(left_alpha, right_alpha))
+                AppKit.CATransaction.commit()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+
+        update_edge_mask()
+        clip.setPostsBoundsChangedNotifications_(True)
+        self.welcome_pill_observer = AppKit.NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
+            AppKit.NSViewBoundsDidChangeNotification, clip, None, update_edge_mask)
+
     def providerClicked_(self, sender):
         self.provider = str(sender.title())
         self._stylePills()
@@ -1025,6 +1110,13 @@ class AppDelegate(NSObject):
         if self.welcome_esc_monitor is not None:
             AppKit.NSEvent.removeMonitor_(self.welcome_esc_monitor)
             self.welcome_esc_monitor = None
+        # The pill strip's bounds-change observer is registered on the clip view every time
+        # this screen is (re)built (resetApiKey_ can re-enter it repeatedly) — without removing
+        # the old one first, each re-entry leaks another observer whose block still holds a
+        # strong reference to the torn-down scroll view and its clip.
+        if self.welcome_pill_observer is not None:
+            AppKit.NSNotificationCenter.defaultCenter().removeObserver_(self.welcome_pill_observer)
+            self.welcome_pill_observer = None
 
     # ----- main screen -----
     def showMainScreen(self):
