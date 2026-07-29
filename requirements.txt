@@ -1,2 +1,5 @@
-rumps
 pyobjc-framework-Cocoa
+pyobjc-framework-AVFoundation
+pyobjc-framework-Quartz
+certifi
+py2app
