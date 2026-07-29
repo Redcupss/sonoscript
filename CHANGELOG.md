@@ -4,6 +4,24 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.7.4] (build 30) — 2026-07-29
+
+### Fixed
+- Pasted text copied from certain PDFs (screenwriting software and some
+  word processors export this way) could contain real IPA/phonetic
+  characters standing in for ordinary Latin letters — visually identical
+  glyphs, but a different Unicode character, from a broken font-subset
+  cmap table in the PDF itself. Kokoro's espeak-ng backend doesn't
+  recognize these as belonging to any alphabet and fell back to reading
+  the character's own hex code point digit-by-digit: "ɑ" (U+0251, Latin
+  Alpha, substituting for a plain "a") came out mid-sentence as "letter
+  two five one" (hex 0251). Reproduced directly against the bundled
+  espeak backend, then confirmed the fix (mapping the character back to
+  "a" before phonemizing) produces byte-identical phonemes to clean text.
+  A small table of these confusable letters (currently ɑ, ɡ, ı) is now
+  normalized back to plain ASCII in sanitize_for_speech, ahead of every
+  provider.
+
 ## [1.7.3] (build 29) — 2026-07-29
 
 ### Added

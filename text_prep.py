@@ -28,11 +28,28 @@ _OVERRIDE_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(k) for k in PRONUNCIATION_OVERRIDES) + r")\b"
 )
 
+# Certain PDFs (screenwriting software and some word processors export this way) subset their
+# fonts with a broken cmap/ToUnicode table: the glyph drawn for a plain letter is CID-mapped to
+# the wrong Unicode code point, so copy-pasted text has real IPA/phonetic-extension characters
+# standing in for ordinary Latin letters — visually identical, but a different character. Kokoro
+# (espeak-ng) doesn't recognize these as belonging to any alphabet and falls back to reading the
+# character's own hex code point digit-by-digit instead — "ɑ" (U+0251, Latin Alpha) came out as
+# "letter two five one" (hex 251), confirmed by phonemizing the exact string against the
+# bundled espeak backend. Mapped back to their plain intended letters before anything reaches
+# a TTS backend, since this is a paste artifact, not real IPA transcription in normal prose.
+CONFUSABLE_LETTERS = {
+    "ɑ": "a",  # U+0251 Latin Alpha
+    "ɡ": "g",  # U+0261 Latin Script G
+    "ı": "i",  # U+0131 Latin Dotless I
+}
+_CONFUSABLE_RE = re.compile("[" + "".join(CONFUSABLE_LETTERS) + "]")
+
 
 def sanitize_for_speech(text):
     """Text-level cleanup applied before any provider (System/Kokoro/ElevenLabs/OpenAI) gets
     the text — these are phonemizer/prosody quirks, not something any one backend handles
     differently, so fixing it once here covers all of them."""
+    text = _CONFUSABLE_RE.sub(lambda m: CONFUSABLE_LETTERS[m.group(0)], text)
     text = _FILENAME_DOT_RE.sub(lambda m: f"{m.group(1)} dot {m.group(2)}", text)
     text = _OVERRIDE_RE.sub(lambda m: PRONUNCIATION_OVERRIDES[m.group(0)], text)
     return text
