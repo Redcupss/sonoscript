@@ -4,6 +4,76 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.7.0] (build 26) — 2026-07-29
+
+### Added
+- Speed range widened to 0.5x–1.5x (from 0.7x–1.2x), with fewer options in
+  the picker (0.5x, 0.8x, 1.0x, 1.25x, 1.5x instead of every 0.1x step) so
+  the list stays short. Verified against each provider's actual API limits
+  first — ElevenLabs' REST API and OpenAI's TTS API both support 0.25–4.0
+  (an earlier assumption of a stricter 0.7–1.2 ElevenLabs cap turned out to
+  be their separate Agents Platform's limit, not the REST API this app
+  actually calls), and Kokoro supports 0.5–2.0 — so no per-provider
+  clamping was needed, just a wider list.
+- Graduated Kokoro chunk sizing: the first chunk now starts smaller than
+  before and grows over the next couple of chunks up to the normal size,
+  instead of every chunk being the same reduced size for the whole
+  document. Local inference has enough of a speed cushion that a chunk can
+  grow by more than 2x the previous one's size and still finish generating
+  well within its predecessor's playback time, so this keeps the fast-
+  first-sound benefit without fragmenting a long document into far more
+  chunks than it needs.
+- Per-voice pitch defaults: Puck now gets a built-in -1.5 semitone pitch
+  correction automatically. Getting there took several real attempts, not
+  a single clean implementation — worth recording since the failed
+  attempts are exactly what a search for "how do I pitch shift speech in
+  Python" turns up first:
+  - A hand-rolled STFT phase vocoder got the math objectively right
+    (verified against a sine wave — within ~2% of the target frequency)
+    but sounded like "multiple layers slightly detuned, creating width" on
+    real speech — the well-known phase-vocoder "chorus" artifact, caused
+    by each frequency bin's phase drifting independently of the others.
+  - Adding phase locking (Laroche & Dolson's technique — lock each bin's
+    phase to its nearest spectral peak instead of letting every bin
+    propagate independently) measurably reduced it, confirmed by ear, but
+    didn't eliminate it.
+  - Comparing against Spotify's pedalboard (Rubber Band library) — a
+    single self-contained wheel, no dependency cascade — sounded better
+    but still not natural, and highlighted a real gap: neither approach
+    was touching formants (the vocal-tract resonances that make a voice
+    sound like itself), which a naive shift drags along with the pitch —
+    the classic reason a pitched voice reads as artificial.
+  - Added formant preservation via cepstral-envelope correction (extract
+    the original's spectral envelope, re-impose it on the shifted audio)
+    on top of both the phase-locked vocoder and pedalboard. Better, but
+    -2 semitones with either one still sounded robotic — this turned out
+    to be an inherent ceiling of frame-based (STFT) approaches for speech
+    specifically, not a bug to keep tuning away: even current (2026)
+    research on WORLD-vocoder pitch shifting for speech notes the same
+    formant-artifact ceiling and is exploring diffusion-based restoration
+    to get past it.
+  - Switched to TD-PSOLA instead — pitch-synchronous processing (aligned
+    to the actual detected pitch periods, not a fixed analysis-frame
+    grid), via the `psola` package (Praat/parselmouth underneath — the
+    actual tool phoneticians use for this). Also correctly leaves
+    unvoiced sounds (consonants, breath) untouched rather than pitch-
+    shifting them too, since Praat's own pitch tracker already marks them
+    as unvoiced. This is the one that actually sounded natural, confirmed
+    by ear at -1/-1.5/-2 semitones.
+
+### Fixed
+- Packaging psola/parselmouth surfaced two new py2app gaps beyond the
+  phonemizer ones from 1.6.0: `parselmouth` is a single-file compiled
+  extension, not a package, and py2app's modulegraph mishandled that
+  shape — alongside correctly placing the real thing in `lib-dynload/`,
+  it ALSO wrote a broken duplicate at `lib/python3.12/parselmouth.py`
+  containing the raw compiled binary, which shadowed the working one and
+  crashed on import ("source code string cannot contain null bytes").
+  `setup.py` now deletes that duplicate automatically after every build.
+  Separately, `psola` depends on `soundfile` (removed from this project
+  back in 1.6.0 since Kokoro itself doesn't need it) and its cffi-
+  generated `_soundfile` companion module, both now bundled again.
+
 ## [1.6.1] (build 25) — 2026-07-28
 
 ### Added

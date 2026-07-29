@@ -3,3 +3,20 @@ pyobjc-framework-AVFoundation
 pyobjc-framework-Quartz
 certifi
 py2app
+
+# Kokoro (local neural voice provider)
+kokoro-onnx
+numpy
+onnxruntime
+espeakng-loader
+phonemizer-fork
+dlinfo
+joblib
+attrs
+
+# Per-voice pitch shift (see pitch_shift.py)
+psola
+praat-parselmouth
+pypar
+tqdm
+soundfile

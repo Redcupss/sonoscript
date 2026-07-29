@@ -11,24 +11,7 @@ below gets picked.
 
 ## Planned
 
-1. **Speed range widen to 0.5x–1.5x** (from 0.7x–1.2x), clamped per-provider
-   — Kokoro/System can go wider, but ElevenLabs' API caps lower and would
-   reject the extremes if sent through unclamped.
-2. **Graduated Kokoro chunk sizing** — smaller first chunk for an even
-   faster first sound, growing on subsequent chunks once prefetch has a
-   comfortable time cushion.
-3. **Per-voice custom defaults** — a config table so a voice (e.g. Puck)
-   can have its own baseline speed/pitch that the UI's controls adjust on
-   top of, instead of one global default for every voice.
-4. **Pitch-shift DSP** — Kokoro's model has no native pitch parameter (only
-   input_ids/style/speed), so this means shifting the generated waveform
-   after the fact. The riskiest item here (real audio-quality risk if done
-   naively) and what #3 needs to have something to set a default *for*.
-   Note: taming one specific voice's trained sentence-initial pitch rise
-   (Puck) isn't achievable this way or any other — that's baked into the
-   model weights, not a tunable parameter, same root cause as SonoScript's
-   remaining sentence-final rise (see CHANGELOG.md 1.6.1). Picking a
-   different voice is the realistic option for Puck.
+Nothing queued yet.
 
 ## Ideas / maybe
 
@@ -49,6 +32,18 @@ Unscoped, not committed to — things worth considering as the app matures:
 - **Menu bar / background playback indicator** — since this is meant to run
   unattended for long documents, a menu bar item showing play/pause and
   progress without needing the main window focused.
+- **Front-end pitch control** — per-voice pitch defaults (1.7.0) are a
+  fixed backend value per voice, not a UI slider the way speed is. Could
+  add one that adjusts on top of a voice's baseline, same relationship the
+  speed dropdown already has to speed. No blocker now that pitch_shift.py
+  exists — genuinely just an unbuilt UI element.
+- **Puck's sentence-initial pitch rise** — separate from the flat -1.5
+  semitone correction shipped in 1.7.0 (which lowers the whole voice
+  evenly). The rise is a *dynamic* prosody pattern baked into specific
+  words at specific positions, not a static offset — pitch_shift.py has no
+  way to selectively target that, and there's no known parameter for it
+  either (see CHANGELOG.md 1.6.1's SonoScript investigation, same class of
+  problem). Still unaddressed.
 
 ## Shipped
 

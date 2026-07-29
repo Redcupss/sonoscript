@@ -27,9 +27,10 @@ from Foundation import (
     NSRunLoop, NSDate, NSDefaultRunLoopMode,
 )
 
-from chunking import chunk_text, CHUNK_TARGET_CHARS, CHUNK_TARGET_CHARS_KOKORO
+from chunking import chunk_text, CHUNK_TARGET_CHARS, kokoro_chunk_target
 from config import load_config, save_config
 from text_prep import sanitize_for_speech
+from voice_defaults import voice_pitch_semitones
 from ui_helpers import white, fix_anchor, build_waveform_bars, make_label, symbol_image, format_playback_time
 from widgets import (
     ClickThroughTextField, ScrubberView, HoverButton, icon_button, text_button, cta_button,
@@ -37,8 +38,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.6.1"
-APP_BUILD = "25"
+APP_VERSION = "1.7.0"
+APP_BUILD = "26"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -50,7 +51,7 @@ OPENAI_API = "https://api.openai.com/v1"
 OPENAI_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
 PROVIDERS = ["System", "Kokoro", "ElevenLabs", "OpenAI", "Other"]
 KEYLESS_PROVIDERS = ("System", "Kokoro")  # no API key needed — bundled/on-device
-SPEEDS = ["0.7x", "0.8x", "0.9x", "1.0x", "1.1x", "1.2x"]
+SPEEDS = ["0.5x", "0.8x", "1.0x", "1.25x", "1.5x"]
 
 
 # ---------- app ----------
@@ -1297,7 +1298,7 @@ class AppDelegate(NSObject):
             # hit on its own and replays the exact same audio instead of regenerating it.
             self._seekToVirtualTime(0.0)
             return
-        target_chars = CHUNK_TARGET_CHARS_KOKORO if self.config.get("provider") == "Kokoro" else CHUNK_TARGET_CHARS
+        target_chars = kokoro_chunk_target if self.config.get("provider") == "Kokoro" else CHUNK_TARGET_CHARS
         chunks = chunk_text(text, target_chars)
         if not chunks:
             return
@@ -1512,6 +1513,11 @@ class AppDelegate(NSObject):
         # get applied to a British voice — American voices (af_/am_) use en-us.
         lang = "en-gb" if voice_identifier.startswith("b") else "en-us"
         audio, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang=lang)
+
+        semitones = voice_pitch_semitones(voice_identifier)
+        if semitones:
+            from pitch_shift import pitch_shift
+            audio = pitch_shift(audio, sample_rate, semitones)
 
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
         buf = io.BytesIO()
