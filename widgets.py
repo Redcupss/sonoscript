@@ -1,7 +1,7 @@
 import AppKit
 import Quartz
 import objc
-from Foundation import NSMakeRect, NSMakePoint
+from Foundation import NSMakeRect, NSMakePoint, NSPointInRect
 
 from ui_helpers import white, make_label, symbol_image
 
@@ -16,18 +16,50 @@ class ClickThroughTextField(AppKit.NSTextField):
         return None
 
 
+class VerticallyCenteredCell(AppKit.NSTextFieldCell):
+    """A plain NSTextFieldCell top-aligns its content whenever the field's own frame is taller
+    than one line of text — noticeable here because EditableNameField's frame is sized for a
+    comfortable double-click target, not just the text's own tight bounding box. Overriding
+    where the title/editor/selection actually draws is the standard Cocoa fix."""
+
+    @objc.python_method
+    def _centeredRect(self, bounds):
+        size = self.attributedStringValue().size()
+        return AppKit.NSMakeRect(
+            bounds.origin.x, bounds.origin.y + (bounds.size.height - size.height) / 2.0,
+            bounds.size.width, size.height)
+
+    def titleRectForBounds_(self, bounds):
+        return self._centeredRect(bounds)
+
+    def drawInteriorWithFrame_inView_(self, frame, view):
+        objc.super(VerticallyCenteredCell, self).drawInteriorWithFrame_inView_(self._centeredRect(frame), view)
+
+    def selectWithFrame_inView_editor_delegate_start_length_(self, frame, view, editor, delegate, start, length):
+        objc.super(VerticallyCenteredCell, self).selectWithFrame_inView_editor_delegate_start_length_(
+            self._centeredRect(frame), view, editor, delegate, start, length)
+
+    def editWithFrame_inView_editor_delegate_event_(self, frame, view, editor, delegate, event):
+        objc.super(VerticallyCenteredCell, self).editWithFrame_inView_editor_delegate_event_(
+            self._centeredRect(frame), view, editor, delegate, event)
+
+
 class EditableNameField(AppKit.NSTextField):
-    """A list-row name that reads as plain text at rest — a soft background box fades in on
-    hover (signaling "double-click to rename"), and only an actual double-click makes it
-    genuinely editable (cursor, selection, a slightly brighter box). Committing (Enter, or
-    clicking elsewhere — resigning first responder fires the normal delegate path) should call
+    """A list-row name that reads as plain text at rest — a soft OUTLINE fades in on hover
+    (signaling "double-click to rename"), and only an actual double-click makes it genuinely
+    editable (a darker, recessed-looking fill, no outline). Committing (Enter, or clicking
+    elsewhere — resigning first responder fires the normal delegate path) should call
     endEditingAppearance() to revert back to plain-text look. Modeled on how a native macOS
     list (e.g. System Settings' Text Replacements) only shows an edit affordance on
     interaction, rather than every row permanently looking like its own little text-entry
     form."""
 
-    HOVER_COLOR = white(0.07)
-    EDITING_COLOR = white(0.10)
+    HOVER_BORDER_COLOR = white(0.22)
+    EDITING_FILL_COLOR = AppKit.NSColor.blackColor().colorWithAlphaComponent_(0.30)
+
+    @classmethod
+    def cellClass(cls):
+        return VerticallyCenteredCell
 
     @objc.python_method
     def configure(self):
@@ -39,7 +71,9 @@ class EditableNameField(AppKit.NSTextField):
         self.setSelectable_(False)
         self.setWantsLayer_(True)
         self.layer().setCornerRadius_(6.0)
-        self.layer().setBackgroundColor_(white(0.0).CGColor())
+        self.layer().setBackgroundColor_(AppKit.NSColor.clearColor().CGColor())
+        self.layer().setBorderWidth_(1.0)
+        self.layer().setBorderColor_(self.HOVER_BORDER_COLOR.colorWithAlphaComponent_(0.0).CGColor())
 
     def updateTrackingAreas(self):
         objc.super(EditableNameField, self).updateTrackingAreas()
@@ -50,18 +84,29 @@ class EditableNameField(AppKit.NSTextField):
             self.bounds(), opts, self, None)
         self.addTrackingArea_(self._tracking_area)
 
+    def resetCursorRects(self):
+        # A plain NSTextField installs an I-beam cursor rect for its own bounds regardless of
+        # editable/selectable state — confirmed by direct testing (the cursor changed on hover
+        # even at rest, before any real editing session existed). Force the normal arrow
+        # cursor while in label mode; let the default (I-beam) behavior take over once actually
+        # editing, where it's the correct cursor again.
+        if not self.isEditable():
+            self.addCursorRect_cursor_(self.bounds(), AppKit.NSCursor.arrowCursor())
+        else:
+            objc.super(EditableNameField, self).resetCursorRects()
+
     def mouseEntered_(self, event):
         if not self.isEditable():
             AppKit.CATransaction.begin()
             AppKit.CATransaction.setAnimationDuration_(0.15)
-            self.layer().setBackgroundColor_(self.HOVER_COLOR.CGColor())
+            self.layer().setBorderColor_(self.HOVER_BORDER_COLOR.CGColor())
             AppKit.CATransaction.commit()
 
     def mouseExited_(self, event):
         if not self.isEditable():
             AppKit.CATransaction.begin()
             AppKit.CATransaction.setAnimationDuration_(0.15)
-            self.layer().setBackgroundColor_(white(0.0).CGColor())
+            self.layer().setBorderColor_(self.HOVER_BORDER_COLOR.colorWithAlphaComponent_(0.0).CGColor())
             AppKit.CATransaction.commit()
 
     def mouseDown_(self, event):
@@ -78,9 +123,11 @@ class EditableNameField(AppKit.NSTextField):
     def _beginEditing(self):
         self.setEditable_(True)
         self.setSelectable_(True)
-        self.layer().setBackgroundColor_(self.EDITING_COLOR.CGColor())
+        self.layer().setBorderColor_(self.HOVER_BORDER_COLOR.colorWithAlphaComponent_(0.0).CGColor())
+        self.layer().setBackgroundColor_(self.EDITING_FILL_COLOR.CGColor())
         if self.window() is not None:
             self.window().makeFirstResponder_(self)
+            self.window().invalidateCursorRectsForView_(self)
             editor = self.currentEditor()
             if editor is not None:
                 editor.selectAll_(None)
@@ -93,8 +140,10 @@ class EditableNameField(AppKit.NSTextField):
         self.setSelectable_(False)
         AppKit.CATransaction.begin()
         AppKit.CATransaction.setAnimationDuration_(0.15)
-        self.layer().setBackgroundColor_(white(0.0).CGColor())
+        self.layer().setBackgroundColor_(AppKit.NSColor.clearColor().CGColor())
         AppKit.CATransaction.commit()
+        if self.window() is not None:
+            self.window().invalidateCursorRectsForView_(self)
 
 
 class ScrubberView(AppKit.NSView):
@@ -408,6 +457,174 @@ def cta_button(title, frame, action, target):
     return btn
 
 
+class BrightenOnHoverButton(HoverButton):
+    """Text-only hover feedback: the title itself brightens instead of a background box
+    appearing — for a button that should always read as plain text (e.g. a Cancel action),
+    never as a filled control. Two overlaid labels (dim always visible, a bright copy fading
+    in on top) rather than animating the attributed title's color directly — NSAttributedString
+    color changes don't animate on their own, while a CALayer alpha fade (the same technique
+    already used for the status label and every other fade in this app) does."""
+
+    @objc.python_method
+    def configureBrighten(self, title, font, dim_color, bright_color):
+        self.configure(0.0, 0.0, 0.0)
+        self._fill = lambda *a, **k: None  # never let the inherited hover fill touch this button
+        self.setTitle_("")
+        b = self.bounds()
+        dim = AppKit.NSTextField.alloc().init()
+        dim.setBezeled_(False)
+        dim.setDrawsBackground_(False)
+        dim.setEditable_(False)
+        dim.setSelectable_(False)
+        dim.setFont_(font)
+        dim.setTextColor_(dim_color)
+        dim.setAlignment_(AppKit.NSTextAlignmentCenter)
+        dim.setStringValue_(title)
+        dim.setFrame_(b)
+        dim.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        bright = AppKit.NSTextField.alloc().init()
+        bright.setBezeled_(False)
+        bright.setDrawsBackground_(False)
+        bright.setEditable_(False)
+        bright.setSelectable_(False)
+        bright.setFont_(font)
+        bright.setTextColor_(bright_color)
+        bright.setAlignment_(AppKit.NSTextAlignmentCenter)
+        bright.setStringValue_(title)
+        bright.setFrame_(b)
+        bright.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        bright.setAlphaValue_(0.0)
+        self.addSubview_(dim)
+        self.addSubview_(bright)
+        self._bright_label = bright
+
+    def mouseEntered_(self, event):
+        if getattr(self, "_suppress_hover", None) and self._suppress_hover.get("active"):
+            return
+        if self.isEnabled():
+            AppKit.CATransaction.begin()
+            AppKit.CATransaction.setAnimationDuration_(0.15)
+            self._bright_label.animator().setAlphaValue_(1.0)
+            AppKit.CATransaction.commit()
+
+    def mouseExited_(self, event):
+        AppKit.CATransaction.begin()
+        AppKit.CATransaction.setAnimationDuration_(0.15)
+        self._bright_label.animator().setAlphaValue_(0.0)
+        AppKit.CATransaction.commit()
+
+
+def text_button_brighten(title, frame, action, target, font, dim_color, bright_color):
+    btn = BrightenOnHoverButton.alloc().initWithFrame_(frame)
+    btn.configureBrighten(title, font, dim_color, bright_color)
+    btn.setTarget_(target)
+    btn.setAction_(action)
+    return btn
+
+
+class RecordButton(AppKit.NSView):
+    """Record/stop button: the outer red circle is a fixed color that hover/press never
+    touch — the previous icon_button-based version's own inherited hover fill (transparent,
+    since a real fill would have clashed with the manually-set red) overwrote that red on the
+    very first hover and never brought it back, since HoverButton's _fill doesn't know "red"
+    is supposed to persist. The inner white shape grows on hover and again on press, springing
+    back on release — the same idle/hover/pressed sizing behavior as ScrubberView's own thumb,
+    reused here for a consistent feel rather than a from-scratch animation approach. Shows a
+    circle (record) or a small rounded square (stop), swapped via setRecording_ rather than an
+    image, so the shape itself can keep animating smoothly through state changes."""
+
+    OUTER_COLOR = AppKit.NSColor.systemRedColor().colorWithAlphaComponent_(0.85)
+    INNER_COLOR = AppKit.NSColor.whiteColor()
+    IDLE_SCALE = 0.32
+    HOVER_SCALE = 0.36
+    PRESSED_SCALE = 0.40
+
+    @objc.python_method
+    def configure(self, on_click):
+        self.on_click = on_click
+        self.recording = False
+        self.hovering = False
+        self.pressed = False
+        self._tracking_area = None
+        self.setWantsLayer_(True)
+        self.outer_layer = Quartz.CALayer.layer()
+        self.outer_layer.setBackgroundColor_(self.OUTER_COLOR.CGColor())
+        self.inner_layer = Quartz.CALayer.layer()
+        self.inner_layer.setBackgroundColor_(self.INNER_COLOR.CGColor())
+        self.layer().addSublayer_(self.outer_layer)
+        self.layer().addSublayer_(self.inner_layer)
+        self._applyPositions(animated=False)
+
+    @objc.python_method
+    def _currentScale(self):
+        if self.pressed:
+            return self.PRESSED_SCALE
+        if self.hovering:
+            return self.HOVER_SCALE
+        return self.IDLE_SCALE
+
+    @objc.python_method
+    def _applyPositions(self, animated=True):
+        b = self.bounds()
+        d = min(b.size.width, b.size.height)
+        AppKit.CATransaction.begin()
+        if animated:
+            AppKit.CATransaction.setAnimationDuration_(0.15)
+        else:
+            AppKit.CATransaction.setDisableActions_(True)
+        self.outer_layer.setFrame_(NSMakeRect((b.size.width - d) / 2.0, (b.size.height - d) / 2.0, d, d))
+        self.outer_layer.setCornerRadius_(d / 2.0)
+        inner_d = d * self._currentScale()
+        cx, cy = b.size.width / 2.0, b.size.height / 2.0
+        self.inner_layer.setFrame_(NSMakeRect(cx - inner_d / 2.0, cy - inner_d / 2.0, inner_d, inner_d))
+        # A small fixed corner radius (not half the size) reads as a rounded square once
+        # recording — matching the familiar record/stop affordance shape change — while a
+        # circle (radius = half the size) is used at rest.
+        self.inner_layer.setCornerRadius_(inner_d * 0.18 if self.recording else inner_d / 2.0)
+        AppKit.CATransaction.commit()
+
+    def setFrame_(self, frame):
+        objc.super(RecordButton, self).setFrame_(frame)
+        if hasattr(self, "outer_layer"):
+            self._applyPositions(animated=False)
+
+    @objc.python_method
+    def setRecording_(self, recording):
+        self.recording = recording
+        self._applyPositions()
+
+    def updateTrackingAreas(self):
+        objc.super(RecordButton, self).updateTrackingAreas()
+        if self._tracking_area is not None:
+            self.removeTrackingArea_(self._tracking_area)
+        opts = AppKit.NSTrackingMouseEnteredAndExited | AppKit.NSTrackingActiveInKeyWindow
+        self._tracking_area = AppKit.NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            self.bounds(), opts, self, None)
+        self.addTrackingArea_(self._tracking_area)
+
+    def mouseEntered_(self, event):
+        self.hovering = True
+        self._applyPositions()
+
+    def mouseExited_(self, event):
+        self.hovering = False
+        self._applyPositions()
+
+    def mouseDown_(self, event):
+        self.pressed = True
+        self._applyPositions()
+
+    def mouseUp_(self, event):
+        self.pressed = False
+        self._applyPositions()
+        pt = self.convertPoint_fromView_(event.locationInWindow(), None)
+        if NSPointInRect(pt, self.bounds()) and self.on_click is not None:
+            self.on_click(self)
+
+    def mouseDownCanMoveWindow(self):
+        return False
+
+
 class FlatPopUpButton(HoverButton):
     """Borderless pseudo-popup: click opens a custom dark dropdown card (no native NSMenu chrome)."""
 
@@ -567,6 +784,12 @@ class BackdropView(AppKit.NSVisualEffectView):
 
 class CardView(AppKit.NSView):
     def mouseDown_(self, event):
+        # Clicking any empty space on a card (including Manage Voices' list background) must
+        # commit whatever text field is currently being edited — a plain NSView doesn't become
+        # first responder just by being clicked, so without this, an active field editor never
+        # resigns and a rename never commits until something else happens to steal focus.
+        if self.window() is not None:
+            self.window().endEditingFor_(None)
         # Drag the whole app window from any empty space on the card, same as the main
         # window's own background (setMovableByWindowBackground_). This still keeps the click
         # from reaching the backdrop underneath (which would otherwise dismiss the overlay) —

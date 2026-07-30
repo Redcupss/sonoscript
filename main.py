@@ -3,6 +3,7 @@
 
 import io
 import json
+import math
 import os
 import shlex
 import ssl
@@ -34,7 +35,7 @@ from ui_helpers import white, fix_anchor, build_waveform_bars, make_label, symbo
 from widgets import (
     ClickThroughTextField, ScrubberView, HoverButton, icon_button, text_button, cta_button,
     FlatPopUpButton, ControlRow, FocusTextView, BackdropView, CardView, DropdownPanel,
-    LevelMeterView, EditableNameField,
+    LevelMeterView, EditableNameField, RecordButton, text_button_brighten,
 )
 
 APP_NAME = "SonoScript"
@@ -525,12 +526,7 @@ class AppDelegate(NSObject):
             # The current selection gets its own persistent (not just on-hover) fill, brighter
             # than a plain hover, so it stays visually distinct in every state — idle, hovered,
             # or with a DIFFERENT row being hovered right next to it.
-            # Alpha deltas bumped (0.09->0.14, 0.16->0.22) and duration slightly longer
-            # (0.18s->0.24s) — confirmed by direct testing that the previous, subtler values
-            # didn't read as a fade at all when scanning down a list at a normal pace: with the
-            # old values, mouse movement between rows outpaced the animation before it became
-            # visible, and the whole thing looked like an instant snap rather than a transition.
-            row.configure(0.10 if is_selected else 0.0, 0.22 if is_selected else 0.14, 0.0, fade_duration=0.24)
+            row.configure(0.07 if is_selected else 0.0, 0.16 if is_selected else 0.09, 0.0)
             row.setTitle_("")
             lbl = make_label(r["title"], 13, 0.95 if r.get("selected") else 0.82)
             lbl.setFrame_(NSMakeRect(16, (row_h - 18) / 2.0, w - 32, 18))
@@ -1963,13 +1959,51 @@ class AppDelegate(NSObject):
             self._rec_preview_player.stop()
             self._rec_preview_player = None
 
-        cw, ch = 320, 380
+        cw = 320
+        box_w = cw - 40
+        text_w = box_w - 24
+
+        style = AppKit.NSMutableParagraphStyle.alloc().init()
+        style.setAlignment_(AppKit.NSTextAlignmentCenter)
+        style.setLineSpacing_(5.0)
+        script_attrs = {
+            AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(13),
+            AppKit.NSForegroundColorAttributeName: white(0.85),
+            AppKit.NSParagraphStyleAttributeName: style,
+        }
+        script_attr_str = AppKit.NSAttributedString.alloc().initWithString_attributes_(RECORD_SCRIPT_TEXT, script_attrs)
+        # Measured, not guessed — a hardcoded label height taller than the actual wrapped text
+        # is exactly what left visible dead space below the script text inside its own box.
+        text_h = math.ceil(script_attr_str.boundingRectWithSize_options_(
+            NSMakeSize(text_w, 1000), AppKit.NSStringDrawingUsesLineFragmentOrigin).size.height)
+        box_pad = 10
+        box_h = text_h + box_pad * 2
+
+        # Built bottom-up from fixed, tight gaps so the card's total height is exactly what its
+        # content needs — no leftover space "because the card used to be taller."
+        cursor = 16  # bottom margin
+        cancel_y, cancel_h = cursor, 24
+        cursor += cancel_h + 12
+        record_y, record_d = cursor, 52
+        cursor += record_d + 12
+        elapsed_y, elapsed_h = cursor, 16
+        cursor += elapsed_h + 8
+        meter_y, meter_h = cursor, 6
+        cursor += meter_h + 8
+        error_y, error_h = cursor, 16
+        cursor += error_h + 12
+        box_y = cursor
+        cursor += box_h + 12
+        title_y, title_h = cursor, 20
+        cursor += title_h + 16  # top margin
+        ch = cursor
+
         card = self._makeCard(cw, ch)
 
         title = make_label("Record your voice sample", 15, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
-        title.setFrame_(NSMakeRect(0, ch - 40, cw, 20))
+        title.setFrame_(NSMakeRect(0, title_y, cw, title_h))
 
-        script_box = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(20, ch - 160, cw - 40, 106))
+        script_box = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(20, box_y, box_w, box_h))
         script_box.setWantsLayer_(True)
         script_box.layer().setBackgroundColor_(white(0.06).CGColor())
         script_box.layer().setBorderColor_(white(0.12).CGColor())
@@ -1980,26 +2014,9 @@ class AppDelegate(NSObject):
         script_label.setDrawsBackground_(False)
         script_label.setEditable_(False)
         script_label.setSelectable_(False)
-        style = AppKit.NSMutableParagraphStyle.alloc().init()
-        style.setAlignment_(AppKit.NSTextAlignmentCenter)
-        style.setLineSpacing_(5.0)
-        attrs = {
-            AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(13),
-            AppKit.NSForegroundColorAttributeName: white(0.85),
-            AppKit.NSParagraphStyleAttributeName: style,
-        }
-        script_label.setAttributedStringValue_(
-            AppKit.NSAttributedString.alloc().initWithString_attributes_(RECORD_SCRIPT_TEXT, attrs))
-        script_label.setFrame_(NSMakeRect(12, 8, cw - 40 - 24, 90))
+        script_label.setAttributedStringValue_(script_attr_str)
+        script_label.setFrame_(NSMakeRect(12, box_pad, text_w, text_h))
         script_box.addSubview_(script_label)
-
-        meter = LevelMeterView.alloc().initWithFrame_(NSMakeRect(20, ch - 186, cw - 40, 6))
-        meter.configure()
-        self.rec_meter = meter
-
-        elapsed_label = make_label("0:00", 11, 0.5, align=AppKit.NSTextAlignmentCenter)
-        elapsed_label.setFrame_(NSMakeRect(0, ch - 210, cw, 16))
-        self.rec_elapsed_label = elapsed_label
 
         error_label = ClickThroughTextField.alloc().init()
         error_label.setBezeled_(False)
@@ -2009,17 +2026,24 @@ class AppDelegate(NSObject):
         error_label.setAlignment_(AppKit.NSTextAlignmentCenter)
         error_label.setFont_(AppKit.NSFont.systemFontOfSize_(11.5))
         error_label.setAlphaValue_(0.0)
-        error_label.setFrame_(NSMakeRect(10, ch - 236, cw - 20, 16))
+        error_label.setFrame_(NSMakeRect(10, error_y, cw - 20, error_h))
         self.rec_error_label = error_label
 
-        record_btn = icon_button("circle.fill", 22, NSMakeRect(cw / 2 - 26, 56, 52, 52),
-                                  "recordToggleClicked:", self, base=0.0, hover=0.0, corner=26.0, tint=1.0)
-        record_btn.layer().setBackgroundColor_(AppKit.NSColor.systemRedColor().colorWithAlphaComponent_(0.85).CGColor())
+        meter = LevelMeterView.alloc().initWithFrame_(NSMakeRect(20, meter_y, box_w, meter_h))
+        meter.configure()
+        self.rec_meter = meter
+
+        elapsed_label = make_label("0:00", 11, 0.5, align=AppKit.NSTextAlignmentCenter)
+        elapsed_label.setFrame_(NSMakeRect(0, elapsed_y, cw, elapsed_h))
+        self.rec_elapsed_label = elapsed_label
+
+        record_btn = RecordButton.alloc().initWithFrame_(NSMakeRect(cw / 2 - record_d / 2, record_y, record_d, record_d))
+        record_btn.configure(self.recordToggleClicked_)
         self.rec_toggle_btn = record_btn
 
         cancel_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
-        cancel_btn = text_button("Cancel", NSMakeRect(cw / 2 - 40, 16, 80, 24), "recordingCancelClicked:", self,
-                                  cancel_font, 0.0, 0.08, 6.0, white(0.5))
+        cancel_btn = text_button_brighten("Cancel", NSMakeRect(cw / 2 - 40, cancel_y, 80, cancel_h),
+                                           "recordingCancelClicked:", self, cancel_font, white(0.5), white(0.85))
 
         for sub in (title, script_box, meter, elapsed_label, error_label, record_btn, cancel_btn):
             card.addSubview_(sub)
@@ -2061,9 +2085,7 @@ class AppDelegate(NSObject):
             self._flashInlineError(self.rec_error_label, f"Couldn't access your microphone: {e}")
             return
         self._rec_recording_active = True
-        img = symbol_image("stop.fill", 18)
-        if img:
-            self.rec_toggle_btn.setImage_(img)
+        self.rec_toggle_btn.setRecording_(True)
 
     def recordingAutoStoppedMain_(self, _):
         # The 10s hard cap fired CallbackStop from inside the audio callback itself, rather
@@ -2082,14 +2104,15 @@ class AppDelegate(NSObject):
         audio = self._rec_buffer[:self._rec_write_pos].copy() if self._rec_buffer is not None else np.zeros(0, dtype=np.float32)
         ok, message = self._validateRecording(audio, RECORD_SAMPLE_RATE)
         if not ok:
-            img = symbol_image("circle.fill", 22)
-            if img:
-                self.rec_toggle_btn.setImage_(img)
+            self.rec_toggle_btn.setRecording_(False)
             self.rec_meter.setLevel_(0.0)
             self.rec_elapsed_label.setStringValue_("0:00")
             self._flashInlineError(self.rec_error_label, message)
             return
-        self._showRecordingConfirmCard(audio, RECORD_SAMPLE_RATE)
+        # Let the button's own release animation (shrinking back down) actually play on
+        # screen before swapping to the confirm card, instead of cutting it off instantly.
+        AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+            0.18, False, lambda t: self._showRecordingConfirmCard(audio, RECORD_SAMPLE_RATE))
 
     def recLevelMain_(self, payload):
         try:
@@ -2293,7 +2316,11 @@ class AppDelegate(NSObject):
         card.addSubview_(title)
 
         list_bottom, list_h, row_h = 64, 296, 40
-        list_box = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(20, list_bottom, cw - 40, list_h))
+        # CardView (not a plain NSView) so clicking blank space anywhere in the list — between
+        # rows, below the last one — ends any active rename the same way clicking the card's
+        # own background does; a plain NSView never becomes first responder on click, so an
+        # active field editor would never resign and a rename would never commit that way.
+        list_box = CardView.alloc().initWithFrame_(NSMakeRect(20, list_bottom, cw - 40, list_h))
         list_box.setWantsLayer_(True)
         list_box.layer().setBackgroundColor_(white(0.05).CGColor())
         list_box.layer().setBorderColor_(white(0.09).CGColor())
@@ -2313,7 +2340,7 @@ class AppDelegate(NSObject):
             scroll.setBorderType_(AppKit.NSNoBorder)
             scroll.setHasVerticalScroller_(True)
             scroll.setDrawsBackground_(False)
-            container = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, content_h))
+            container = CardView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, content_h))
             cy = content_h
             self._manage_voice_fields = {}
             for i, entry in enumerate(customs):
