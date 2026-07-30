@@ -23,3 +23,6 @@ soundfile
 
 # Chatterbox Turbo (MLX) — replaces Kokoro as the local neural voice provider (Phase 2)
 mlx-audio
+
+# Sesame license verification (see license.py) — Ed25519 via PyNaCl, offline, no network
+pynacl

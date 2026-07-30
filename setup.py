@@ -45,6 +45,9 @@ LOCAL_TTS_PACKAGES = [
     # feature, which SonoScript doesn't use — audio goes through AVAudioPlayer instead), so
     # this needs to load cleanly even though we never call into it.
     "_sounddevice_data",
+    # Sesame license verification (see license.py) — Ed25519 via PyNaCl. A regular package
+    # (has __init__.py), not a namespace package like mlx, so it needs no special treatment.
+    "nacl",
 ]
 
 # Some packages' PyPI *distribution* name doesn't match their *import* name — "phonemizer"

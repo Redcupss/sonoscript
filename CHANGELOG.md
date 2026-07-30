@@ -4,6 +4,16 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.9.0] (build 34) — 2026-07-30
+
+### Added
+- First piece of the **Sesame** voice-cloning tier: a new "Sesame" option on the welcome
+  screen, gated by an offline, no-account license key (Ed25519 signature, verified entirely
+  on-device — no network call, matching this app's offline philosophy everywhere else). A
+  valid key unlocks the tier; the actual voice-cloning UI (recording flow, voice library,
+  "create your own") isn't built yet, so Sesame currently shows a clear "coming in a future
+  update" placeholder rather than a live feature.
+
 ## [1.8.2] (build 33) — 2026-07-30
 
 ### Fixed

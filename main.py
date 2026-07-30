@@ -37,8 +37,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.8.2"
-APP_BUILD = "33"
+APP_VERSION = "1.9.0"
+APP_BUILD = "34"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -48,8 +48,11 @@ SHADOW_OPACITY = 0.6  # About/Update card drop shadow
 EL_API = "https://api.elevenlabs.io/v1"
 OPENAI_API = "https://api.openai.com/v1"
 OPENAI_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-PROVIDERS = ["System", "Chatterbox", "ElevenLabs", "OpenAI", "Other"]
+PROVIDERS = ["System", "Chatterbox", "Sesame", "ElevenLabs", "OpenAI", "Other"]
 KEYLESS_PROVIDERS = ("System", "Chatterbox")  # no API key needed — bundled/on-device
+# Sesame is NOT in KEYLESS_PROVIDERS — it still needs a pasted credential (a license key) that
+# flows through the same key_field/_validateKeyWorker/_isConfigured path every other provider
+# uses; it's just verified offline (see license.py) instead of over the network.
 
 CHATTERBOX_VOICES = [
     {"id": "nova", "label": "Nova (American, Female)", "ref_audio": None},
@@ -910,7 +913,8 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _keyPlaceholder(self):
-        return {"OpenAI": "OpenAI API key (sk-...)", "Other": "API key"}.get(self.provider, "ElevenLabs API key")
+        return {"OpenAI": "OpenAI API key (sk-...)", "Other": "API key", "Sesame": "Sesame license key"}.get(
+            self.provider, "ElevenLabs API key")
 
     @objc.python_method
     def _captionText(self):
@@ -918,6 +922,8 @@ class AppDelegate(NSObject):
             return "Uses your Mac's built-in text-to-speech.\nFree, offline, no account needed."
         if self.provider == "Chatterbox":
             return "A higher-quality offline voice, built into the app.\nFree, no account needed, no downloads required."
+        if self.provider == "Sesame":
+            return "Clone your own voice — offline, private to this Mac.\nPaste the license key from your purchase."
         return ("Connect a text-to-speech provider to get started.\n"
                 "Paste an API key from your provider's account page.")
 
@@ -950,7 +956,17 @@ class AppDelegate(NSObject):
     @objc.python_method
     def _isConfigured(self):
         # System/Chatterbox need no key at all — an api_key is only required for the other providers.
-        return self.config.get("provider") in KEYLESS_PROVIDERS or bool(self.config.get("api_key"))
+        provider = self.config.get("provider")
+        if provider in KEYLESS_PROVIDERS:
+            return True
+        if provider == "Sesame":
+            from license import verify_license, LicenseError
+            try:
+                verify_license(self.config.get("api_key", ""))
+                return True
+            except LicenseError:
+                return False
+        return bool(self.config.get("api_key"))
 
     @objc.python_method
     def _updateKeyPlaceholder(self):
@@ -1090,6 +1106,14 @@ class AppDelegate(NSObject):
                 self._request_json(f"{EL_API}/user", {"xi-api-key": key})
             elif provider == "OpenAI":
                 self._request_json(f"{OPENAI_API}/models", {"Authorization": f"Bearer {key}"})
+            elif provider == "Sesame":
+                from license import verify_license, LicenseError
+                try:
+                    verify_license(key)
+                except LicenseError as e:
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "keyValidationFailedMain:", str(e), False)
+                    return
             # "Other": no known shape to validate against; accept as entered
         except urllib.error.HTTPError as e:
             msg = (
@@ -1418,6 +1442,15 @@ class AppDelegate(NSObject):
             self.voice_ids = [v["id"] for v in CHATTERBOX_VOICES]
             self._populateVoiceMenu([v["label"] for v in CHATTERBOX_VOICES])
             self.usage_label.setStringValue_("A free, offline neural voice — no account, no limit.")
+        elif provider == "Sesame":
+            # Voice cloning itself (recording flow, voice library, actual CSM generation) isn't
+            # built yet — only the license gate is. Without this branch, Sesame would silently
+            # fall into the `else` below and show OpenAI's fixed voice list, which is wrong and
+            # actively misleading. _requestTTS has a matching guard so Play fails with a clear
+            # message instead of misrouting the license key to ElevenLabs as a bogus API key.
+            self.voice_ids = ["__sesame_coming_soon__"]
+            self._populateVoiceMenu(["Coming soon"])
+            self.usage_label.setStringValue_("Voice cloning is coming in a future update.")
         else:
             # OpenAI (and Other) use a fixed voice list; no usage endpoint
             self.voice_ids = list(OPENAI_VOICES)
@@ -1555,6 +1588,10 @@ class AppDelegate(NSObject):
             return self._requestSystemTTS(text, voice, speed)
         if provider == "Chatterbox":
             return self._requestChatterboxTTS(text, voice, speed)
+        if provider == "Sesame":
+            # Caught by _chunkWorker's generic Exception handler and shown via showError_ —
+            # see fetchVoices' Sesame branch for why this guard exists.
+            raise RuntimeError("Sesame voice cloning isn't available yet — check back in a future update.")
         if provider == "OpenAI":
             body = json.dumps({"model": "gpt-4o-mini-tts", "voice": voice, "input": text, "speed": speed}).encode()
             req = urllib.request.Request(f"{OPENAI_API}/audio/speech", data=body, headers={
