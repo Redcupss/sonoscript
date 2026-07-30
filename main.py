@@ -966,7 +966,7 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _keyPlaceholder(self):
-        return {"OpenAI": "OpenAI API key (sk-...)", "Other": "API key", "Sesame": "Sesame license key"}.get(
+        return {"OpenAI": "OpenAI API key (sk-...)", "Other": "API key", "Sesame": "SonoScript license key"}.get(
             self.provider, "ElevenLabs API key")
 
     @objc.python_method
