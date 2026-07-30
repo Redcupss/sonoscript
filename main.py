@@ -150,6 +150,8 @@ class AppDelegate(NSObject):
         self._rec_write_pos = 0
         self._rec_preview_audio = None  # (float32 ndarray, sample_rate) once a take passes validation
         self._rec_preview_player = None  # AVAudioPlayer, scoped to this flow only — never touches self.player
+        self._pending_delete_voice_id = None  # set right before the Manage Voices delete-confirm card opens
+        self._manage_voice_fields = {}  # voice_id -> its NSTextField in the Manage Voices card, for rename commits
         # Chunked playback state — see playPauseClicked_/_beginChunkPlayback for the pipeline.
         # playback_token identifies one Play session; background chunk results carrying a
         # stale token (from a Stop or a new Play superseding it) are dropped on arrival.
@@ -252,7 +254,14 @@ class AppDelegate(NSObject):
         self.window.setTitlebarAppearsTransparent_(True)
         self.window.setTitleVisibility_(AppKit.NSWindowTitleHidden)
         self.window.setAppearance_(AppKit.NSAppearance.appearanceNamed_("NSAppearanceNameVibrantDark"))
-        self.window.center()
+        # Dev-testing convenience, not a real app feature — SONOSCRIPT_DEV_QUIET moves a
+        # dev-mode launch to the right edge of the screen instead of dead center, so it doesn't
+        # land on top of whatever else is on screen. No real user would ever set this.
+        if os.environ.get("SONOSCRIPT_DEV_QUIET"):
+            screen = AppKit.NSScreen.mainScreen().visibleFrame()
+            self.window.setFrameOrigin_(NSMakePoint(screen.origin.x + screen.size.width - 460, screen.origin.y + 80))
+        else:
+            self.window.center()
         # 360 wide: fits the control row without overlap. 434 tall: fits the welcome screen's
         # fixed-size centered container (386pt, including the Cancel button's row) with margin —
         # below that the container's flexible-margin autoresizing can't distribute negative
@@ -289,8 +298,14 @@ class AppDelegate(NSObject):
         self.root.addSubview_(self.wordmark)
 
         self.screen_view = None
-        self.window.makeKeyAndOrderFront_(None)
-        AppKit.NSApp.activateIgnoringOtherApps_(True)
+        self.window.orderFront_(None)
+        # activateIgnoringOtherApps_ is what steals keyboard focus from whatever app you're
+        # actually using — skipped in the same dev-testing mode as the window position above,
+        # so a background test launch doesn't interrupt anything. makeKeyAndOrderFront_ (the
+        # normal path) both shows AND focuses the window; orderFront_ alone just shows it.
+        if not os.environ.get("SONOSCRIPT_DEV_QUIET"):
+            self.window.makeKeyAndOrderFront_(None)
+            AppKit.NSApp.activateIgnoringOtherApps_(True)
 
     @objc.python_method
     def swap_screen(self, view):
@@ -311,6 +326,9 @@ class AppDelegate(NSObject):
             None,
             {"title": "Set API Key", "on_click": lambda: self.resetApiKey_(None)},
         ]
+        if self.config.get("provider") == "Sesame":
+            rows.append(None)
+            rows.append({"title": "Manage Voices", "on_click": lambda: self._showManageVoicesCard()})
         self._showDropdown(sender, rows, align="right", direction="down")
 
     # ----- custom dropdown / menu panel (matches mockup card styling; no native NSMenu chrome) -----
@@ -1130,6 +1148,27 @@ class AppDelegate(NSObject):
                 self._updateKeyPlaceholder()
         elif notification.object() is getattr(self, "rec_name_field", None):
             self._updateRecordSaveState()
+
+    def controlTextDidEndEditing_(self, notification):
+        # Commits a Manage Voices rename once a name field loses focus (click away, Tab, or
+        # Enter) — a per-keystroke commit would mean racing to save a half-typed name against
+        # every other row's field on the same screen.
+        field = notification.object()
+        # A raw NSTextField (unlike a custom subclass such as HoverButton) rejects arbitrary
+        # Python attributes outright — self._manage_voice_fields (voice_id -> field) is the
+        # forward mapping built in _showManageVoicesCard; find this field's id by identity
+        # instead of trying to tag the field itself.
+        voice_id = next((vid for vid, f in self._manage_voice_fields.items() if f is field), None)
+        if voice_id is None:
+            return
+        name = str(field.stringValue()).strip()
+        if not name:
+            return
+        for entry in self.config.get("sesame_custom_voices", []):
+            if entry["id"] == voice_id:
+                entry["label"] = name
+                save_config(self.config)
+                break
 
     @objc.python_method
     def _updateContinueState(self):
@@ -2218,6 +2257,149 @@ class AppDelegate(NSObject):
         self.setStatus(f'"{name}" saved — ready to use.')
         AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
             2.5, False, lambda t: self.setStatus(""))
+
+    @objc.python_method
+    def _showManageVoicesCard(self):
+        # Modeled on macOS's own list-editing sheets (System Settings' Text Replacements,
+        # Login Items): plain rows separated by hairlines rather than each name sitting in its
+        # own bordered box, and a "+" to add another entry sitting right next to "Done" —
+        # instead of a flat list of bezeled text-entry forms, which read more like a stack of
+        # small forms than a single coherent list.
+        customs = list(self.config.get("sesame_custom_voices", []))
+        cw, ch = 320, 400
+        card = self._makeCard(cw, ch)
+
+        title = make_label("Manage Voices", 15, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+        title.setFrame_(NSMakeRect(0, ch - 36, cw, 20))
+        card.addSubview_(title)
+
+        list_bottom, list_h, row_h = 64, 296, 40
+        list_box = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(20, list_bottom, cw - 40, list_h))
+        list_box.setWantsLayer_(True)
+        list_box.layer().setBackgroundColor_(white(0.05).CGColor())
+        list_box.layer().setBorderColor_(white(0.09).CGColor())
+        list_box.layer().setBorderWidth_(1.0)
+        list_box.layer().setCornerRadius_(10.0)
+        list_box.layer().setMasksToBounds_(True)
+        card.addSubview_(list_box)
+        box_w = cw - 40
+
+        if not customs:
+            empty = make_label("You haven't created any custom voices yet.", 12, 0.45, align=AppKit.NSTextAlignmentCenter)
+            empty.setFrame_(NSMakeRect(10, list_h / 2 - 16, box_w - 20, 32))
+            list_box.addSubview_(empty)
+        else:
+            content_h = max(list_h, len(customs) * row_h)
+            scroll = AppKit.NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, list_h))
+            scroll.setBorderType_(AppKit.NSNoBorder)
+            scroll.setHasVerticalScroller_(True)
+            scroll.setDrawsBackground_(False)
+            container = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, content_h))
+            cy = content_h
+            self._manage_voice_fields = {}
+            for i, entry in enumerate(customs):
+                cy -= row_h
+                if i > 0:
+                    line = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, cy + row_h - 1, box_w, 1))
+                    line.setWantsLayer_(True)
+                    line.layer().setBackgroundColor_(white(0.09).CGColor())
+                    container.addSubview_(line)
+                # Borderless/no visible box — reads as a plain list label at rest, same
+                # discoverable-on-interaction feel as clicking straight into a Finder list
+                # label, rather than looking like its own little form field.
+                field = AppKit.NSTextField.alloc().initWithFrame_(NSMakeRect(12, cy + 6, box_w - 60, 26))
+                field.setBezeled_(False)
+                field.setBordered_(False)
+                field.setDrawsBackground_(False)
+                field.setFont_(AppKit.NSFont.systemFontOfSize_(13))
+                field.setTextColor_(white(0.9))
+                field.setStringValue_(entry["label"])
+                field.setDelegate_(self)
+                self._manage_voice_fields[entry["id"]] = field
+                trash = icon_button("trash", 13, NSMakeRect(box_w - 40, cy + 4, 30, 30),
+                                     "manageVoiceDeleteClicked:", self, base=0.0, hover=0.14, corner=7.0, tint=0.5)
+                # trash IS a custom HoverButton subclass (unlike the plain NSTextField above),
+                # which PyObjC lets carry arbitrary Python attributes fine — same convention
+                # already used for _showDropdown's rows (_on_click, _suppress_hover).
+                trash._manage_voice_id = entry["id"]
+                container.addSubview_(field)
+                container.addSubview_(trash)
+            scroll.setDocumentView_(container)
+            clip = scroll.contentView()
+            clip.scrollToPoint_(NSMakePoint(0, max(0.0, content_h - list_h)))
+            scroll.reflectScrolledClipView_(clip)
+            list_box.addSubview_(scroll)
+
+        add_btn = icon_button("plus", 14, NSMakeRect(20, 16, 36, 32), "addVoiceFromManageClicked:", self,
+                               base=0.08, hover=0.16, corner=9.0, tint=0.85)
+        done_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+        done_btn = text_button("Done", NSMakeRect(64, 16, cw - 84, 32), "dismissManageVoices:", self,
+                                done_font, 0.08, 0.16, 9.0, white(0.85))
+        card.addSubview_(add_btn)
+        card.addSubview_(done_btn)
+        self._presentOverlay(card)
+
+    def addVoiceFromManageClicked_(self, sender):
+        self._showRecordingCaptureCard()
+
+    def dismissManageVoices_(self, sender):
+        self.dismissOverlay()
+
+    def manageVoiceDeleteClicked_(self, sender):
+        voice_id = getattr(sender, "_manage_voice_id", None)
+        entry = next((v for v in self.config.get("sesame_custom_voices", []) if v["id"] == voice_id), None)
+        if entry is None:
+            return
+        self._pending_delete_voice_id = voice_id
+
+        cw, ch = 300, 170
+        card = self._makeCard(cw, ch)
+        title = make_label("Delete this voice?", 15, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+        title.setFrame_(NSMakeRect(0, ch - 40, cw, 20))
+        sub = make_label(f'"{entry["label"]}" will be permanently removed.', 12, 0.5, align=AppKit.NSTextAlignmentCenter)
+        sub.setFrame_(NSMakeRect(20, ch - 70, cw - 40, 32))
+
+        cancel_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+        cancel_btn = text_button("Cancel", NSMakeRect(20, 20, (cw - 52) / 2, 34), "cancelDeleteVoice:", self,
+                                  cancel_font, 0.08, 0.16, 9.0, white(0.85))
+        delete_btn = cta_button("Delete", NSMakeRect(cw / 2 + 6, 20, (cw - 52) / 2, 34), "confirmDeleteVoiceClicked:", self)
+        # cta_button defaults to a light bg/dark text "positive" look — overridden here to a
+        # solid red fill with white text so a destructive, unrecoverable action reads as
+        # visually distinct from every other confirm button in the app.
+        delete_btn.layer().setBackgroundColor_(AppKit.NSColor.systemRedColor().colorWithAlphaComponent_(0.85).CGColor())
+        delete_attrs = {
+            AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightSemibold),
+            AppKit.NSForegroundColorAttributeName: AppKit.NSColor.whiteColor(),
+        }
+        delete_btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_attributes_("Delete", delete_attrs))
+
+        for s in (title, sub, cancel_btn, delete_btn):
+            card.addSubview_(s)
+        self._presentOverlay(card)
+
+    def cancelDeleteVoice_(self, sender):
+        self._pending_delete_voice_id = None
+        self._showManageVoicesCard()  # back to the list, not fully closed
+
+    def confirmDeleteVoiceClicked_(self, sender):
+        voice_id = self._pending_delete_voice_id
+        self._pending_delete_voice_id = None
+        customs = self.config.get("sesame_custom_voices", [])
+        entry = next((v for v in customs if v["id"] == voice_id), None)
+        if entry is not None:
+            try:
+                os.remove(sesame_voices_path(entry["audio_file"]))
+            except OSError:
+                pass
+            self.config["sesame_custom_voices"] = [v for v in customs if v["id"] != voice_id]
+            if self.config.get("voice_id") == voice_id:
+                self.config["voice_id"] = SESAME_VOICES[0]["id"]  # fall back to the first built-in
+            save_config(self.config)
+        self.fetchVoices()
+        self._showManageVoicesCard()  # refreshed list, still in the management screen
+        self.setStatus("Voice deleted.")
+        AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+            2.0, False, lambda t: self.setStatus(""))
 
     @objc.python_method
     def _chunkWorker(self, text, token, role, index, offset):
