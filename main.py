@@ -27,10 +27,9 @@ from Foundation import (
     NSRunLoop, NSDate, NSDefaultRunLoopMode,
 )
 
-from chunking import chunk_text, CHUNK_TARGET_CHARS, kokoro_chunk_target
+from chunking import chunk_text, CHUNK_TARGET_CHARS, chatterbox_chunk_target
 from config import load_config, save_config
 from text_prep import sanitize_for_speech
-from voice_defaults import voice_pitch_semitones
 from ui_helpers import white, fix_anchor, build_waveform_bars, make_label, symbol_image, format_playback_time
 from widgets import (
     ClickThroughTextField, ScrubberView, HoverButton, icon_button, text_button, cta_button,
@@ -38,8 +37,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.7.4"
-APP_BUILD = "30"
+APP_VERSION = "1.8.0"
+APP_BUILD = "31"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -49,8 +48,14 @@ SHADOW_OPACITY = 0.6  # About/Update card drop shadow
 EL_API = "https://api.elevenlabs.io/v1"
 OPENAI_API = "https://api.openai.com/v1"
 OPENAI_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-PROVIDERS = ["System", "Kokoro", "ElevenLabs", "OpenAI", "Other"]
-KEYLESS_PROVIDERS = ("System", "Kokoro")  # no API key needed — bundled/on-device
+PROVIDERS = ["System", "Chatterbox", "ElevenLabs", "OpenAI", "Other"]
+KEYLESS_PROVIDERS = ("System", "Chatterbox")  # no API key needed — bundled/on-device
+
+CHATTERBOX_VOICES = [
+    {"id": "nova", "label": "Nova (American, Female)", "ref_audio": None},
+    {"id": "sadie", "label": "Sadie (American, Female)", "ref_audio": "sadie.wav"},
+    {"id": "manny", "label": "Manny (American, Male)", "ref_audio": "manny.wav"},
+]
 SPEEDS = ["0.5x", "0.8x", "1.0x", "1.25x", "1.5x"]
 
 
@@ -60,10 +65,14 @@ class AppDelegate(NSObject):
     # ----- lifecycle -----
     def applicationDidFinishLaunching_(self, notification):
         self.config = load_config()
+        if self.config.get("provider") == "Kokoro":  # v1.7.x -> v1.8: Chatterbox replaced Kokoro
+            self.config["provider"] = "Chatterbox"
+            self.config.pop("voice_id", None)  # Kokoro's voice ids don't exist in the new list
+            save_config(self.config)
         self.voice_ids = []
         self.player = None
-        self._kokoro_engine = None  # lazy-loaded once, reused for every chunk — see _kokoroEngine
-        self._kokoro_lock = threading.Lock()
+        self._chatterbox_engine = None  # lazy-loaded once, reused for every chunk — see _chatterboxEngine
+        self._chatterbox_lock = threading.Lock()
         # Chunked playback state — see playPauseClicked_/_beginChunkPlayback for the pipeline.
         # playback_token identifies one Play session; background chunk results carrying a
         # stale token (from a Stop or a new Play superseding it) are dropped on arrival.
@@ -886,7 +895,7 @@ class AppDelegate(NSObject):
     def _captionText(self):
         if self.provider == "System":
             return "Uses your Mac's built-in text-to-speech.\nFree, offline, no account needed."
-        if self.provider == "Kokoro":
+        if self.provider == "Chatterbox":
             return "A higher-quality offline voice, built into the app.\nFree, no account needed, no downloads required."
         return ("Connect a text-to-speech provider to get started.\n"
                 "Paste an API key from your provider's account page.")
@@ -906,7 +915,7 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _updateKeyFieldMode(self):
-        # System/Kokoro need no key at all — swap the secure field for a plain explanatory
+        # System/Chatterbox need no key at all — swap the secure field for a plain explanatory
         # line in the exact same spot, rather than reflowing the whole screen's layout around it.
         is_keyless = self.provider in KEYLESS_PROVIDERS
         self.key_field.setHidden_(is_keyless)
@@ -919,7 +928,7 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _isConfigured(self):
-        # System/Kokoro need no key at all — an api_key is only required for the other providers.
+        # System/Chatterbox need no key at all — an api_key is only required for the other providers.
         return self.config.get("provider") in KEYLESS_PROVIDERS or bool(self.config.get("api_key"))
 
     @objc.python_method
@@ -1370,12 +1379,9 @@ class AppDelegate(NSObject):
             self.voice_ids = [v.identifier() for v in voices]
             self._populateVoiceMenu([self._systemVoiceLabel(v) for v in voices])
             self.usage_label.setStringValue_("Uses your Mac's built-in voices — free, offline, no limit.")
-        elif provider == "Kokoro":
-            voices_dir = self._resourcePath("kokoro_assets", "voices")
-            ids = [os.path.splitext(f)[0] for f in os.listdir(voices_dir) if f.endswith(".bin")]
-            ids.sort(key=lambda vid: vid.split("_", 1)[1])  # by person's name, not raw id
-            self.voice_ids = ids
-            self._populateVoiceMenu([self._kokoroVoiceLabel(v) for v in ids])
+        elif provider == "Chatterbox":
+            self.voice_ids = [v["id"] for v in CHATTERBOX_VOICES]
+            self._populateVoiceMenu([v["label"] for v in CHATTERBOX_VOICES])
             self.usage_label.setStringValue_("A free, offline neural voice — no account, no limit.")
         else:
             # OpenAI (and Other) use a fixed voice list; no usage endpoint
@@ -1489,7 +1495,7 @@ class AppDelegate(NSObject):
             # hit on its own and replays the exact same audio instead of regenerating it.
             self._seekToVirtualTime(0.0)
             return
-        target_chars = kokoro_chunk_target if self.config.get("provider") == "Kokoro" else CHUNK_TARGET_CHARS
+        target_chars = chatterbox_chunk_target if self.config.get("provider") == "Chatterbox" else CHUNK_TARGET_CHARS
         chunks = chunk_text(text, target_chars)
         if not chunks:
             return
@@ -1512,8 +1518,8 @@ class AppDelegate(NSObject):
         speed = float(self.config.get("speed", "1.0x").rstrip("x"))
         if provider == "System":
             return self._requestSystemTTS(text, voice, speed)
-        if provider == "Kokoro":
-            return self._requestKokoroTTS(text, voice, speed)
+        if provider == "Chatterbox":
+            return self._requestChatterboxTTS(text, voice, speed)
         if provider == "OpenAI":
             body = json.dumps({"model": "gpt-4o-mini-tts", "voice": voice, "input": text, "speed": speed}).encode()
             req = urllib.request.Request(f"{OPENAI_API}/audio/speech", data=body, headers={
@@ -1597,118 +1603,47 @@ class AppDelegate(NSObject):
         return os.path.join(base, *parts)
 
     @objc.python_method
-    def _stubUnusedPhonemizerBackends(self):
-        # phonemizer's package __init__ unconditionally imports ALL FOUR of its backends
-        # (espeak, espeak-mbrola, festival, segments) just to build one name->class lookup
-        # dict — even though we only ever use espeak (see _requestKokoroTTS/_kokoroEngine).
-        # The festival and segments backends drag in a large, otherwise-unnecessary
-        # dependency tree (segments -> csvw -> rdflib and jsonschema, festival -> its own CLI
-        # tooling) purely to be importable, never to be used — Kokoro only ever passes
-        # lang="en-us"/"en-gb", which resolves to the espeak backend. Pre-registering fake
-        # modules for just those two makes Python's import machinery skip the real (and,
-        # for this app, pointless) imports entirely, so none of that tree needs bundling.
-        import sys
-        import types
-        if "phonemizer.backend.segments" not in sys.modules:
-            mod = types.ModuleType("phonemizer.backend.segments")
-
-            class SegmentsBackend:
-                @staticmethod
-                def name():
-                    return "segments"
-
-                @staticmethod
-                def is_available():
-                    return False
-
-            mod.SegmentsBackend = SegmentsBackend
-            sys.modules["phonemizer.backend.segments"] = mod
-        if "phonemizer.backend.festival.festival" not in sys.modules:
-            pkg = types.ModuleType("phonemizer.backend.festival")
-            mod = types.ModuleType("phonemizer.backend.festival.festival")
-
-            class FestivalBackend:
-                @staticmethod
-                def name():
-                    return "festival"
-
-                @staticmethod
-                def is_available():
-                    return False
-
-            mod.FestivalBackend = FestivalBackend
-            pkg.festival = mod
-            sys.modules["phonemizer.backend.festival"] = pkg
-            sys.modules["phonemizer.backend.festival.festival"] = mod
+    def _chatterboxEngine(self):
+        # Loading the model is a few seconds — must happen once and be reused for every
+        # chunk, not reloaded per request. _chunkWorker runs on background threads (current
+        # chunk + prefetch can both be in flight), so the lazy init itself needs a lock; the
+        # loaded engine's own .generate() calls are safe to share across threads.
+        if getattr(self, "_chatterbox_engine", None) is not None:
+            return self._chatterbox_engine
+        with self._chatterbox_lock:
+            if self._chatterbox_engine is None:
+                from mlx_audio.tts.utils import load_model
+                # Pass the real local snapshot directory, not the "mlx-community/..." repo-id
+                # string — load_model()/get_model_path() short-circuits immediately on a path
+                # that already exists, touching zero huggingface_hub/network code. Confirmed
+                # during the packaging spike that relying on HF_HUB_OFFLINE alone is NOT a
+                # hard guarantee — one fallback path inside huggingface_hub still attempted a
+                # real network connection despite the env var being set.
+                hub_dir = self._resourcePath(
+                    "chatterbox_assets", "hf_cache", "hub",
+                    "models--mlx-community--chatterbox-turbo-4bit", "snapshots")
+                snapshot_dir = os.path.join(hub_dir, os.listdir(hub_dir)[0])
+                self._chatterbox_engine = load_model(snapshot_dir)
+        return self._chatterbox_engine
 
     @objc.python_method
-    def _kokoroEngine(self):
-        # Loading the model takes ~1.25s (measured) — must happen once and be reused for
-        # every chunk, not reloaded per request. _chunkWorker runs on background threads
-        # (current chunk + prefetch can both be in flight), so the lazy init itself needs a
-        # lock; the loaded engine's own .create() calls are safe to share across threads.
-        if getattr(self, "_kokoro_engine", None) is not None:
-            return self._kokoro_engine
-        with self._kokoro_lock:
-            if self._kokoro_engine is None:
-                import numpy as np
-                self._stubUnusedPhonemizerBackends()
-                from kokoro_onnx import Kokoro, EspeakConfig
-                model_path = self._resourcePath("kokoro_assets", "model.onnx")
-                espeak_config = EspeakConfig(
-                    lib_path=self._resourcePath("kokoro_assets", "espeak_bundle", "libespeak-ng.dylib"),
-                    data_path=self._resourcePath("kokoro_assets", "espeak_bundle", "espeak-ng-data"),
-                )
-                # Kokoro's constructor unconditionally np.load()s voices_path even though we
-                # pass each voice's real style vector straight to create() ourselves — it just
-                # needs something loadable, never actually read for content. Validated in the
-                # py2app spike beforehand.
-                dummy_voices = os.path.join(tempfile.gettempdir(), "sonoscript_kokoro_dummy_voices.npz")
-                if not os.path.exists(dummy_voices):
-                    np.savez(dummy_voices, dummy=np.zeros(1, dtype=np.float32))
-                engine = Kokoro(model_path, dummy_voices, espeak_config=espeak_config)
-
-                # kokoro-onnx 0.5.0 (current latest) has two real bugs in _create_audio for
-                # this model's input layout (the "input_ids" branch, used when the export names
-                # its token input "input_ids" rather than "tokens"): it builds the "speed"
-                # input as int32 when the model requires float32 (every call raises
-                # InvalidArgument), and the raw session output is (1, N), not (N,) — left
-                # un-flattened, downstream trimming/duration math silently treats it as a
-                # 1-sample array instead of raising, producing a near-empty result. Patching
-                # just this one method with both fixed — everything else (tokenizing, phoneme-
-                # length batching, trimming, concatenation) stays exactly as create() does it.
-                def _fixed_create_audio(kokoro_self, phonemes, voice, speed):
-                    tokens = np.array(kokoro_self.tokenizer.tokenize(phonemes), dtype=np.int64)
-                    style = np.array(voice[len(tokens)], dtype=np.float32)
-                    inputs = {
-                        "input_ids": [[0, *tokens.tolist(), 0]],
-                        "style": style,
-                        "speed": np.array([speed], dtype=np.float32),
-                    }
-                    audio = kokoro_self.sess.run(None, inputs)[0].reshape(-1)
-                    return audio, kokoro_onnx_config.SAMPLE_RATE
-                import types
-                from kokoro_onnx import config as kokoro_onnx_config
-                engine._create_audio = types.MethodType(_fixed_create_audio, engine)
-
-                self._kokoro_engine = engine
-        return self._kokoro_engine
-
-    @objc.python_method
-    def _requestKokoroTTS(self, text, voice_identifier, speed):
+    def _requestChatterboxTTS(self, text, voice_identifier, speed):
         import numpy as np
-        kokoro = self._kokoroEngine()
-        voice_path = self._resourcePath("kokoro_assets", "voices", f"{voice_identifier}.bin")
-        voice = np.fromfile(voice_path, dtype=np.float32).reshape(-1, 1, 256)
-        # British voices (bf_/bm_) need en-gb phonemization or American pronunciation rules
-        # get applied to a British voice — American voices (af_/am_) use en-us.
-        lang = "en-gb" if voice_identifier.startswith("b") else "en-us"
-        audio, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang=lang)
+        from mlx_audio.tts.generate import generate_audio
+        engine = self._chatterboxEngine()
+        voice = next((v for v in CHATTERBOX_VOICES if v["id"] == voice_identifier), CHATTERBOX_VOICES[0])
+        ref_audio = self._resourcePath("chatterbox_assets", "voices", voice["ref_audio"]) if voice["ref_audio"] else None
 
-        semitones = voice_pitch_semitones(voice_identifier)
-        if semitones:
-            from pitch_shift import pitch_shift
-            audio = pitch_shift(audio, sample_rate, semitones)
+        # split_pattern=None and temperature=0.05 were both found by direct listening tests —
+        # the library's own defaults (per-sentence splitting, temperature ~0.7-0.8) produced
+        # random upward inflections and unstable pacing/duration on some voices/sentences.
+        # generate_audio() is the CLI-oriented wrapper (writes files to disk); calling the
+        # model's own .generate() generator directly instead keeps this fully in-memory,
+        # matching how every other provider here returns audio bytes without touching disk.
+        results = list(engine.generate(
+            text=text, ref_audio=ref_audio, split_pattern=None, temperature=0.05))
+        audio = np.concatenate([np.array(r.audio) for r in results])
+        sample_rate = results[0].sample_rate
 
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
         buf = io.BytesIO()
@@ -1719,15 +1654,6 @@ class AppDelegate(NSObject):
         w.writeframes(pcm)
         w.close()
         return buf.getvalue()
-
-    @objc.python_method
-    def _kokoroVoiceLabel(self, voice_id):
-        # Identifiers follow Kokoro's own convention: first letter is accent (a=American,
-        # b=British), second is gender (f/m), rest is the voice's name (af_bella -> Bella).
-        prefix, _, name = voice_id.partition("_")
-        accent = "American" if prefix[0] == "a" else "British" if prefix[0] == "b" else prefix[0].upper()
-        gender = "Female" if prefix[1] == "f" else "Male" if prefix[1] == "m" else prefix[1].upper()
-        return f"{name.capitalize()} ({accent}, {gender})"
 
     @objc.python_method
     def _chunkWorker(self, text, token, role, index, offset):

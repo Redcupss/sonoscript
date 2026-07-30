@@ -7,19 +7,19 @@ import re
 CHUNK_TARGET_CHARS = 600
 CHUNK_MAX_CHARS = 900
 
-# Kokoro's local inference runs at ~0.45x realtime (measured) — a flat 600-char first chunk
-# would mean 10+ seconds of dead air before playback starts. Only the FIRST few chunks need
-# to be small: prefetch of chunk N+1 only has to finish generating before chunk N's (much
-# longer) playback ends, and at this RTF a chunk can grow by more than 2x the previous one's
-# size and still finish generating well within its predecessor's playback time — so growing
-# quickly back up to the normal size (rather than staying small for the whole document) keeps
-# the fast-start benefit without fragmenting a long document into far more chunks than needed.
-KOKORO_CHUNK_SCHEDULE = [150, 300, 450]  # chunk 3+ falls back to CHUNK_TARGET_CHARS
+# Chatterbox's local inference isn't instant — a flat 600-char first chunk would mean a
+# real, noticeable wait before playback starts. Only the FIRST few chunks need to be small:
+# prefetch of chunk N+1 only has to finish generating before chunk N's (much longer) playback
+# ends, and a chunk can grow by more than 2x the previous one's size and still finish
+# generating well within its predecessor's playback time — so growing quickly back up to the
+# normal size (rather than staying small for the whole document) keeps the fast-start benefit
+# without fragmenting a long document into far more chunks than needed.
+CHATTERBOX_CHUNK_SCHEDULE = [150, 300, 450]  # chunk 3+ falls back to CHUNK_TARGET_CHARS
 
 
-def kokoro_chunk_target(index):
-    if index < len(KOKORO_CHUNK_SCHEDULE):
-        return KOKORO_CHUNK_SCHEDULE[index]
+def chatterbox_chunk_target(index):
+    if index < len(CHATTERBOX_CHUNK_SCHEDULE):
+        return CHATTERBOX_CHUNK_SCHEDULE[index]
     return CHUNK_TARGET_CHARS
 
 
@@ -49,7 +49,7 @@ def chunk_text(text, target_chars=CHUNK_TARGET_CHARS):
     every provider's per-request limit and fast enough to generate that prefetching one
     chunk ahead comfortably outruns playback. target_chars is overridable per-provider — it
     can be a fixed int, or a callable(chunk_index) -> int for graduated sizing (e.g.
-    kokoro_chunk_target, above)."""
+    chatterbox_chunk_target, above)."""
     get_target = target_chars if callable(target_chars) else (lambda i: target_chars)
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s]
     chunks = []

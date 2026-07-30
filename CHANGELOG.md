@@ -4,6 +4,26 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.8.0] (build 31) — 2026-07-30
+
+### Changed
+- Kokoro replaced with **Chatterbox Turbo** (MLX) as the bundled, free, offline default
+  voice engine — same "no account, no downloads" experience, but noticeably more natural
+  and correctly handles heteronyms (e.g. "wind" the weather vs. "wind" a clock) that Kokoro
+  got wrong. Three voices for now: Nova (the model's own built-in voice), Sadie, and Manny
+  — more planned. Existing installs migrate automatically on next launch; no user action
+  needed.
+- Speed control is temporarily unavailable for Chatterbox specifically — the model has no
+  native speed parameter (unlike Kokoro/ElevenLabs/OpenAI). Investigating a proper fix
+  (likely extending the existing Praat/parselmouth pitch-shift integration to also drive
+  duration via its `DurationTier`, which needs no new dependencies) before wiring the
+  existing 0.5x–1.5x control back up for this provider.
+- Settings landed only after direct listening tests, same process used for Puck's pitch
+  fix: sentence-level splitting and default sampling both produced random upward
+  inflections and unstable pacing on some voices/sentences — fixed by generating each
+  chunk as one continuous pass (no per-sentence split) at a low, steady sampling
+  temperature.
+
 ## [1.7.4] (build 30) — 2026-07-29
 
 ### Fixed
