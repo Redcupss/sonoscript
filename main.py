@@ -489,6 +489,7 @@ class AppDelegate(NSObject):
             container = outer
 
         cy = content_h - pad
+        selected_center_y = None
         for r in rows:
             if r is None:
                 cy -= sep_h
@@ -498,6 +499,8 @@ class AppDelegate(NSObject):
                 container.addSubview_(line)
                 continue
             cy -= row_h
+            if r.get("selected"):
+                selected_center_y = cy + row_h / 2.0
             row = HoverButton.alloc().initWithFrame_(NSMakeRect(0, cy, w, row_h))
             row.configure(0.0, 0.09, 0.0)
             row.setTitle_("")
@@ -519,8 +522,18 @@ class AppDelegate(NSObject):
             # this layout is exactly the BOTTOM of the list, not the top. Every dropdown that
             # actually needs scrolling (28 Kokoro voices, long ElevenLabs voice lists) was
             # opening pre-scrolled to its last few rows instead of its first.
+            #
+            # If one row is the current selection, center it in the viewport instead — on a
+            # long list (System's dozens of voices, ElevenLabs' voice library) reopening the
+            # menu should show you where you already are, not force a re-scroll to confirm it.
+            # Falls back to the plain top-of-list behavior above when nothing is selected
+            # (e.g. the wordmark's app menu, which has no concept of a "current" row).
             clip = scroll.contentView()
-            clip.scrollToPoint_(NSMakePoint(0, content_h - height))
+            if selected_center_y is not None:
+                target_origin_y = max(0.0, min(content_h - height, selected_center_y - height / 2.0))
+            else:
+                target_origin_y = content_h - height
+            clip.scrollToPoint_(NSMakePoint(0, target_origin_y))
             scroll.reflectScrolledClipView_(clip)
 
             # Edge fade signals "more rows this way" the same way Claude's own chat scroll
