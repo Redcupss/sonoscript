@@ -191,6 +191,50 @@ class ScrubberView(AppKit.NSView):
         return False
 
 
+class LevelMeterView(AppKit.NSView):
+    """Live single-fill level meter for the voice-recording flow — same track/fill CALayer
+    shape as ScrubberView, just driven by setLevel_(level) (a live mic RMS reading) instead of
+    a mouse drag. Idle (level=0) shows a flat, empty bar, matching "armed, not recording"."""
+
+    TRACK_COLOR = white(0.12)
+    FILL_COLOR = white(0.75)
+
+    @objc.python_method
+    def configure(self):
+        self.level = 0.0
+        self.setWantsLayer_(True)
+        self.track_layer = Quartz.CALayer.layer()
+        self.track_layer.setBackgroundColor_(self.TRACK_COLOR.CGColor())
+        self.fill_layer = Quartz.CALayer.layer()
+        self.fill_layer.setBackgroundColor_(self.FILL_COLOR.CGColor())
+        self.layer().addSublayer_(self.track_layer)
+        self.layer().addSublayer_(self.fill_layer)
+        self._applyPositions()
+
+    @objc.python_method
+    def _applyPositions(self):
+        b = self.bounds()
+        h = b.size.height
+        AppKit.CATransaction.begin()
+        AppKit.CATransaction.setDisableActions_(True)
+        self.track_layer.setFrame_(NSMakeRect(0, 0, b.size.width, h))
+        self.track_layer.setCornerRadius_(h / 2.0)
+        fill_w = max(h, b.size.width * max(0.0, min(1.0, self.level)))
+        self.fill_layer.setFrame_(NSMakeRect(0, 0, fill_w, h))
+        self.fill_layer.setCornerRadius_(h / 2.0)
+        AppKit.CATransaction.commit()
+
+    def setFrame_(self, frame):
+        objc.super(LevelMeterView, self).setFrame_(frame)
+        if hasattr(self, "track_layer"):
+            self._applyPositions()
+
+    @objc.python_method
+    def setLevel_(self, level):
+        self.level = level
+        self._applyPositions()
+
+
 # ---------- controls ----------
 
 class HoverButton(AppKit.NSButton):

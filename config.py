@@ -2,6 +2,12 @@ import json
 import os
 
 CONFIG_PATH = os.path.expanduser("~/Library/Application Support/SonoScript/config.json")
+SESAME_VOICES_DIR = os.path.join(os.path.dirname(CONFIG_PATH), "sesame_voices")
+
+
+def sesame_voices_path(filename):
+    os.makedirs(SESAME_VOICES_DIR, exist_ok=True)
+    return os.path.join(SESAME_VOICES_DIR, filename)
 
 
 def load_config():

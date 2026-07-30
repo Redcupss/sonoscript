@@ -26,3 +26,8 @@ mlx-audio
 
 # Sesame license verification (see license.py) — Ed25519 via PyNaCl, offline, no network
 pynacl
+
+# Sesame voice-recording flow (see _startRecording in main.py) — already bundled transitively
+# via mlx_audio, but main.py now imports it directly for microphone capture, so it's a real
+# dependency of this app, not just an incidental one.
+sounddevice

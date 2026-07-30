@@ -28,12 +28,13 @@ from Foundation import (
 )
 
 from chunking import chunk_text, CHUNK_TARGET_CHARS, chatterbox_chunk_target
-from config import load_config, save_config
+from config import load_config, save_config, sesame_voices_path
 from text_prep import sanitize_for_speech
 from ui_helpers import white, fix_anchor, build_waveform_bars, make_label, symbol_image, format_playback_time
 from widgets import (
     ClickThroughTextField, ScrubberView, HoverButton, icon_button, text_button, cta_button,
     FlatPopUpButton, ControlRow, FocusTextView, BackdropView, CardView, DropdownPanel,
+    LevelMeterView,
 )
 
 APP_NAME = "SonoScript"
@@ -111,6 +112,18 @@ SESAME_MIN_CHARS_PER_SEC = 11.5
 SESAME_MIN_CHARS_FOR_CHECK = 50
 SESAME_MAX_RETRIES = 2
 
+CREATE_VOICE_SENTINEL = "__sesame_create_your_own__"
+RECORD_SAMPLE_RATE = 44100
+RECORD_MIN_SECONDS = 5.0
+RECORD_MAX_SECONDS = 10.0
+# A fixed, app-dictated script — never user-editable — means the app always knows the exact
+# ground-truth transcript with zero risk of a mismatch, and no ASR/transcription step is ever
+# needed (keeping voice creation fully offline, matching the rest of the app). ~21 words lands
+# comfortably inside the 5-10s window even at a slow, careful reading pace. One statement + one
+# question gives the reference clip natural pitch variation instead of a flat monotone.
+RECORD_SCRIPT_TEXT = ("Hi, thanks for recording this with me today. I've been looking forward "
+                      "to trying this out — how's your week been going?")
+
 
 # ---------- app ----------
 
@@ -128,6 +141,15 @@ class AppDelegate(NSObject):
         self._chatterbox_lock = threading.Lock()
         self._sesame_engine = None  # lazy-loaded once, reused for every chunk — see _sesameEngine
         self._sesame_lock = threading.Lock()
+        # Voice-recording flow state (see _showRecordingCaptureCard and friends). Guards
+        # dismissOverlay() against an accidental backdrop-click/Esc silently discarding an
+        # in-progress take — only the flow's own explicit Cancel/Use actions clear this.
+        self._rec_recording_active = False
+        self._rec_stream = None
+        self._rec_buffer = None
+        self._rec_write_pos = 0
+        self._rec_preview_audio = None  # (float32 ndarray, sample_rate) once a take passes validation
+        self._rec_preview_player = None  # AVAudioPlayer, scoped to this flow only — never touches self.player
         # Chunked playback state — see playPauseClicked_/_beginChunkPlayback for the pipeline.
         # playback_token identifies one Play session; background chunk results carrying a
         # stale token (from a Stop or a new Play superseding it) are dropped on arrival.
@@ -1089,6 +1111,8 @@ class AppDelegate(NSObject):
                     timer.invalidate()
                 error_label.setAlphaValue_(0.0)
                 self._updateKeyPlaceholder()
+        elif notification.object() is getattr(self, "rec_name_field", None):
+            self._updateRecordSaveState()
 
     @objc.python_method
     def _updateContinueState(self):
@@ -1426,9 +1450,27 @@ class AppDelegate(NSObject):
     def voiceChanged_(self, sender):
         i = self.voice_popup.indexOfSelectedItem()
         if 0 <= i < len(self.voice_ids):
-            self.config["voice_id"] = self.voice_ids[i]
+            chosen = self.voice_ids[i]
+            if chosen == CREATE_VOICE_SENTINEL:
+                # Never persisted as a real selection — revert the popup to whatever was
+                # already chosen (so the sentinel never visibly "sticks"), then open the
+                # recording flow instead.
+                self._revertVoiceMenuSelection()
+                self._showRecordingCaptureCard()
+                return
+            self.config["voice_id"] = chosen
             save_config(self.config)
             self._invalidateUngeneratedChunks()
+
+    @objc.python_method
+    def _revertVoiceMenuSelection(self):
+        saved = self.config.get("voice_id")
+        idx = self.voice_ids.index(saved) if saved in self.voice_ids else 0
+        self.voice_popup.selectItemAtIndex_(idx)
+
+    @objc.python_method
+    def _sesameVoiceCatalog(self):
+        return list(SESAME_VOICES) + list(self.config.get("sesame_custom_voices", []))
 
     @objc.python_method
     def _invalidateUngeneratedChunks(self):
@@ -1474,11 +1516,9 @@ class AppDelegate(NSObject):
             self._populateVoiceMenu([v["label"] for v in CHATTERBOX_VOICES])
             self.usage_label.setStringValue_("A free, offline neural voice — no account, no limit.")
         elif provider == "Sesame":
-            # The 3 built-in cloned voices work now; "Create your own" isn't shown yet since
-            # the recording flow that would back it doesn't exist yet (a menu entry that does
-            # nothing on click would be worse than not showing it at all).
-            self.voice_ids = [v["id"] for v in SESAME_VOICES]
-            self._populateVoiceMenu([v["label"] for v in SESAME_VOICES])
+            catalog = self._sesameVoiceCatalog()
+            self.voice_ids = [v["id"] for v in catalog] + [CREATE_VOICE_SENTINEL]
+            self._populateVoiceMenu([v["label"] for v in catalog] + ["Create your own..."])
             self.usage_label.setStringValue_("Premium offline voices — private to this Mac.")
         else:
             # OpenAI (and Other) use a fixed voice list; no usage endpoint
@@ -1815,8 +1855,14 @@ class AppDelegate(NSObject):
     def _requestSesameTTS(self, text, voice_identifier, speed):
         import numpy as np
         engine = self._sesameEngine()
-        voice = next((v for v in SESAME_VOICES if v["id"] == voice_identifier), SESAME_VOICES[0])
-        ref_audio = self._resourcePath("sesame_assets", "voices", voice["ref_audio"])
+        catalog = self._sesameVoiceCatalog()
+        voice = next((v for v in catalog if v["id"] == voice_identifier), catalog[0])
+        # Built-ins (Sadie/Manny/Ben) are bundled and keyed by "ref_audio"; a user-created
+        # custom voice lives outside the app bundle (see sesame_voices_path) and is keyed by
+        # "audio_file" instead — see the data model in _maybeFinalizeSesameClone-equivalent
+        # commit path (useRecordingClicked_).
+        ref_audio = (self._resourcePath("sesame_assets", "voices", voice["ref_audio"]) if "ref_audio" in voice
+                     else sesame_voices_path(voice["audio_file"]))
 
         audio, sample_rate = self._generateSesameAudio(engine, text, ref_audio, voice["ref_text"])
 
@@ -1834,6 +1880,297 @@ class AppDelegate(NSObject):
         w.writeframes(pcm)
         w.close()
         return buf.getvalue()
+
+    # ----- Sesame voice recording -----
+    @objc.python_method
+    def _showRecordingCaptureCard(self):
+        self._rec_recording_active = False
+        self._rec_buffer = None
+        self._rec_write_pos = 0
+        self._rec_preview_audio = None
+        if self._rec_preview_player is not None:
+            self._rec_preview_player.stop()
+            self._rec_preview_player = None
+
+        cw, ch = 320, 380
+        card = self._makeCard(cw, ch)
+
+        title = make_label("Record your voice sample", 15, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+        title.setFrame_(NSMakeRect(0, ch - 40, cw, 20))
+
+        script_box = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(20, ch - 160, cw - 40, 106))
+        script_box.setWantsLayer_(True)
+        script_box.layer().setBackgroundColor_(white(0.06).CGColor())
+        script_box.layer().setBorderColor_(white(0.12).CGColor())
+        script_box.layer().setBorderWidth_(1.0)
+        script_box.layer().setCornerRadius_(10.0)
+        script_label = AppKit.NSTextField.alloc().init()
+        script_label.setBezeled_(False)
+        script_label.setDrawsBackground_(False)
+        script_label.setEditable_(False)
+        script_label.setSelectable_(False)
+        style = AppKit.NSMutableParagraphStyle.alloc().init()
+        style.setAlignment_(AppKit.NSTextAlignmentCenter)
+        style.setLineSpacing_(5.0)
+        attrs = {
+            AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(13),
+            AppKit.NSForegroundColorAttributeName: white(0.85),
+            AppKit.NSParagraphStyleAttributeName: style,
+        }
+        script_label.setAttributedStringValue_(
+            AppKit.NSAttributedString.alloc().initWithString_attributes_(RECORD_SCRIPT_TEXT, attrs))
+        script_label.setFrame_(NSMakeRect(12, 8, cw - 40 - 24, 90))
+        script_box.addSubview_(script_label)
+
+        meter = LevelMeterView.alloc().initWithFrame_(NSMakeRect(20, ch - 186, cw - 40, 6))
+        meter.configure()
+        self.rec_meter = meter
+
+        elapsed_label = make_label("0:00", 11, 0.5, align=AppKit.NSTextAlignmentCenter)
+        elapsed_label.setFrame_(NSMakeRect(0, ch - 210, cw, 16))
+        self.rec_elapsed_label = elapsed_label
+
+        error_label = ClickThroughTextField.alloc().init()
+        error_label.setBezeled_(False)
+        error_label.setDrawsBackground_(False)
+        error_label.setEditable_(False)
+        error_label.setSelectable_(False)
+        error_label.setAlignment_(AppKit.NSTextAlignmentCenter)
+        error_label.setFont_(AppKit.NSFont.systemFontOfSize_(11.5))
+        error_label.setAlphaValue_(0.0)
+        error_label.setFrame_(NSMakeRect(10, ch - 236, cw - 20, 16))
+        self.rec_error_label = error_label
+
+        record_btn = icon_button("circle.fill", 22, NSMakeRect(cw / 2 - 26, 56, 52, 52),
+                                  "recordToggleClicked:", self, base=0.0, hover=0.0, corner=26.0, tint=1.0)
+        record_btn.layer().setBackgroundColor_(AppKit.NSColor.systemRedColor().colorWithAlphaComponent_(0.85).CGColor())
+        self.rec_toggle_btn = record_btn
+
+        cancel_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+        cancel_btn = text_button("Cancel", NSMakeRect(cw / 2 - 40, 16, 80, 24), "recordingCancelClicked:", self,
+                                  cancel_font, 0.0, 0.08, 6.0, white(0.5))
+
+        for sub in (title, script_box, meter, elapsed_label, error_label, record_btn, cancel_btn):
+            card.addSubview_(sub)
+        self._presentOverlay(card)
+
+    def recordToggleClicked_(self, sender):
+        if self._rec_recording_active:
+            self._stopRecording()
+        else:
+            self._startRecording()
+
+    @objc.python_method
+    def _startRecording(self):
+        import sounddevice as sd
+        import numpy as np
+        self._rec_buffer = np.zeros(int(RECORD_MAX_SECONDS * RECORD_SAMPLE_RATE), dtype=np.float32)
+        self._rec_write_pos = 0
+
+        def callback(indata, frames, time_info, status):
+            remaining = len(self._rec_buffer) - self._rec_write_pos
+            n = min(frames, remaining)
+            if n > 0:
+                self._rec_buffer[self._rec_write_pos:self._rec_write_pos + n] = indata[:n, 0]
+                self._rec_write_pos += n
+            level = float(np.sqrt(np.mean(np.square(indata[:n, 0])))) if n > 0 else 0.0
+            payload = {"level": level, "elapsed": self._rec_write_pos / RECORD_SAMPLE_RATE}
+            self.performSelectorOnMainThread_withObject_waitUntilDone_("recLevelMain:", payload, False)
+            if self._rec_write_pos >= len(self._rec_buffer):
+                raise sd.CallbackStop
+
+        try:
+            self._rec_stream = sd.InputStream(
+                samplerate=RECORD_SAMPLE_RATE, channels=1, dtype="float32",
+                blocksize=int(RECORD_SAMPLE_RATE * 0.1), callback=callback,
+                finished_callback=lambda: self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "recordingAutoStoppedMain:", None, False))
+            self._rec_stream.start()
+        except Exception as e:
+            self._flashInlineError(self.rec_error_label, f"Couldn't access your microphone: {e}")
+            return
+        self._rec_recording_active = True
+        img = symbol_image("stop.fill", 18)
+        if img:
+            self.rec_toggle_btn.setImage_(img)
+
+    def recordingAutoStoppedMain_(self, _):
+        # The 10s hard cap fired CallbackStop from inside the audio callback itself, rather
+        # than the user clicking Stop in time — same trimming/validation path either way.
+        if self._rec_recording_active:
+            self._stopRecording()
+
+    @objc.python_method
+    def _stopRecording(self):
+        import numpy as np
+        if self._rec_stream is not None:
+            self._rec_stream.stop()
+            self._rec_stream.close()
+            self._rec_stream = None
+        self._rec_recording_active = False
+        audio = self._rec_buffer[:self._rec_write_pos].copy() if self._rec_buffer is not None else np.zeros(0, dtype=np.float32)
+        ok, message = self._validateRecording(audio, RECORD_SAMPLE_RATE)
+        if not ok:
+            img = symbol_image("circle.fill", 22)
+            if img:
+                self.rec_toggle_btn.setImage_(img)
+            self.rec_meter.setLevel_(0.0)
+            self.rec_elapsed_label.setStringValue_("0:00")
+            self._flashInlineError(self.rec_error_label, message)
+            return
+        self._rec_recording_active = True  # a pending, not-yet-saved take — still don't allow silent dismissal
+        self._showRecordingConfirmCard(audio, RECORD_SAMPLE_RATE)
+
+    def recLevelMain_(self, payload):
+        try:
+            self.rec_meter.setLevel_(min(1.0, float(payload["level"]) * 6.0))
+            self.rec_elapsed_label.setStringValue_(format_playback_time(float(payload["elapsed"])))
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
+    @objc.python_method
+    def _validateRecording(self, audio, sample_rate):
+        import numpy as np
+        duration = len(audio) / sample_rate
+        if duration < RECORD_MIN_SECONDS:
+            return False, f"That was too short — read the whole sentence in one go (needs to be at least {int(RECORD_MIN_SECONDS)} seconds)."
+        peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+        if peak < 0.02:
+            return False, "We didn't pick up any sound — check the right microphone is selected and try again."
+        clipped_fraction = float(np.mean(np.abs(audio) > 0.97))
+        if clipped_fraction > 0.005:
+            return False, "That sounded distorted — try sitting a bit further from the microphone and record again."
+        return True, ""
+
+    @objc.python_method
+    def _showRecordingConfirmCard(self, audio, sample_rate):
+        self._rec_preview_audio = (audio, sample_rate)
+        cw, ch = 320, 260
+        card = self._makeCard(cw, ch)
+
+        title = make_label("Listen and name it", 15, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+        title.setFrame_(NSMakeRect(0, ch - 40, cw, 20))
+
+        duration = len(audio) / sample_rate
+        dur_label = make_label(format_playback_time(duration), 11, 0.5, align=AppKit.NSTextAlignmentCenter)
+        dur_label.setFrame_(NSMakeRect(0, ch - 64, cw, 16))
+
+        play_btn = icon_button("play.fill", 15, NSMakeRect(cw / 2 - 20, ch - 138, 40, 40),
+                                "previewToggleClicked:", self, base=0.08, hover=0.16, corner=20.0, tint=0.95)
+        self.rec_preview_play_btn = play_btn
+
+        name_field = AppKit.NSTextField.alloc().initWithFrame_(NSMakeRect(20, ch - 180, cw - 40, 30))
+        name_field.setBezeled_(True)
+        name_field.setBezelStyle_(AppKit.NSTextFieldRoundedBezel)
+        name_field.setDrawsBackground_(True)
+        name_field.setBackgroundColor_(white(0.08))
+        name_field.setFont_(AppKit.NSFont.systemFontOfSize_(13))
+        name_field.setDelegate_(self)
+        attrs = {AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(13),
+                 AppKit.NSForegroundColorAttributeName: white(0.45)}
+        name_field.setPlaceholderAttributedString_(
+            AppKit.NSAttributedString.alloc().initWithString_attributes_("Name this voice", attrs))
+        self.rec_name_field = name_field
+
+        rerecord_font = AppKit.NSFont.systemFontOfSize_weight_(12, AppKit.NSFontWeightMedium)
+        rerecord_btn = text_button("Re-record", NSMakeRect(20, 16, 120, 32), "rerecordClicked:", self,
+                                    rerecord_font, 0.08, 0.16, 9.0, white(0.85))
+        save_btn = cta_button("Save", NSMakeRect(150, 16, cw - 170, 32), "useRecordingClicked:", self)
+        self.rec_save_btn = save_btn
+        self._updateRecordSaveState()
+
+        cancel_font = AppKit.NSFont.systemFontOfSize_(11)
+        cancel_btn = text_button("Cancel", NSMakeRect(cw / 2 - 40, ch - 214, 80, 18), "recordingCancelClicked:", self,
+                                  cancel_font, 0.0, 0.06, 5.0, white(0.35))
+
+        for sub in (title, dur_label, play_btn, name_field, rerecord_btn, save_btn, cancel_btn):
+            card.addSubview_(sub)
+        self._presentOverlay(card)
+
+    @objc.python_method
+    def _updateRecordSaveState(self):
+        enabled = bool(str(self.rec_name_field.stringValue()).strip())
+        attrs = {
+            AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightSemibold),
+            AppKit.NSForegroundColorAttributeName: AppKit.NSColor.colorWithWhite_alpha_(0.11 if enabled else 0.4, 1.0),
+        }
+        self.rec_save_btn.setAttributedTitle_(
+            AppKit.NSAttributedString.alloc().initWithString_attributes_("Save", attrs))
+        self.rec_save_btn.layer().setBackgroundColor_(
+            AppKit.NSColor.colorWithWhite_alpha_(0.95 if enabled else 0.3, 1.0).CGColor())
+
+    def previewToggleClicked_(self, sender):
+        import numpy as np
+        if self._rec_preview_player is not None and self._rec_preview_player.isPlaying():
+            self._rec_preview_player.stop()
+            img = symbol_image("play.fill", 15)
+            if img:
+                self.rec_preview_play_btn.setImage_(img)
+            return
+        audio, sample_rate = self._rec_preview_audio
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        buf = io.BytesIO()
+        w = wave.open(buf, "wb")
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(int(sample_rate))
+        w.writeframes(pcm)
+        w.close()
+        player, err = AVFoundation.AVAudioPlayer.alloc().initWithData_error_(bytes(buf.getvalue()), None)
+        if player is None:
+            self.showError_("Could not play back the recording.")
+            return
+        self._rec_preview_player = player
+        player.play()
+        img = symbol_image("pause.fill", 15)
+        if img:
+            self.rec_preview_play_btn.setImage_(img)
+
+    def rerecordClicked_(self, sender):
+        self._showRecordingCaptureCard()
+
+    def recordingCancelClicked_(self, sender):
+        if self._rec_stream is not None:
+            self._rec_stream.stop()
+            self._rec_stream.close()
+            self._rec_stream = None
+        if self._rec_preview_player is not None:
+            self._rec_preview_player.stop()
+            self._rec_preview_player = None
+        self._rec_recording_active = False
+        self.dismissOverlay()
+
+    def useRecordingClicked_(self, sender):
+        name = str(self.rec_name_field.stringValue()).strip()
+        if not name:
+            return
+        try:
+            import uuid
+            import numpy as np
+            audio, sample_rate = self._rec_preview_audio
+            voice_id = "custom_" + uuid.uuid4().hex[:8]
+            audio_file = f"{voice_id}.wav"
+            dest = sesame_voices_path(audio_file)
+            pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+            with wave.open(dest, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(int(sample_rate))
+                w.writeframes(pcm)
+            entry = {"id": voice_id, "label": name, "audio_file": audio_file, "ref_text": RECORD_SCRIPT_TEXT}
+            self.config.setdefault("sesame_custom_voices", []).append(entry)
+            self.config["voice_id"] = voice_id
+            save_config(self.config)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            self.showError_("Couldn't save that voice — please try again.")
+            return
+        if self._rec_preview_player is not None:
+            self._rec_preview_player.stop()
+            self._rec_preview_player = None
+        self._rec_recording_active = False
+        self.dismissOverlay()
+        self.fetchVoices()
 
     @objc.python_method
     def _chunkWorker(self, text, token, role, index, offset):
@@ -2200,6 +2537,12 @@ class AppDelegate(NSObject):
             traceback.print_exc(file=sys.stderr)
 
     def dismissOverlay(self):
+        if self._rec_recording_active:
+            # A voice-recording take is actively capturing or pending-unsaved — an accidental
+            # backdrop click or Esc press must not silently kill it. The recording flow's own
+            # Cancel/Save actions clear this flag themselves before calling dismissOverlay(),
+            # so this only blocks the ACCIDENTAL paths, never a deliberate one.
+            return
         if self.overlay is None:
             return
         overlay = self.overlay
