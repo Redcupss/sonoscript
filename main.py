@@ -1479,7 +1479,7 @@ class AppDelegate(NSObject):
             # nothing on click would be worse than not showing it at all).
             self.voice_ids = [v["id"] for v in SESAME_VOICES]
             self._populateVoiceMenu([v["label"] for v in SESAME_VOICES])
-            self.usage_label.setStringValue_("Cloned voices — offline, private to this Mac.")
+            self.usage_label.setStringValue_("Premium offline voices — private to this Mac.")
         else:
             # OpenAI (and Other) use a fixed voice list; no usage endpoint
             self.voice_ids = list(OPENAI_VOICES)
