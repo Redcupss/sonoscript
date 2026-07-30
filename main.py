@@ -1372,7 +1372,11 @@ class AppDelegate(NSObject):
     @objc.python_method
     def setStatus(self, text):
         self.status_label.setStringValue_(text)
-        self.status_label.animator().setAlphaValue_(1.0 if text else 0.0)
+
+        def anim(ctx):
+            ctx.setDuration_(0.35)
+            self.status_label.animator().setAlphaValue_(1.0 if text else 0.0)
+        AppKit.NSAnimationContext.runAnimationGroup_(anim)
 
     def setStatusMain_(self, text):
         self.setStatus(str(text))
@@ -2080,7 +2084,7 @@ class AppDelegate(NSObject):
         self._updateRecordSaveState()
 
         cancel_font = AppKit.NSFont.systemFontOfSize_(11)
-        cancel_btn = text_button("Cancel", NSMakeRect(cw / 2 - 40, ch - 214, 80, 18), "recordingCancelClicked:", self,
+        cancel_btn = text_button("Cancel", NSMakeRect(cw / 2 - 40, ch - 208, 80, 18), "recordingCancelClicked:", self,
                                   cancel_font, 0.0, 0.06, 5.0, white(0.35))
 
         for sub in (title, dur_label, play_btn, name_field, rerecord_btn, save_btn, cancel_btn):
@@ -2163,6 +2167,12 @@ class AppDelegate(NSObject):
             save_config(self.config)
         except Exception:
             traceback.print_exc(file=sys.stderr)
+            # Clear the guard BEFORE showError_ — showError_ itself calls dismissOverlay(),
+            # which no-ops while this flag is set (see dismissOverlay's own comment), so
+            # leaving it set here would silently swallow this exact error message: the
+            # overlay stays open, hiding the error behind it on the now-unreachable status
+            # label underneath.
+            self._rec_recording_active = False
             self.showError_("Couldn't save that voice — please try again.")
             return
         if self._rec_preview_player is not None:
@@ -2171,6 +2181,9 @@ class AppDelegate(NSObject):
         self._rec_recording_active = False
         self.dismissOverlay()
         self.fetchVoices()
+        self.setStatus(f'"{name}" saved — ready to use.')
+        AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+            2.5, False, lambda t: self.setStatus(""))
 
     @objc.python_method
     def _chunkWorker(self, text, token, role, index, offset):
