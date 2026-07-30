@@ -20,3 +20,6 @@ praat-parselmouth
 pypar
 tqdm
 soundfile
+
+# Chatterbox Turbo (MLX) — replaces Kokoro as the local neural voice provider (Phase 2)
+mlx-audio
