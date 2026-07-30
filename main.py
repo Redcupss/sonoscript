@@ -2039,7 +2039,6 @@ class AppDelegate(NSObject):
             self.rec_elapsed_label.setStringValue_("0:00")
             self._flashInlineError(self.rec_error_label, message)
             return
-        self._rec_recording_active = True  # a pending, not-yet-saved take — still don't allow silent dismissal
         self._showRecordingConfirmCard(audio, RECORD_SAMPLE_RATE)
 
     def recLevelMain_(self, payload):
@@ -2151,13 +2150,23 @@ class AppDelegate(NSObject):
         self._showRecordingCaptureCard()
 
     def recordingCancelClicked_(self, sender):
-        if self._rec_stream is not None:
-            self._rec_stream.stop()
-            self._rec_stream.close()
-            self._rec_stream = None
-        if self._rec_preview_player is not None:
-            self._rec_preview_player.stop()
-            self._rec_preview_player = None
+        # Cancel must ALWAYS get the user out, no matter what — clear every reference before
+        # touching it, so a raised exception from stop()/close() can never leave a stale
+        # reference behind (which would keep dismissOverlay's own stream guard blocking exit)
+        # or skip the dismiss entirely.
+        stream, self._rec_stream = self._rec_stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+        player, self._rec_preview_player = self._rec_preview_player, None
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
         self._rec_recording_active = False
         self.dismissOverlay()
 
@@ -2192,9 +2201,17 @@ class AppDelegate(NSObject):
             self._rec_recording_active = False
             self.showError_("Couldn't save that voice — please try again.")
             return
-        if self._rec_preview_player is not None:
-            self._rec_preview_player.stop()
-            self._rec_preview_player = None
+        # The voice is already saved on disk and in config at this point — everything below
+        # is just cleanup/UI. Clear the reference before calling stop() (same reasoning as
+        # recordingCancelClicked_): if a real preview player's stop() ever throws, this must
+        # not skip dismissOverlay()/fetchVoices()/setStatus() and strand the user looking at a
+        # stale confirm card for a voice that actually saved successfully.
+        player, self._rec_preview_player = self._rec_preview_player, None
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
         self._rec_recording_active = False
         self.dismissOverlay()
         self.fetchVoices()
@@ -2567,12 +2584,23 @@ class AppDelegate(NSObject):
             traceback.print_exc(file=sys.stderr)
 
     def dismissOverlay(self):
-        if self._rec_recording_active:
-            # A voice-recording take is actively capturing or pending-unsaved — an accidental
-            # backdrop click or Esc press must not silently kill it. The recording flow's own
-            # Cancel/Save actions clear this flag themselves before calling dismissOverlay(),
-            # so this only blocks the ACCIDENTAL paths, never a deliberate one.
+        if self._rec_stream is not None:
+            # Actively capturing from the mic right now — an accidental backdrop click or Esc
+            # press must not silently abandon the hardware stream and a mid-take recording.
+            # Once recording stops (Stop clicked, or the 10s cap fires), this is None again,
+            # so normal dismissal is allowed even during the confirm/preview/naming stage —
+            # losing an unsaved preview there is a much smaller cost than being unable to back
+            # out of the flow at all, which is exactly what blocking it there felt like.
             return
+        if self._rec_preview_player is not None:
+            # Covers backdrop-click/Esc dismissing the recording confirm card directly,
+            # bypassing recordingCancelClicked_'s own explicit cleanup — a playing preview
+            # shouldn't keep going after the card that shows it has closed.
+            try:
+                self._rec_preview_player.stop()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+            self._rec_preview_player = None
         if self.overlay is None:
             return
         overlay = self.overlay
