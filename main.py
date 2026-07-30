@@ -499,10 +499,14 @@ class AppDelegate(NSObject):
                 container.addSubview_(line)
                 continue
             cy -= row_h
-            if r.get("selected"):
+            is_selected = bool(r.get("selected"))
+            if is_selected:
                 selected_center_y = cy + row_h / 2.0
             row = HoverButton.alloc().initWithFrame_(NSMakeRect(0, cy, w, row_h))
-            row.configure(0.0, 0.09, 0.0)
+            # The current selection gets its own persistent (not just on-hover) fill, brighter
+            # than a plain hover, so it stays visually distinct in every state — idle, hovered,
+            # or with a DIFFERENT row being hovered right next to it.
+            row.configure(0.07 if is_selected else 0.0, 0.16 if is_selected else 0.09, 0.0)
             row.setTitle_("")
             lbl = make_label(r["title"], 13, 0.95 if r.get("selected") else 0.82)
             lbl.setFrame_(NSMakeRect(16, (row_h - 18) / 2.0, w - 32, 18))
