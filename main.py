@@ -37,8 +37,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.8.0"
-APP_BUILD = "31"
+APP_VERSION = "1.8.1"
+APP_BUILD = "32"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -56,7 +56,16 @@ CHATTERBOX_VOICES = [
     {"id": "sadie", "label": "Sadie (American, Female)", "ref_audio": "sadie.wav"},
     {"id": "manny", "label": "Manny (American, Male)", "ref_audio": "manny.wav"},
 ]
-SPEEDS = ["0.5x", "0.8x", "1.0x", "1.25x", "1.5x"]
+SPEEDS = ["0.5x", "0.8x", "1.0x", "1.25x", "1.5x"]  # real multipliers actually applied
+
+# Chatterbox's natural speaking pace runs a little fast — a genuine 0.8x slowdown is what
+# actually sounds like an unhurried "normal" pace for this specific voice model, confirmed by
+# direct listening tests across the full speed range. Showing "0.8x" as the default would read
+# as "this is playing slow" even though it's the best-sounding default, so the menu shows every
+# real value shifted up one label for this provider only — real 0.8x appears as "1.0x", real
+# 1.0x as "1.25x", etc. — while every other provider's menu still shows its true value.
+CHATTERBOX_SPEED_DISPLAY = {"0.5x": "0.8x", "0.8x": "1.0x", "1.0x": "1.25x", "1.25x": "1.5x", "1.5x": "1.75x"}
+CHATTERBOX_SPEED_REAL = {v: k for k, v in CHATTERBOX_SPEED_DISPLAY.items()}
 
 
 # ---------- app ----------
@@ -1207,11 +1216,9 @@ class AppDelegate(NSObject):
         self.play_btn = icon_button("play.fill", 12, NSMakeRect(0, 0, 38, 38), "playPauseClicked:", self, base=0.14, hover=0.24, corner=19.0, tint=1.0)
         self.fwd_btn = icon_button("goforward.15", 16, NSMakeRect(0, 0, 40, 40), "skipForward:", self, base=0.0, hover=0.10, corner=20.0)
         self.speed_popup = FlatPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 66, 38), False)
-        for s in SPEEDS:
-            self.speed_popup.addItemWithTitle_(s)
-        self.speed_popup.selectItemWithTitle_(self.config.get("speed", "1.0x"))
         self.speed_popup.setTarget_(self)
         self.speed_popup.setAction_("speedChanged:")
+        self._populateSpeedMenu()
         for sub in (self.paste_btn, self.stop_btn, self.back_btn, self.play_btn, self.fwd_btn, self.speed_popup):
             row.addSubview_(sub)
         row.setNeedsLayout_(True)
@@ -1330,9 +1337,24 @@ class AppDelegate(NSObject):
             self.updateCharCount()
 
     def speedChanged_(self, sender):
-        self.config["speed"] = str(self.speed_popup.titleOfSelectedItem())
+        displayed = str(self.speed_popup.titleOfSelectedItem())
+        real = CHATTERBOX_SPEED_REAL.get(displayed, displayed) if self.config.get("provider") == "Chatterbox" else displayed
+        self.config["speed"] = real
         save_config(self.config)
         self._invalidateUngeneratedChunks()
+
+    @objc.python_method
+    def _populateSpeedMenu(self):
+        # Chatterbox shows shifted display labels (see CHATTERBOX_SPEED_DISPLAY) — every other
+        # provider shows its real value as-is. self.config["speed"] always stores the REAL
+        # value regardless of provider, so switching providers never loses the actual setting.
+        real = self.config.get("speed", "0.8x")
+        is_cb = self.config.get("provider") == "Chatterbox"
+        self.speed_popup.removeAllItems()
+        for s in SPEEDS:
+            self.speed_popup.addItemWithTitle_(CHATTERBOX_SPEED_DISPLAY.get(s, s) if is_cb else s)
+        selected = CHATTERBOX_SPEED_DISPLAY.get(real, real) if is_cb else real
+        self.speed_popup.selectItemWithTitle_(selected)
 
     def voiceChanged_(self, sender):
         i = self.voice_popup.indexOfSelectedItem()
@@ -1361,6 +1383,7 @@ class AppDelegate(NSObject):
     # ----- voices / usage -----
     def fetchVoices(self):
         provider = self.config.get("provider", "ElevenLabs")
+        self._populateSpeedMenu()
         if provider == "ElevenLabs":
             self.setStatus("Loading voices...")
             threading.Thread(target=self._fetchElVoicesWorker, daemon=True).start()
@@ -1515,7 +1538,7 @@ class AppDelegate(NSObject):
         provider = self.config.get("provider", "ElevenLabs")
         key = self.config.get("api_key", "")
         voice = self.config.get("voice_id", "")
-        speed = float(self.config.get("speed", "1.0x").rstrip("x"))
+        speed = float(self.config.get("speed", "0.8x").rstrip("x"))
         if provider == "System":
             return self._requestSystemTTS(text, voice, speed)
         if provider == "Chatterbox":
@@ -1629,7 +1652,6 @@ class AppDelegate(NSObject):
     @objc.python_method
     def _requestChatterboxTTS(self, text, voice_identifier, speed):
         import numpy as np
-        from mlx_audio.tts.generate import generate_audio
         engine = self._chatterboxEngine()
         voice = next((v for v in CHATTERBOX_VOICES if v["id"] == voice_identifier), CHATTERBOX_VOICES[0])
         ref_audio = self._resourcePath("chatterbox_assets", "voices", voice["ref_audio"]) if voice["ref_audio"] else None
@@ -1637,13 +1659,19 @@ class AppDelegate(NSObject):
         # split_pattern=None and temperature=0.05 were both found by direct listening tests —
         # the library's own defaults (per-sentence splitting, temperature ~0.7-0.8) produced
         # random upward inflections and unstable pacing/duration on some voices/sentences.
-        # generate_audio() is the CLI-oriented wrapper (writes files to disk); calling the
-        # model's own .generate() generator directly instead keeps this fully in-memory,
-        # matching how every other provider here returns audio bytes without touching disk.
+        # Calling the model's own .generate() generator directly (not generate_audio(), the
+        # CLI-oriented wrapper that writes files to disk) keeps this fully in-memory, matching
+        # how every other provider here returns audio bytes without touching disk.
         results = list(engine.generate(
             text=text, ref_audio=ref_audio, split_pattern=None, temperature=0.05))
         audio = np.concatenate([np.array(r.audio) for r in results])
         sample_rate = results[0].sample_rate
+
+        # Chatterbox has no native speed parameter (unlike every other provider here) — see
+        # time_stretch's own docstring for why this specific technique was picked.
+        if speed != 1.0:
+            from pitch_shift import time_stretch
+            audio = time_stretch(audio, sample_rate, speed)
 
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
         buf = io.BytesIO()

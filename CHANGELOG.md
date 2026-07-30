@@ -4,6 +4,17 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.8.1] (build 32) — 2026-07-30
+
+### Changed
+- Speed control now works for Chatterbox too, despite the model having no native speed
+  parameter of its own (unlike Kokoro/ElevenLabs/OpenAI) — extends the existing
+  Praat/parselmouth pitch-shift integration to also drive duration via its `DurationTier`,
+  so no new dependency was needed. Chatterbox's most natural pace sits slightly slower than
+  the other providers', so its speed menu is relabeled to match: what's actually 0.8x plays
+  as the default and shows as "1.0x," with every other option shifted the same way
+  (1.0x real shows as "1.25x," and so on). Every other provider's speed menu is unaffected.
+
 ## [1.8.0] (build 31) — 2026-07-30
 
 ### Changed
@@ -13,11 +24,9 @@ build number increments once per release regardless of version bump.
   got wrong. Three voices for now: Nova (the model's own built-in voice), Sadie, and Manny
   — more planned. Existing installs migrate automatically on next launch; no user action
   needed.
-- Speed control is temporarily unavailable for Chatterbox specifically — the model has no
-  native speed parameter (unlike Kokoro/ElevenLabs/OpenAI). Investigating a proper fix
-  (likely extending the existing Praat/parselmouth pitch-shift integration to also drive
-  duration via its `DurationTier`, which needs no new dependencies) before wiring the
-  existing 0.5x–1.5x control back up for this provider.
+- Speed control was temporarily unavailable for Chatterbox specifically in this release —
+  the model has no native speed parameter (unlike Kokoro/ElevenLabs/OpenAI). Fixed in 1.8.1,
+  immediately after.
 - Settings landed only after direct listening tests, same process used for Puck's pitch
   fix: sentence-level splitting and default sampling both produced random upward
   inflections and unstable pacing on some voices/sentences — fixed by generating each
