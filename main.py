@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import queue
 import shlex
 import ssl
 import struct
@@ -30,12 +31,14 @@ from Foundation import (
 
 from chunking import chunk_text, CHUNK_TARGET_CHARS, chatterbox_chunk_target
 from config import load_config, save_config, sesame_voices_path
+import history
 from text_prep import sanitize_for_speech
 from ui_helpers import white, fix_anchor, build_waveform_bars, make_label, symbol_image, format_playback_time
 from widgets import (
     ClickThroughTextField, ScrubberView, HoverButton, icon_button, text_button, cta_button,
     FlatPopUpButton, ControlRow, FocusTextView, BackdropView, CardView, DropdownPanel,
-    LevelMeterView, EditableNameField, RecordButton, text_button_brighten,
+    LevelMeterView, EditableNameField, RecordButton, text_button_brighten, BrightenOnHoverButton,
+    PulsingLabel, ShimmerBorderView,
 )
 
 APP_NAME = "SonoScript"
@@ -142,6 +145,15 @@ class AppDelegate(NSObject):
         self._chatterbox_lock = threading.Lock()
         self._sesame_engine = None  # lazy-loaded once, reused for every chunk — see _sesameEngine
         self._sesame_lock = threading.Lock()
+        # Every chunk/prefetch/seek used to spawn its own brand-new threading.Thread to call
+        # into the local MLX engine (Chatterbox/Sesame) — fine for a short passage, but a long
+        # one (a whole book chapter) creates enough distinct native threads over a session to
+        # exhaust MLX's own per-thread GPU stream pool, surfacing as a real, reproducible
+        # crash: "Couldn't generate speech: There is no Stream(gpu, 2) in current thread."
+        # Routing every chunk-generation job through ONE persistent worker thread instead
+        # means MLX only ever sees a single thread identity for the app's entire lifetime.
+        self._tts_job_queue = queue.Queue()
+        threading.Thread(target=self._ttsWorkerLoop, daemon=True).start()
         # Voice-recording flow state (see _showRecordingCaptureCard and friends). Guards
         # dismissOverlay() against an accidental backdrop-click/Esc silently discarding an
         # in-progress take — only the flow's own explicit Cancel/Use actions clear this.
@@ -201,6 +213,16 @@ class AppDelegate(NSObject):
         threading.Thread(target=self._checkUpdateWorker, args=(True,), daemon=True).start()
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, app):
+        # Standard Mac app lifecycle: closing the window is not the same as quitting. Staying
+        # alive in the Dock after the window closes is also what lets an in-progress
+        # background save/generation actually finish instead of being killed mid-flight —
+        # only a real Quit (Cmd-Q, or Quit from the Dock menu) should end the process.
+        return False
+
+    def applicationShouldHandleReopen_hasVisibleWindows_(self, app, has_visible_windows):
+        if not has_visible_windows:
+            self.window.makeKeyAndOrderFront_(None)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
         return True
 
     # ----- menu bar -----
@@ -270,6 +292,12 @@ class AppDelegate(NSObject):
         # space and it snaps into a corner.
         self.window.setMinSize_(NSMakeSize(360, 458))
         self.window.setMovableByWindowBackground_(True)
+        # A programmatically-created NSWindow defaults to isReleasedWhenClosed=YES — without
+        # this, closing the window (now that the app itself no longer quits when you do)
+        # would deallocate the window and its whole content view hierarchy for good, leaving
+        # no way to bring it back via the Dock icon and a dangling self.window reference used
+        # everywhere else in this file.
+        self.window.setReleasedWhenClosed_(False)
 
         effect = AppKit.NSVisualEffectView.alloc().initWithFrame_(rect)
         effect.setMaterial_(AppKit.NSVisualEffectMaterialHUDWindow)
@@ -292,9 +320,9 @@ class AppDelegate(NSObject):
         # wordmark button, top-right of title bar; opens the app popup menu
         h = rect.size.height
         font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightSemibold)
-        self.wordmark = text_button(
+        self.wordmark = text_button_brighten(
             APP_NAME, NSMakeRect(rect.size.width - 96, h - 32, 84, 26),
-            "wordmarkClicked:", self, font, 0.0, 0.12, 7.0, white(0.55),
+            "wordmarkClicked:", self, font, white(0.55), white(1.0),
         )
         self.wordmark.setAutoresizingMask_(AppKit.NSViewMinXMargin | AppKit.NSViewMinYMargin)
         self.root.addSubview_(self.wordmark)
@@ -494,7 +522,7 @@ class AppDelegate(NSObject):
             def scroll_started(note):
                 suppress_hover["active"] = True
                 for r in hover_rows:
-                    r._fill(r._base_alpha, animated=False)
+                    r._bright_label.setAlphaValue_(0.0)
 
             def scroll_ended(note):
                 suppress_hover["active"] = False
@@ -522,16 +550,18 @@ class AppDelegate(NSObject):
             is_selected = bool(r.get("selected"))
             if is_selected:
                 selected_center_y = cy + row_h / 2.0
-            row = HoverButton.alloc().initWithFrame_(NSMakeRect(0, cy, w, row_h))
-            # The current selection gets its own persistent (not just on-hover) fill, brighter
-            # than a plain hover, so it stays visually distinct in every state — idle, hovered,
-            # or with a DIFFERENT row being hovered right next to it.
-            row.configure(0.07 if is_selected else 0.0, 0.16 if is_selected else 0.09, 0.0)
-            row.setTitle_("")
-            lbl = make_label(r["title"], 13, 0.95 if r.get("selected") else 0.82)
-            lbl.setFrame_(NSMakeRect(16, (row_h - 18) / 2.0, w - 32, 18))
-            lbl.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewMinYMargin | AppKit.NSViewMaxYMargin)
-            row.addSubview_(lbl)
+            row = BrightenOnHoverButton.alloc().initWithFrame_(NSMakeRect(0, cy, w, row_h))
+            # No background pill at all, for selected or hovered — three distinct text-only
+            # brightness tiers: dim (plain row) < hover < selected-at-rest. Selected is the
+            # brightest/topmost tier here (a trial swap vs. the previous hover-is-brightest
+            # version) — hovering the selected row itself will read as a slight DIM rather
+            # than a brighten, which is the natural side effect of putting selected on top.
+            row_font = AppKit.NSFont.systemFontOfSize_(13)
+            dim_color = white(1.0 if is_selected else 0.42)
+            row.configureBrighten(
+                r["title"], row_font, dim_color, white(0.8),
+                align=AppKit.NSTextAlignmentLeft,
+                label_frame=NSMakeRect(16, (row_h - 18) / 2.0, w - 32, 18))
             row.setTarget_(self)
             row.setAction_("_dropdownRowClicked:")
             row._on_click = r["on_click"]
@@ -1301,13 +1331,14 @@ class AppDelegate(NSObject):
         # text card (flexible height); controls live below it. 156 instead of 128 leaves room
         # for the scrubber row (124-148) between the card and the transport controls (70-112).
         card_bottom = 156
-        self.card = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(20, card_bottom, W - 40, b.size.height - 58 - 8 - card_bottom))
+        self.card = ShimmerBorderView.alloc().initWithFrame_(NSMakeRect(20, card_bottom, W - 40, b.size.height - 58 - 8 - card_bottom))
         self.card.setWantsLayer_(True)
         self.card.layer().setBackgroundColor_(white(0.06).CGColor())
         self.card.layer().setBorderColor_(white(0.10).CGColor())
         self.card.layer().setBorderWidth_(1.0)
         self.card.layer().setCornerRadius_(14.0)
         self.card.layer().setMasksToBounds_(True)
+        self.card.configureShimmerBorder(14.0, white(0.35))
         self.card.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
 
         cb = self.card.bounds()
@@ -1388,7 +1419,10 @@ class AppDelegate(NSObject):
         self.scrubber.on_scrub = self._scrubberDragged
         self.scrubber.on_scrub_end = self._scrubberReleased
 
-        self.status_label = make_label("", 10, 0.5, align=AppKit.NSTextAlignmentCenter)
+        self.status_label = PulsingLabel.alloc().init()
+        self.status_label.configurePulse(
+            AppKit.NSFont.systemFontOfSize_weight_(10, AppKit.NSFontWeightRegular),
+            white(0.32), white(0.95), align=AppKit.NSTextAlignmentCenter)
         self.status_label.setFrame_(NSMakeRect(20, 52, W - 40, 13))
         self.status_label.setAutoresizingMask_(AppKit.NSViewWidthSizable)
         self.status_label.setAlphaValue_(0.0)
@@ -1431,7 +1465,20 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def setStatus(self, text):
+        # A previous error may have left textColor red via _flashInlineError, which never
+        # restores it on its own — every real status update must reclaim the label's normal
+        # look, not just whichever one happens to say "Generating...".
+        self.status_label.resetBaseColor()
         self.status_label.setStringValue_(text)
+        card = getattr(self, "card", None)
+        if text == "Generating...":
+            self.status_label.startPulsing()
+            if card is not None:
+                card.startBorderShimmer()
+        else:
+            self.status_label.stopPulsing()
+            if card is not None:
+                card.stopBorderShimmer()
 
         def anim(ctx):
             ctx.setDuration_(0.35)
@@ -1462,6 +1509,13 @@ class AppDelegate(NSObject):
         existing = self._fade_timers.get(key)
         if existing is not None:
             existing.invalidate()
+        # status_label may be mid-"Generating..." pulse when an error interrupts it (e.g. a
+        # generation failure) — plain NSTextFields like key_error_label don't have this method.
+        if hasattr(label, "stopPulsing"):
+            label.stopPulsing()
+            card = getattr(self, "card", None)
+            if card is not None:
+                card.stopBorderShimmer()
         label.setTextColor_(AppKit.NSColor.systemRedColor())
         label.setStringValue_(message)
         label.setAlphaValue_(0.0)
@@ -1801,9 +1855,9 @@ class AppDelegate(NSObject):
     @objc.python_method
     def _resourcePath(self, *parts):
         # In the frozen py2app bundle, py2app sets RESOURCEPATH to Contents/Resources and
-        # "resources": ["kokoro_assets"] in setup.py copies the whole directory tree there
+        # "resources": ["chatterbox_assets"] in setup.py copies the whole directory tree there
         # unchanged; in dev mode (running main.py directly) there's no RESOURCEPATH, so this
-        # falls back to the script's own directory, where kokoro_assets/ also lives. Same
+        # falls back to the script's own directory, where chatterbox_assets/ also lives. Same
         # relative layout either way — validated against a real frozen build beforehand.
         base = os.environ.get("RESOURCEPATH", os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(base, *parts)
@@ -1811,9 +1865,11 @@ class AppDelegate(NSObject):
     @objc.python_method
     def _chatterboxEngine(self):
         # Loading the model is a few seconds — must happen once and be reused for every
-        # chunk, not reloaded per request. _chunkWorker runs on background threads (current
-        # chunk + prefetch can both be in flight), so the lazy init itself needs a lock; the
-        # loaded engine's own .generate() calls are safe to share across threads.
+        # chunk, not reloaded per request. Every chunk now funnels through the single
+        # persistent _ttsWorkerLoop thread (see applicationDidFinishLaunching_ — spawning a
+        # fresh thread per chunk used to exhaust MLX's own per-thread GPU stream pool on long
+        # text), so this lock isn't guarding against real concurrent access anymore; it's
+        # cheap to keep as a defensive guard in case that ever changes.
         if getattr(self, "_chatterbox_engine", None) is not None:
             return self._chatterbox_engine
         with self._chatterbox_lock:
@@ -2448,6 +2504,29 @@ class AppDelegate(NSObject):
         AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
             2.0, False, lambda t: self.setStatus(""))
 
+    def _ttsWorkerLoop(self):
+        # Runs forever on the ONE persistent thread MLX ever sees — see the comment where this
+        # is started in applicationDidFinishLaunching_. Must never actually exit or die: an
+        # uncaught exception here would silently kill generation for the rest of the app's
+        # life with no error shown, a far worse failure mode than today's crash, so this
+        # catches everything rather than letting anything propagate out of the loop.
+        while True:
+            job = self._tts_job_queue.get()
+            try:
+                text, token, role, index, offset = job
+                # A superseded job (Stop, or a new Play/seek issued before this one was even
+                # pulled off the queue) is cheap to skip before spending real generation time
+                # on audio nobody will ever see — chunkResultMain_ still re-checks the token
+                # itself once a result comes back, so this is a pure efficiency win, not a
+                # correctness requirement.
+                if token is self.playback_token:
+                    self._chunkWorker(text, token, role, index, offset)
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+            finally:
+                self._tts_job_queue.task_done()
+
     @objc.python_method
     def _chunkWorker(self, text, token, role, index, offset):
         try:
@@ -2534,11 +2613,7 @@ class AppDelegate(NSObject):
         if cached is not None:
             self.next_chunk_audio = cached
             return
-        threading.Thread(
-            target=self._chunkWorker,
-            args=(self.all_chunks[next_index], self.playback_token, "prefetch", next_index, 0.0),
-            daemon=True,
-        ).start()
+        self._tts_job_queue.put((self.all_chunks[next_index], self.playback_token, "prefetch", next_index, 0.0))
 
     @objc.python_method
     def _resetPlaybackState(self):
@@ -2553,12 +2628,62 @@ class AppDelegate(NSObject):
         self.session_text = None
         self.waiting_for_next = False
 
+    @objc.python_method
+    def _concatenateSessionAudio(self):
+        """Combines every chunk's cached WAV bytes into one WAV blob — only meaningful right
+        at the natural end of playback, when every chunk (0..len(all_chunks)-1) is guaranteed
+        to already be sitting in chunk_audio_cache from having played through in order."""
+        frames = bytearray()
+        params = None
+        for i in range(len(self.all_chunks)):
+            chunk_bytes = self.chunk_audio_cache.get(i)
+            if chunk_bytes is None:
+                return None
+            with wave.open(io.BytesIO(chunk_bytes), "rb") as w:
+                if params is None:
+                    params = (w.getnchannels(), w.getsampwidth(), w.getframerate())
+                frames += w.readframes(w.getnframes())
+        if params is None:
+            return None
+        nchannels, sampwidth, framerate = params
+        buf = io.BytesIO()
+        out = wave.open(buf, "wb")
+        out.setnchannels(nchannels)
+        out.setsampwidth(sampwidth)
+        out.setframerate(framerate)
+        out.writeframes(bytes(frames))
+        out.close()
+        return buf.getvalue()
+
+    @objc.python_method
+    def _saveSessionToHistoryWorker(self, text, provider, voice, speed, wav_bytes):
+        try:
+            history.add_entry(text=text, provider=provider, voice=voice, speed=speed, wav_bytes=wav_bytes)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+
     def audioPlayerDidFinishPlaying_successfully_(self, player, flag):
         if player is not self.player:
             return  # a stale delegate callback from a player Stop already replaced/cleared
         next_index = self.chunk_index + 1
         if next_index >= len(self.all_chunks):
-            # Reached the actual end of the document. Deliberately NOT _resetPlaybackState()
+            # Reached the actual end of the document — the one trigger (besides an explicit
+            # Save, not built yet) for entering the visible "recent generations" cache. A
+            # take that gets stopped partway through (to tweak voice/speed/text) never gets
+            # here, so it never surfaces — exactly the hidden-vs-visible split from the
+            # design discussion. Combining+writing happens off the main thread since a long
+            # chapter's audio is a real amount of bytes to concatenate and write to disk.
+            if self.session_text:
+                combined = self._concatenateSessionAudio()
+                if combined is not None:
+                    threading.Thread(
+                        target=self._saveSessionToHistoryWorker,
+                        args=(self.session_text, self.config.get("provider", ""),
+                              self.config.get("voice_id", ""), self.config.get("speed", ""), combined),
+                        daemon=True,
+                    ).start()
+            # Deliberately NOT _resetPlaybackState()
             # here — that would also wipe all_chunks/chunk_durations/chunk_audio_cache, so
             # pressing Play again would re-chunk and regenerate from scratch instead of just
             # replaying what's already sitting in cache. Only the "currently playing" bits
@@ -2674,11 +2799,7 @@ class AppDelegate(NSObject):
             return
 
         self.setStatus("Generating...")
-        threading.Thread(
-            target=self._chunkWorker,
-            args=(self.all_chunks[target_index], self.playback_token, "seek", target_index, offset),
-            daemon=True,
-        ).start()
+        self._tts_job_queue.put((self.all_chunks[target_index], self.playback_token, "seek", target_index, offset))
 
     @objc.python_method
     def _startProgressTimer(self):

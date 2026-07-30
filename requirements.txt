@@ -3,16 +3,7 @@ pyobjc-framework-AVFoundation
 pyobjc-framework-Quartz
 certifi
 py2app
-
-# Kokoro (local neural voice provider)
-kokoro-onnx
 numpy
-onnxruntime
-espeakng-loader
-phonemizer-fork
-dlinfo
-joblib
-attrs
 
 # Per-voice pitch shift (see pitch_shift.py)
 psola
@@ -21,7 +12,7 @@ pypar
 tqdm
 soundfile
 
-# Chatterbox Turbo (MLX) — replaces Kokoro as the local neural voice provider (Phase 2)
+# Chatterbox Turbo (MLX) — the local neural voice provider
 mlx-audio
 
 # Sesame license verification (see license.py) — Ed25519 via PyNaCl, offline, no network

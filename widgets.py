@@ -1,3 +1,5 @@
+import time
+
 import AppKit
 import Quartz
 import objc
@@ -69,6 +71,10 @@ class EditableNameField(AppKit.NSTextField):
         self.setDrawsBackground_(False)
         self.setEditable_(False)
         self.setSelectable_(False)
+        # Without this, becoming first responder (on double-click) draws AppKit's system
+        # accent-color focus ring around the whole field — a blue/purple halo that has nothing
+        # to do with this app's own hover/editing outline colors.
+        self.setFocusRingType_(AppKit.NSFocusRingTypeNone)
         self.setWantsLayer_(True)
         self.layer().setCornerRadius_(6.0)
         self.layer().setBackgroundColor_(AppKit.NSColor.clearColor().CGColor())
@@ -384,10 +390,31 @@ class HoverButton(AppKit.NSButton):
 
     @objc.python_method
     def _fill(self, alpha, animated=True):
-        AppKit.CATransaction.begin()
-        AppKit.CATransaction.setAnimationDuration_(getattr(self, "_fade_duration", 0.18) if animated else 0.0)
-        self.layer().setBackgroundColor_(white(alpha).CGColor())
-        AppKit.CATransaction.commit()
+        layer = self.layer()
+        target = white(alpha).CGColor()
+        # A plain CATransaction-wrapped property set relies on CALayer's IMPLICIT action for
+        # "backgroundColor" — but confirmed by direct testing, NSButton's own layer suppresses
+        # that implicit action (this exact technique animates fine on EditableNameField, an
+        # NSTextField, but produced a true instant swap with zero fade here — same code
+        # pattern, different control class). An EXPLICIT animation sidesteps whatever NSButton
+        # is doing to the implicit-action lookup entirely; setting the real backgroundColor
+        # alongside it keeps the end state correct once the animation finishes and is removed.
+        # A spring (not a fixed-duration eased curve) also reads noticeably smoother when hover
+        # re-triggers rapidly (moving quickly across several controls) — each new animation
+        # starts from wherever the previous one actually was instead of visibly restarting.
+        if animated:
+            pres = layer.presentationLayer()
+            from_color = pres.backgroundColor() if pres is not None else layer.backgroundColor()
+            anim = Quartz.CASpringAnimation.animationWithKeyPath_("backgroundColor")
+            anim.setFromValue_(from_color)
+            anim.setToValue_(target)
+            anim.setMass_(1.0)
+            anim.setStiffness_(400.0)
+            anim.setDamping_(22.0)
+            anim.setInitialVelocity_(0.0)
+            anim.setDuration_(min(anim.settlingDuration(), 0.4))
+            layer.addAnimation_forKey_(anim, "hoverFill")
+        layer.setBackgroundColor_(target)
 
     def updateTrackingAreas(self):
         objc.super(HoverButton, self).updateTrackingAreas()
@@ -466,11 +493,17 @@ class BrightenOnHoverButton(HoverButton):
     already used for the status label and every other fade in this app) does."""
 
     @objc.python_method
-    def configureBrighten(self, title, font, dim_color, bright_color):
+    def configureBrighten(self, title, font, dim_color, bright_color, align=None, label_frame=None):
         self.configure(0.0, 0.0, 0.0)
         self._fill = lambda *a, **k: None  # never let the inherited hover fill touch this button
         self.setTitle_("")
-        b = self.bounds()
+        align = align if align is not None else AppKit.NSTextAlignmentCenter
+        # A caller-supplied frame/alignment (list rows: left-aligned, inset from the row's own
+        # edges) instead of always filling+centering the whole bounds (buttons like Cancel) —
+        # same overlay technique either way, just laid out differently.
+        frame = label_frame if label_frame is not None else self.bounds()
+        autoresize = (AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable) if label_frame is None else (
+            AppKit.NSViewWidthSizable | AppKit.NSViewMinYMargin | AppKit.NSViewMaxYMargin)
         dim = AppKit.NSTextField.alloc().init()
         dim.setBezeled_(False)
         dim.setDrawsBackground_(False)
@@ -478,10 +511,10 @@ class BrightenOnHoverButton(HoverButton):
         dim.setSelectable_(False)
         dim.setFont_(font)
         dim.setTextColor_(dim_color)
-        dim.setAlignment_(AppKit.NSTextAlignmentCenter)
+        dim.setAlignment_(align)
         dim.setStringValue_(title)
-        dim.setFrame_(b)
-        dim.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        dim.setFrame_(frame)
+        dim.setAutoresizingMask_(autoresize)
         bright = AppKit.NSTextField.alloc().init()
         bright.setBezeled_(False)
         bright.setDrawsBackground_(False)
@@ -489,14 +522,15 @@ class BrightenOnHoverButton(HoverButton):
         bright.setSelectable_(False)
         bright.setFont_(font)
         bright.setTextColor_(bright_color)
-        bright.setAlignment_(AppKit.NSTextAlignmentCenter)
+        bright.setAlignment_(align)
         bright.setStringValue_(title)
-        bright.setFrame_(b)
-        bright.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        bright.setFrame_(frame)
+        bright.setAutoresizingMask_(autoresize)
         bright.setAlphaValue_(0.0)
         self.addSubview_(dim)
         self.addSubview_(bright)
         self._bright_label = bright
+        self._dim_label = dim
 
     def mouseEntered_(self, event):
         if getattr(self, "_suppress_hover", None) and self._suppress_hover.get("active"):
@@ -522,6 +556,197 @@ def text_button_brighten(title, frame, action, target, font, dim_color, bright_c
     return btn
 
 
+class PulsingLabel(AppKit.NSTextField):
+    """A label that can show a soft, looping left-to-right brightness sweep across its own
+    text — signals "actively working" (e.g. during TTS generation, which has no reliable
+    percentage to show as a real progress bar) instead of sitting there looking possibly
+    frozen. Same overlay idea as BrightenOnHoverButton (a dim base copy always visible, a
+    brighter copy on top) but here the bright copy's own layer gets a CAGradientLayer mask
+    with one narrow bright band, and a repeating NSTimer explicitly steps that band's
+    location each frame — a genuine CAAnimation added directly to the mask layer (tried both
+    a transform and a "locations" animation) never visibly moved at all, confirmed directly:
+    its presentationLayer value WAS updating correctly in isolation, but nothing was pumping
+    a fresh composite of the layer it was masking, so the render just sat on one frame
+    forever. Explicitly setting the mask's geometry on a timer forces a real redraw each
+    tick, sidestepping whatever isn't re-compositing an animating mask on its own here."""
+
+    PULSE_DURATION = 2.2
+
+    @objc.python_method
+    def configurePulse(self, font, base_color, bright_color, align=AppKit.NSTextAlignmentLeft):
+        self.setBezeled_(False)
+        self.setDrawsBackground_(False)
+        self.setEditable_(False)
+        self.setSelectable_(False)
+        self.setFont_(font)
+        self.setTextColor_(base_color)
+        self.setAlignment_(align)
+        self.setWantsLayer_(True)
+        self._pulse_font = font
+        self._pulse_align = align
+        self._base_color = base_color
+        self._bright_color = bright_color
+        self._bright_label = None
+        self._pulse_gradient = None
+        self._pulse_timer = None
+        self._pulse_start = None
+        self._pulsing = False
+
+    @objc.python_method
+    def resetBaseColor(self):
+        # Callers (e.g. _flashInlineError) may set textColor directly to flash a red error on
+        # this same label — nothing else ever restores it afterward, so the NEXT normal status
+        # message silently inherits that stale red. Call this whenever showing a real status.
+        self.setTextColor_(self._base_color)
+
+    @objc.python_method
+    def startPulsing(self):
+        if self._bright_label is None:
+            bright = AppKit.NSTextField.alloc().init()
+            bright.setBezeled_(False)
+            bright.setDrawsBackground_(False)
+            bright.setEditable_(False)
+            bright.setSelectable_(False)
+            bright.setFont_(self._pulse_font)
+            bright.setAlignment_(self._pulse_align)
+            bright.setTextColor_(self._bright_color)
+            bright.setFrame_(self.bounds())
+            bright.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+            bright.setWantsLayer_(True)
+            self.addSubview_(bright)
+            self._bright_label = bright
+
+            gradient = Quartz.CAGradientLayer.layer()
+            gradient.setFrame_(bright.bounds())
+            gradient.setStartPoint_(NSMakePoint(0.0, 0.5))
+            gradient.setEndPoint_(NSMakePoint(1.0, 0.5))
+            clear = AppKit.NSColor.blackColor().colorWithAlphaComponent_(0.0).CGColor()
+            solid = AppKit.NSColor.whiteColor().CGColor()
+            gradient.setColors_([clear, clear, solid, clear, clear])
+            bright.layer().setMask_(gradient)
+            self._pulse_gradient = gradient
+
+        self._bright_label.setStringValue_(self.stringValue())
+        self._bright_label.setHidden_(False)
+        if self._pulsing:
+            return  # already running — just needed the text refresh above
+        self._pulsing = True
+        self._pulse_start = time.time()
+
+        offsets = [-0.35, -0.15, 0.0, 0.15, 0.35]
+
+        def tick(t):
+            if not self._pulsing:
+                return
+            elapsed = time.time() - self._pulse_start
+            phase = (elapsed % self.PULSE_DURATION) / self.PULSE_DURATION
+            # Fully off the left edge at phase 0, fully off the right edge at phase 1 — the
+            # band travels THROUGH the visible 0..1 span in between. CAGradientLayer tolerates
+            # locations outside 0..1 (a standard technique for a stop that starts/ends
+            # offscreen rather than popping in/out abruptly at the edges).
+            center = -0.4 + phase * 1.8
+            AppKit.CATransaction.begin()
+            AppKit.CATransaction.setDisableActions_(True)
+            self._pulse_gradient.setLocations_([center + o for o in offsets])
+            AppKit.CATransaction.commit()
+
+        self._pulse_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(1.0 / 30.0, True, tick)
+
+    @objc.python_method
+    def stopPulsing(self):
+        self._pulsing = False
+        if self._pulse_timer is not None:
+            self._pulse_timer.invalidate()
+            self._pulse_timer = None
+        if self._bright_label is not None:
+            self._bright_label.setHidden_(True)
+
+
+class ShimmerBorderView(AppKit.NSView):
+    """A plain container view (the main text card) whose rounded-rect border can show the
+    same traveling brightness sweep as PulsingLabel — a bright duplicate of the border's
+    stroke (drawn via CAShapeLayer, matching the view's own corner radius), masked by a
+    CAGradientLayer whose "locations" a repeating NSTimer steps each frame. Only the outline
+    shimmers; the card's own fill/background and the existing static border underneath are
+    untouched — the bright stroke just sits on top, normally hidden, revealed only where the
+    traveling mask currently is."""
+
+    SHIMMER_DURATION = 2.2
+
+    @objc.python_method
+    def configureShimmerBorder(self, corner_radius, bright_color):
+        self._shimmer_radius = corner_radius
+        self._shimmer_color = bright_color
+        self._shimmer_layer = None
+        self._shimmer_gradient = None
+        self._shimmer_timer = None
+        self._shimmer_start = None
+        self._shimmering = False
+
+    @objc.python_method
+    def startBorderShimmer(self):
+        if self._shimmer_layer is None:
+            b = self.bounds()
+            inset = NSMakeRect(0.5, 0.5, b.size.width - 1.0, b.size.height - 1.0)
+            path = Quartz.CGPathCreateWithRoundedRect(inset, self._shimmer_radius, self._shimmer_radius, None)
+            shape = Quartz.CAShapeLayer.layer()
+            shape.setFrame_(b)
+            shape.setPath_(path)
+            shape.setFillColor_(None)
+            shape.setStrokeColor_(self._shimmer_color.CGColor())
+            shape.setLineWidth_(1.0)
+            self.layer().addSublayer_(shape)
+            self._shimmer_layer = shape
+
+            gradient = Quartz.CAGradientLayer.layer()
+            gradient.setFrame_(b)
+            # CAGradientLayer's unit space has (0,0) at the bottom-left and (1,1) at the
+            # top-right regardless of view flippedness — top-left to bottom-right is (0,1) to (1,0).
+            gradient.setStartPoint_(NSMakePoint(0.0, 1.0))
+            gradient.setEndPoint_(NSMakePoint(1.0, 0.0))
+            clear = AppKit.NSColor.blackColor().colorWithAlphaComponent_(0.0).CGColor()
+            solid = AppKit.NSColor.whiteColor().CGColor()
+            gradient.setColors_([clear, clear, solid, clear, clear])
+            shape.setMask_(gradient)
+            self._shimmer_gradient = gradient
+
+        self._shimmer_layer.setHidden_(False)
+        if self._shimmering:
+            return
+        self._shimmering = True
+        self._shimmer_start = time.time()
+        offsets = [-0.35, -0.15, 0.0, 0.15, 0.35]
+
+        def tick(t):
+            if not self._shimmering:
+                return
+            elapsed = time.time() - self._shimmer_start
+            phase = (elapsed % self.SHIMMER_DURATION) / self.SHIMMER_DURATION
+            center = -0.4 + phase * 1.8
+            AppKit.CATransaction.begin()
+            AppKit.CATransaction.setDisableActions_(True)
+            self._shimmer_gradient.setLocations_([center + o for o in offsets])
+            AppKit.CATransaction.commit()
+
+        self._shimmer_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(1.0 / 30.0, True, tick)
+
+    @objc.python_method
+    def stopBorderShimmer(self):
+        self._shimmering = False
+        if self._shimmer_timer is not None:
+            self._shimmer_timer.invalidate()
+            self._shimmer_timer = None
+        if self._shimmer_layer is not None:
+            self._shimmer_layer.setHidden_(True)
+
+    def setStringValue_(self, value):
+        objc.super(PulsingLabel, self).setStringValue_(value)
+        # Guarded with getattr — configurePulse hasn't necessarily run yet the first time
+        # AppKit/our own construction code sets an initial string value.
+        if getattr(self, "_pulsing", False) and getattr(self, "_bright_label", None) is not None:
+            self._bright_label.setStringValue_(value)
+
+
 class RecordButton(AppKit.NSView):
     """Record/stop button: the outer red circle is a fixed color that hover/press never
     touch — the previous icon_button-based version's own inherited hover fill (transparent,
@@ -537,7 +762,14 @@ class RecordButton(AppKit.NSView):
     INNER_COLOR = AppKit.NSColor.whiteColor()
     IDLE_SCALE = 0.32
     HOVER_SCALE = 0.36
-    PRESSED_SCALE = 0.40
+    # Bigger jump than idle->hover on purpose: mouseUp_ releases back to HOVER_SCALE (the
+    # cursor is still over the button in the normal click case), so the gap between PRESSED
+    # and HOVER is what actually reads as "shrinks back down on release." At the old 0.40 it
+    # was only a couple points different from HOVER_SCALE and the release was imperceptible.
+    # 0.52 (the first attempt at widening this) overcorrected — confirmed directly as "way too
+    # big," nearly filling the red circle. 0.44 keeps a clearly visible press/release delta
+    # without the pressed state dominating the whole button.
+    PRESSED_SCALE = 0.44
 
     @objc.python_method
     def configure(self, on_click):
