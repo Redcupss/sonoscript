@@ -37,8 +37,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.8.1"
-APP_BUILD = "32"
+APP_VERSION = "1.8.2"
+APP_BUILD = "33"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -66,6 +66,18 @@ SPEEDS = ["0.5x", "0.8x", "1.0x", "1.25x", "1.5x"]  # real multipliers actually 
 # 1.0x as "1.25x", etc. — while every other provider's menu still shows its true value.
 CHATTERBOX_SPEED_DISPLAY = {"0.5x": "0.8x", "0.8x": "1.0x", "1.0x": "1.25x", "1.25x": "1.5x", "1.5x": "1.75x"}
 CHATTERBOX_SPEED_REAL = {v: k for k, v in CHATTERBOX_SPEED_DISPLAY.items()}
+
+# Chatterbox occasionally (even at this file's already-low temperature=0.05) produces a
+# "runaway" generation 2-3x longer than normal for a given chunk of text — confirmed by
+# direct repeated trials (identical input, same voice, same settings) to be a real model
+# instability, not something tied to one specific reference clip: it reproduced with Nova,
+# which has no reference audio at all. A confirmed-bad generation measured ~5.8 chars/sec
+# (184 chars taking 31.7s instead of the normal ~10-14s); dozens of clean generations across
+# both voices ranged ~12.8-20+ chars/sec. Only applied to chunks long enough for the ratio to
+# be meaningful — a very short chunk's fixed generation overhead would trip this on its own.
+CHATTERBOX_MIN_CHARS_PER_SEC = 11.5
+CHATTERBOX_MIN_CHARS_FOR_CHECK = 50
+CHATTERBOX_MAX_RETRIES = 2
 
 
 # ---------- app ----------
@@ -1650,22 +1662,34 @@ class AppDelegate(NSObject):
         return self._chatterbox_engine
 
     @objc.python_method
-    def _requestChatterboxTTS(self, text, voice_identifier, speed):
+    def _generateChatterboxAudio(self, engine, text, ref_audio):
         import numpy as np
-        engine = self._chatterboxEngine()
-        voice = next((v for v in CHATTERBOX_VOICES if v["id"] == voice_identifier), CHATTERBOX_VOICES[0])
-        ref_audio = self._resourcePath("chatterbox_assets", "voices", voice["ref_audio"]) if voice["ref_audio"] else None
-
         # split_pattern=None and temperature=0.05 were both found by direct listening tests —
         # the library's own defaults (per-sentence splitting, temperature ~0.7-0.8) produced
         # random upward inflections and unstable pacing/duration on some voices/sentences.
         # Calling the model's own .generate() generator directly (not generate_audio(), the
         # CLI-oriented wrapper that writes files to disk) keeps this fully in-memory, matching
         # how every other provider here returns audio bytes without touching disk.
-        results = list(engine.generate(
-            text=text, ref_audio=ref_audio, split_pattern=None, temperature=0.05))
-        audio = np.concatenate([np.array(r.audio) for r in results])
-        sample_rate = results[0].sample_rate
+        for attempt in range(CHATTERBOX_MAX_RETRIES + 1):
+            results = list(engine.generate(
+                text=text, ref_audio=ref_audio, split_pattern=None, temperature=0.05))
+            audio = np.concatenate([np.array(r.audio) for r in results])
+            sample_rate = results[0].sample_rate
+            if len(text) < CHATTERBOX_MIN_CHARS_FOR_CHECK or attempt == CHATTERBOX_MAX_RETRIES:
+                return audio, sample_rate
+            chars_per_sec = len(text) / (len(audio) / sample_rate)
+            if chars_per_sec >= CHATTERBOX_MIN_CHARS_PER_SEC:
+                return audio, sample_rate
+        return audio, sample_rate  # unreachable — loop always returns
+
+    @objc.python_method
+    def _requestChatterboxTTS(self, text, voice_identifier, speed):
+        import numpy as np
+        engine = self._chatterboxEngine()
+        voice = next((v for v in CHATTERBOX_VOICES if v["id"] == voice_identifier), CHATTERBOX_VOICES[0])
+        ref_audio = self._resourcePath("chatterbox_assets", "voices", voice["ref_audio"]) if voice["ref_audio"] else None
+
+        audio, sample_rate = self._generateChatterboxAudio(engine, text, ref_audio)
 
         # Chatterbox has no native speed parameter (unlike every other provider here) — see
         # time_stretch's own docstring for why this specific technique was picked.

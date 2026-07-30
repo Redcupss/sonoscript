@@ -4,6 +4,17 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.8.2] (build 33) — 2026-07-30
+
+### Fixed
+- Chatterbox could occasionally produce a "runaway" generation 2-3x longer than normal for a
+  given chunk of text — garbled, breathy, static-sounding audio, made worse once it then went
+  through the speed/time-stretch step. Confirmed via repeated direct trials to be a real,
+  intermittent instability in the model itself (it reproduced even with Nova, which has no
+  reference clip at all), not something tied to one specific voice. Every chunk's generated
+  duration is now sanity-checked against its text length, and a chunk that comes back
+  implausibly slow is automatically regenerated (up to 2 extra attempts) before being used.
+
 ## [1.8.1] (build 32) — 2026-07-30
 
 ### Changed
