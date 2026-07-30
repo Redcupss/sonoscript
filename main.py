@@ -34,7 +34,7 @@ from ui_helpers import white, fix_anchor, build_waveform_bars, make_label, symbo
 from widgets import (
     ClickThroughTextField, ScrubberView, HoverButton, icon_button, text_button, cta_button,
     FlatPopUpButton, ControlRow, FocusTextView, BackdropView, CardView, DropdownPanel,
-    LevelMeterView,
+    LevelMeterView, EditableNameField,
 )
 
 APP_NAME = "SonoScript"
@@ -152,6 +152,7 @@ class AppDelegate(NSObject):
         self._rec_preview_player = None  # AVAudioPlayer, scoped to this flow only — never touches self.player
         self._pending_delete_voice_id = None  # set right before the Manage Voices delete-confirm card opens
         self._manage_voice_fields = {}  # voice_id -> its NSTextField in the Manage Voices card, for rename commits
+        self._rec_return_to = None  # callable to reopen instead of dismissing to the main screen, or None
         # Chunked playback state — see playPauseClicked_/_beginChunkPlayback for the pipeline.
         # playback_token identifies one Play session; background chunk results carrying a
         # stale token (from a Stop or a new Play superseding it) are dropped on arrival.
@@ -524,7 +525,12 @@ class AppDelegate(NSObject):
             # The current selection gets its own persistent (not just on-hover) fill, brighter
             # than a plain hover, so it stays visually distinct in every state — idle, hovered,
             # or with a DIFFERENT row being hovered right next to it.
-            row.configure(0.07 if is_selected else 0.0, 0.16 if is_selected else 0.09, 0.0)
+            # Alpha deltas bumped (0.09->0.14, 0.16->0.22) and duration slightly longer
+            # (0.18s->0.24s) — confirmed by direct testing that the previous, subtler values
+            # didn't read as a fade at all when scanning down a list at a normal pace: with the
+            # old values, mouse movement between rows outpaced the animation before it became
+            # visible, and the whole thing looked like an instant snap rather than a transition.
+            row.configure(0.10 if is_selected else 0.0, 0.22 if is_selected else 0.14, 0.0, fade_duration=0.24)
             row.setTitle_("")
             lbl = make_label(r["title"], 13, 0.95 if r.get("selected") else 0.82)
             lbl.setFrame_(NSMakeRect(16, (row_h - 18) / 2.0, w - 32, 18))
@@ -1162,13 +1168,15 @@ class AppDelegate(NSObject):
         if voice_id is None:
             return
         name = str(field.stringValue()).strip()
-        if not name:
-            return
-        for entry in self.config.get("sesame_custom_voices", []):
-            if entry["id"] == voice_id:
+        entries = self.config.get("sesame_custom_voices", [])
+        entry = next((e for e in entries if e["id"] == voice_id), None)
+        if entry is not None:
+            if name:
                 entry["label"] = name
                 save_config(self.config)
-                break
+            else:
+                field.setStringValue_(entry["label"])  # blank name — restore rather than keep it empty
+        field.endEditingAppearance()
 
     @objc.python_method
     def _updateContinueState(self):
@@ -1514,7 +1522,10 @@ class AppDelegate(NSObject):
             if chosen == CREATE_VOICE_SENTINEL:
                 # Never persisted as a real selection — revert the popup to whatever was
                 # already chosen (so the sentinel never visibly "sticks"), then open the
-                # recording flow instead.
+                # recording flow instead. Entered from the main screen, so Cancel/Save should
+                # close back to the main screen too — see addVoiceFromManageClicked_ for the
+                # other entry point, which sets this to come back to Manage Voices instead.
+                self._rec_return_to = None
                 self._revertVoiceMenuSelection()
                 self._showRecordingCaptureCard()
                 return
@@ -2207,7 +2218,11 @@ class AppDelegate(NSObject):
             except Exception:
                 traceback.print_exc(file=sys.stderr)
         self._rec_recording_active = False
-        self.dismissOverlay()
+        return_to, self._rec_return_to = self._rec_return_to, None
+        if return_to is not None:
+            return_to()
+        else:
+            self.dismissOverlay()
 
     def useRecordingClicked_(self, sender):
         name = str(self.rec_name_field.stringValue()).strip()
@@ -2252,8 +2267,12 @@ class AppDelegate(NSObject):
             except Exception:
                 traceback.print_exc(file=sys.stderr)
         self._rec_recording_active = False
-        self.dismissOverlay()
         self.fetchVoices()
+        return_to, self._rec_return_to = self._rec_return_to, None
+        if return_to is not None:
+            return_to()  # e.g. back to Manage Voices, refreshed with the new voice included
+        else:
+            self.dismissOverlay()
         self.setStatus(f'"{name}" saved — ready to use.')
         AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
             2.5, False, lambda t: self.setStatus(""))
@@ -2304,13 +2323,11 @@ class AppDelegate(NSObject):
                     line.setWantsLayer_(True)
                     line.layer().setBackgroundColor_(white(0.09).CGColor())
                     container.addSubview_(line)
-                # Borderless/no visible box — reads as a plain list label at rest, same
-                # discoverable-on-interaction feel as clicking straight into a Finder list
-                # label, rather than looking like its own little form field.
-                field = AppKit.NSTextField.alloc().initWithFrame_(NSMakeRect(12, cy + 6, box_w - 60, 26))
-                field.setBezeled_(False)
-                field.setBordered_(False)
-                field.setDrawsBackground_(False)
+                # Plain-text at rest; a soft box fades in on hover and it only becomes truly
+                # editable on double-click (see EditableNameField) — reads as a real list
+                # label rather than a permanently-visible little form field.
+                field = EditableNameField.alloc().initWithFrame_(NSMakeRect(12, cy + 6, box_w - 60, 26))
+                field.configure()
                 field.setFont_(AppKit.NSFont.systemFontOfSize_(13))
                 field.setTextColor_(white(0.9))
                 field.setStringValue_(entry["label"])
@@ -2340,6 +2357,9 @@ class AppDelegate(NSObject):
         self._presentOverlay(card)
 
     def addVoiceFromManageClicked_(self, sender):
+        # Entered from Manage Voices — Cancel and a successful Save should both come back here
+        # (refreshed, in Save's case), not dump you out to the main text-input screen.
+        self._rec_return_to = self._showManageVoicesCard
         self._showRecordingCaptureCard()
 
     def dismissManageVoices_(self, sender):

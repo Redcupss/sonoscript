@@ -16,6 +16,87 @@ class ClickThroughTextField(AppKit.NSTextField):
         return None
 
 
+class EditableNameField(AppKit.NSTextField):
+    """A list-row name that reads as plain text at rest — a soft background box fades in on
+    hover (signaling "double-click to rename"), and only an actual double-click makes it
+    genuinely editable (cursor, selection, a slightly brighter box). Committing (Enter, or
+    clicking elsewhere — resigning first responder fires the normal delegate path) should call
+    endEditingAppearance() to revert back to plain-text look. Modeled on how a native macOS
+    list (e.g. System Settings' Text Replacements) only shows an edit affordance on
+    interaction, rather than every row permanently looking like its own little text-entry
+    form."""
+
+    HOVER_COLOR = white(0.07)
+    EDITING_COLOR = white(0.10)
+
+    @objc.python_method
+    def configure(self):
+        self._tracking_area = None
+        self.setBezeled_(False)
+        self.setBordered_(False)
+        self.setDrawsBackground_(False)
+        self.setEditable_(False)
+        self.setSelectable_(False)
+        self.setWantsLayer_(True)
+        self.layer().setCornerRadius_(6.0)
+        self.layer().setBackgroundColor_(white(0.0).CGColor())
+
+    def updateTrackingAreas(self):
+        objc.super(EditableNameField, self).updateTrackingAreas()
+        if self._tracking_area is not None:
+            self.removeTrackingArea_(self._tracking_area)
+        opts = AppKit.NSTrackingMouseEnteredAndExited | AppKit.NSTrackingActiveInKeyWindow
+        self._tracking_area = AppKit.NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            self.bounds(), opts, self, None)
+        self.addTrackingArea_(self._tracking_area)
+
+    def mouseEntered_(self, event):
+        if not self.isEditable():
+            AppKit.CATransaction.begin()
+            AppKit.CATransaction.setAnimationDuration_(0.15)
+            self.layer().setBackgroundColor_(self.HOVER_COLOR.CGColor())
+            AppKit.CATransaction.commit()
+
+    def mouseExited_(self, event):
+        if not self.isEditable():
+            AppKit.CATransaction.begin()
+            AppKit.CATransaction.setAnimationDuration_(0.15)
+            self.layer().setBackgroundColor_(white(0.0).CGColor())
+            AppKit.CATransaction.commit()
+
+    def mouseDown_(self, event):
+        # Single clicks are swallowed entirely while in label mode — no cursor, no selection,
+        # nothing — only a genuine double-click starts editing. Once editable, clicks behave
+        # exactly like a normal text field again (positioning the cursor, etc.).
+        if not self.isEditable():
+            if event.clickCount() >= 2:
+                self._beginEditing()
+            return
+        objc.super(EditableNameField, self).mouseDown_(event)
+
+    @objc.python_method
+    def _beginEditing(self):
+        self.setEditable_(True)
+        self.setSelectable_(True)
+        self.layer().setBackgroundColor_(self.EDITING_COLOR.CGColor())
+        if self.window() is not None:
+            self.window().makeFirstResponder_(self)
+            editor = self.currentEditor()
+            if editor is not None:
+                editor.selectAll_(None)
+
+    @objc.python_method
+    def endEditingAppearance(self):
+        """Called by the delegate (controlTextDidEndEditing_) once a rename commits — reverts
+        to the plain-text, non-editable look, same as before the double-click."""
+        self.setEditable_(False)
+        self.setSelectable_(False)
+        AppKit.CATransaction.begin()
+        AppKit.CATransaction.setAnimationDuration_(0.15)
+        self.layer().setBackgroundColor_(white(0.0).CGColor())
+        AppKit.CATransaction.commit()
+
+
 class ScrubberView(AppKit.NSView):
     """Draggable playback-position track: a thin filled bar + round thumb inside a taller
     click/drag target. on_scrub fires live while dragging (for the time labels), on_scrub_end
@@ -238,13 +319,14 @@ class LevelMeterView(AppKit.NSView):
 # ---------- controls ----------
 
 class HoverButton(AppKit.NSButton):
-    """Borderless button: hover fill fades in/out (0.18s), press scales to 0.94."""
+    """Borderless button: hover fill fades in/out (0.18s by default), press scales to 0.94."""
 
     @objc.python_method
-    def configure(self, base_alpha, hover_alpha, corner):
+    def configure(self, base_alpha, hover_alpha, corner, fade_duration=0.18):
         self._tracking_area = None
         self._base_alpha = base_alpha
         self._hover_alpha = hover_alpha
+        self._fade_duration = fade_duration
         self.setBordered_(False)
         self.setBezelStyle_(AppKit.NSBezelStyleRegularSquare)
         self.setWantsLayer_(True)
@@ -254,7 +336,7 @@ class HoverButton(AppKit.NSButton):
     @objc.python_method
     def _fill(self, alpha, animated=True):
         AppKit.CATransaction.begin()
-        AppKit.CATransaction.setAnimationDuration_(0.18 if animated else 0.0)
+        AppKit.CATransaction.setAnimationDuration_(getattr(self, "_fade_duration", 0.18) if animated else 0.0)
         self.layer().setBackgroundColor_(white(alpha).CGColor())
         AppKit.CATransaction.commit()
 
