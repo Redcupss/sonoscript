@@ -82,6 +82,35 @@ CHATTERBOX_MIN_CHARS_PER_SEC = 11.5
 CHATTERBOX_MIN_CHARS_FOR_CHECK = 50
 CHATTERBOX_MAX_RETRIES = 2
 
+# Sesame's 3 built-in voices — cloned from real, single continuous reference recordings (never
+# spliced fragments, confirmed by earlier testing to hurt clone quality). Unlike Chatterbox,
+# Sesame's generate() pairs each ref_audio with its own transcript (ref_text) as conditioning
+# context, so every entry needs one; these were transcribed directly from the reference clips
+# rather than guessed. "Ben" is the developer's own voice — labeled Ben everywhere in the app,
+# never the developer's real name.
+SESAME_VOICES = [
+    {"id": "sadie", "label": "Sadie (American, Female)", "ref_audio": "sadie.wav",
+     "ref_text": ("Yes, my dad is stereotypically Danish. I think there's kind of a mysterious "
+                  "element to the Danes. They're very funny and dry and witty and guarded. "
+                  "That's how my dad is, he's all those things.")},
+    {"id": "manny", "label": "Manny (American, Male)", "ref_audio": "manny.wav",
+     "ref_text": ("And Solomon gets to walk in a certain level of authority that is only "
+                  "possible because of David. I got a revelation like really early that like...")},
+    {"id": "ben", "label": "Ben (American, Male)", "ref_audio": "ben.wav",
+     "ref_text": ("To Henry, the journey of a thousand miles begins with a single step. For "
+                  "wherever he lived, he would place to place and he kept his dream alive and "
+                  "burning.")},
+]
+
+# Same defensive pattern as Chatterbox's runaway-generation guard — CSM's default sampler
+# (temperature=0.9) is far more stochastic than Chatterbox's tuned 0.05, and 5 direct trials
+# with Sadie's reference clip already spanned 15.2-20.5 chars/sec on the same input, a wider
+# spread than Chatterbox showed even before its own instability was found. Thresholds are
+# provisional (based on a small sample) pending more real-world usage data.
+SESAME_MIN_CHARS_PER_SEC = 11.5
+SESAME_MIN_CHARS_FOR_CHECK = 50
+SESAME_MAX_RETRIES = 2
+
 
 # ---------- app ----------
 
@@ -97,6 +126,8 @@ class AppDelegate(NSObject):
         self.player = None
         self._chatterbox_engine = None  # lazy-loaded once, reused for every chunk — see _chatterboxEngine
         self._chatterbox_lock = threading.Lock()
+        self._sesame_engine = None  # lazy-loaded once, reused for every chunk — see _sesameEngine
+        self._sesame_lock = threading.Lock()
         # Chunked playback state — see playPauseClicked_/_beginChunkPlayback for the pipeline.
         # playback_token identifies one Play session; background chunk results carrying a
         # stale token (from a Stop or a new Play superseding it) are dropped on arrival.
@@ -1443,14 +1474,12 @@ class AppDelegate(NSObject):
             self._populateVoiceMenu([v["label"] for v in CHATTERBOX_VOICES])
             self.usage_label.setStringValue_("A free, offline neural voice — no account, no limit.")
         elif provider == "Sesame":
-            # Voice cloning itself (recording flow, voice library, actual CSM generation) isn't
-            # built yet — only the license gate is. Without this branch, Sesame would silently
-            # fall into the `else` below and show OpenAI's fixed voice list, which is wrong and
-            # actively misleading. _requestTTS has a matching guard so Play fails with a clear
-            # message instead of misrouting the license key to ElevenLabs as a bogus API key.
-            self.voice_ids = ["__sesame_coming_soon__"]
-            self._populateVoiceMenu(["Coming soon"])
-            self.usage_label.setStringValue_("Voice cloning is coming in a future update.")
+            # The 3 built-in cloned voices work now; "Create your own" isn't shown yet since
+            # the recording flow that would back it doesn't exist yet (a menu entry that does
+            # nothing on click would be worse than not showing it at all).
+            self.voice_ids = [v["id"] for v in SESAME_VOICES]
+            self._populateVoiceMenu([v["label"] for v in SESAME_VOICES])
+            self.usage_label.setStringValue_("Cloned voices — offline, private to this Mac.")
         else:
             # OpenAI (and Other) use a fixed voice list; no usage endpoint
             self.voice_ids = list(OPENAI_VOICES)
@@ -1589,9 +1618,7 @@ class AppDelegate(NSObject):
         if provider == "Chatterbox":
             return self._requestChatterboxTTS(text, voice, speed)
         if provider == "Sesame":
-            # Caught by _chunkWorker's generic Exception handler and shown via showError_ —
-            # see fetchVoices' Sesame branch for why this guard exists.
-            raise RuntimeError("Sesame voice cloning isn't available yet — check back in a future update.")
+            return self._requestSesameTTS(text, voice, speed)
         if provider == "OpenAI":
             body = json.dumps({"model": "gpt-4o-mini-tts", "voice": voice, "input": text, "speed": speed}).encode()
             req = urllib.request.Request(f"{OPENAI_API}/audio/speech", data=body, headers={
@@ -1730,6 +1757,70 @@ class AppDelegate(NSObject):
 
         # Chatterbox has no native speed parameter (unlike every other provider here) — see
         # time_stretch's own docstring for why this specific technique was picked.
+        if speed != 1.0:
+            from pitch_shift import time_stretch
+            audio = time_stretch(audio, sample_rate, speed)
+
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        buf = io.BytesIO()
+        w = wave.open(buf, "wb")
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(int(sample_rate))
+        w.writeframes(pcm)
+        w.close()
+        return buf.getvalue()
+
+    @objc.python_method
+    def _sesameEngine(self):
+        # Same lazy-load-with-lock shape as _chatterboxEngine. NOTE: sesame_assets/ isn't
+        # bundled yet — this is still dev-mode-only wiring, deliberately using whatever's
+        # already in this machine's own huggingface cache (network access allowed here,
+        # unlike the frozen/offline app) rather than a bundled snapshot path. Replace the
+        # fallback branch with a real bundled-snapshot resolution (matching
+        # _chatterboxEngine exactly) once sesame_assets/ is actually packaged.
+        if getattr(self, "_sesame_engine", None) is not None:
+            return self._sesame_engine
+        with self._sesame_lock:
+            if self._sesame_engine is None:
+                from mlx_audio.tts.utils import load_model
+                hub_dir = self._resourcePath(
+                    "sesame_assets", "hf_cache", "hub",
+                    "models--mlx-community--csm-1b", "snapshots")
+                if os.path.isdir(hub_dir):
+                    snapshot_dir = os.path.join(hub_dir, os.listdir(hub_dir)[0])
+                else:
+                    snapshot_dir = "mlx-community/csm-1b"
+                self._sesame_engine = load_model(snapshot_dir)
+        return self._sesame_engine
+
+    @objc.python_method
+    def _generateSesameAudio(self, engine, text, ref_audio, ref_text):
+        import numpy as np
+        # Same runaway-generation guard as Chatterbox's — see SESAME_MIN_CHARS_PER_SEC's
+        # comment for why, given CSM's own default sampler is even more stochastic.
+        for attempt in range(SESAME_MAX_RETRIES + 1):
+            results = list(engine.generate(
+                text=text, ref_audio=ref_audio, ref_text=ref_text, split_pattern=None))
+            audio = np.concatenate([np.array(r.audio) for r in results])
+            sample_rate = results[0].sample_rate
+            if len(text) < SESAME_MIN_CHARS_FOR_CHECK or attempt == SESAME_MAX_RETRIES:
+                return audio, sample_rate
+            chars_per_sec = len(text) / (len(audio) / sample_rate)
+            if chars_per_sec >= SESAME_MIN_CHARS_PER_SEC:
+                return audio, sample_rate
+        return audio, sample_rate  # unreachable — loop always returns
+
+    @objc.python_method
+    def _requestSesameTTS(self, text, voice_identifier, speed):
+        import numpy as np
+        engine = self._sesameEngine()
+        voice = next((v for v in SESAME_VOICES if v["id"] == voice_identifier), SESAME_VOICES[0])
+        ref_audio = self._resourcePath("sesame_assets", "voices", voice["ref_audio"])
+
+        audio, sample_rate = self._generateSesameAudio(engine, text, ref_audio, voice["ref_text"])
+
+        # Same speed/time-stretch treatment as Chatterbox — CSM has no native speed parameter either.
         if speed != 1.0:
             from pitch_shift import time_stretch
             audio = time_stretch(audio, sample_rate, speed)
