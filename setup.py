@@ -98,7 +98,16 @@ OPTIONS = {
     # from a real directory, which correctly finds both its .py submodules AND core's compiled
     # extension (core.cpython-312-darwin.so, found via CPython's standard ABI-tagged-suffix
     # extension search — no special stub or renaming needed once py2app stops interfering).
-    "excludes": ["mlx"],
+    # torch/matplotlib/sympy/babel/numba: transformers and mlx_audio support several possible
+    # backends/optional features SonoScript never uses (this app only ever runs the MLX
+    # backend) — modulegraph's static scan can't tell "imported inside a branch we never
+    # execute" from "always executed," so it bundles the full dependency regardless. Confirmed
+    # via direct source search that none of SonoScript's own files (main.py and everything it
+    # imports) reference any of these, and via a real rebuild + full smoke test (Chatterbox
+    # generation including pitch/speed-adjusted voices, which is the one path that legitimately
+    # needs scipy — deliberately NOT excluded — so this isn't "exclude everything heavy") that
+    # the app works identically without them bundled. ~650MB combined.
+    "excludes": ["mlx", "torch", "matplotlib", "sympy", "babel", "numba"],
     "resources": ["chatterbox_assets"],
     "iconfile": "icon.icns",
 }
