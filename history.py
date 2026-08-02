@@ -3,6 +3,8 @@ import os
 import time
 import uuid
 
+import Foundation
+
 from config import CONFIG_PATH
 
 # App-internal, not meant to be browsed in Finder — distinct from the user-visible permanent
@@ -15,6 +17,11 @@ CACHE_INDEX_PATH = os.path.join(CACHE_DIR, "cache_index.json")
 
 DEFAULT_MAX_ENTRIES = 10
 DEFAULT_MAX_BYTES = None  # None = no size cap, only the count cap, until the user sets one
+
+# Marks "leave this field alone" in set_limits/preview_eviction — None is itself a legitimate
+# value for max_bytes (it's exactly how "unlimited" is represented), so it has to be a real
+# settable value, not overloaded to also mean "don't change it."
+_UNSET = object()
 
 # 24kHz/16-bit mono PCM — matches every local provider's actual output in this app (see
 # _requestChatterboxTTS/_requestSesameTTS). Good enough for a UI estimate ("this cache size
@@ -29,6 +36,22 @@ def estimate_seconds_for_bytes(num_bytes):
 
 def _ensure_dir():
     os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def trash_file(path):
+    # Moves to the real macOS Trash instead of unlinking outright — a wrong limit change or
+    # an accidental delete is recoverable (drag back out of Trash, or it just ages out
+    # naturally) instead of being instantly, permanently gone. NSFileManager (not NSWorkspace)
+    # deliberately — it's documented safe to call off the main thread, and eviction can happen
+    # from add_entry, which doesn't run on the main thread.
+    try:
+        fm = Foundation.NSFileManager.defaultManager()
+        url = Foundation.NSURL.fileURLWithPath_(path)
+        success, _, error = fm.trashItemAtURL_resultingItemURL_error_(url, None, None)
+        if not success:
+            os.remove(path)
+    except OSError:
+        pass
 
 
 def load_index():
@@ -51,13 +74,26 @@ def save_index(data):
     os.replace(tmp, CACHE_INDEX_PATH)
 
 
+def _safe_filename(text):
+    # Same sanitizing rule saved.py's permanent-folder filenames use — kept as its own small
+    # copy here rather than importing from saved.py, which already imports FROM this module
+    # (trash_file); importing back the other way would be circular.
+    base = "".join(c if c.isalnum() or c in " -_" else "" for c in text[:40]).strip()
+    return base or "Recording"
+
+
 def add_entry(text, provider, voice, speed, wav_bytes):
     """Writes a completed generation into the cache, evicting least-recently-used entries
     first if the configured max count/size is now exceeded. Returns the new entry dict."""
     _ensure_dir()
     data = load_index()
     entry_id = uuid.uuid4().hex[:12]
-    filename = f"{entry_id}.wav"
+    # entry_id alone (no readable text) used to be the whole filename — fine as an internal
+    # lookup key, but if anyone actually opens this folder (Finder, a debug log, this session's
+    # own screenshots) a bare hex string tells them nothing. The id still stays the real,
+    # stable lookup key everywhere (entry["id"]/entry["audio_file"] is what every caller
+    # actually uses to find the file) — this only changes what the file is NAMED.
+    filename = f"{_safe_filename(text)} - {entry_id}.wav"
     with open(os.path.join(CACHE_DIR, filename), "wb") as f:
         f.write(wav_bytes)
     now = time.time()
@@ -85,10 +121,30 @@ def _evict(data):
     entries.sort(key=lambda e: e.get("last_accessed_at", 0))  # oldest-used first
     while len(entries) > max_entries or (max_bytes and sum(e["size_bytes"] for e in entries) > max_bytes):
         victim = entries.pop(0)
-        try:
-            os.remove(os.path.join(CACHE_DIR, victim["audio_file"]))
-        except OSError:
-            pass
+        trash_file(os.path.join(CACHE_DIR, victim["audio_file"]))
+
+
+def preview_eviction(max_entries=_UNSET, max_bytes=_UNSET):
+    """How many currently-cached entries WOULD be evicted if these limits were applied right
+    now, without changing anything — lets a caller warn the user before set_limits actually
+    deletes anything. Unset params fall back to whatever's currently stored, matching
+    set_limits' own "leave this field alone" semantics, so a caller only changing one of the
+    two limits gets an accurate preview against the other one's current value."""
+    data = load_index()
+    resolved_max_entries = data.get("max_entries") if max_entries is _UNSET else max_entries
+    resolved_max_bytes = data.get("max_bytes") if max_bytes is _UNSET else max_bytes
+    resolved_max_entries = resolved_max_entries or DEFAULT_MAX_ENTRIES
+    entries = sorted(data["entries"], key=lambda e: e.get("last_accessed_at", 0))
+    count = len(entries)
+    total = sum(e["size_bytes"] for e in entries)
+    evicted = 0
+    i = 0
+    while count > resolved_max_entries or (resolved_max_bytes and total > resolved_max_bytes):
+        total -= entries[i]["size_bytes"]
+        count -= 1
+        evicted += 1
+        i += 1
+    return evicted
 
 
 def list_entries():
@@ -112,21 +168,18 @@ def remove_entry(entry_id):
     remaining = []
     for e in data["entries"]:
         if e["id"] == entry_id:
-            try:
-                os.remove(os.path.join(CACHE_DIR, e["audio_file"]))
-            except OSError:
-                pass
+            trash_file(os.path.join(CACHE_DIR, e["audio_file"]))
         else:
             remaining.append(e)
     data["entries"] = remaining
     save_index(data)
 
 
-def set_limits(max_entries=None, max_bytes=None):
+def set_limits(max_entries=_UNSET, max_bytes=_UNSET):
     data = load_index()
-    if max_entries is not None:
+    if max_entries is not _UNSET:
         data["max_entries"] = max_entries
-    if max_bytes is not None:
+    if max_bytes is not _UNSET:
         data["max_bytes"] = max_bytes
     _evict(data)
     save_index(data)

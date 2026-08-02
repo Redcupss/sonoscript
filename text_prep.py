@@ -44,6 +44,59 @@ CONFUSABLE_LETTERS = {
 }
 _CONFUSABLE_RE = re.compile("[" + "".join(CONFUSABLE_LETTERS) + "]")
 
+# Confirmed directly against real generated audio: colons and semicolons get pronounced as
+# literal words ("colon", "span"/"spanned" for semicolon) instead of read as a pause, and
+# parentheses get the same treatment — the model tries to vocalize the punctuation mark itself
+# rather than treating it as a stage direction for pacing. A comma already reads as a natural
+# pause everywhere else in this app, so re-punctuating all four as commas (rather than
+# stripping them, which would lose the pause entirely) gets the intended effect without
+# introducing new symbols the model might also try to pronounce.
+#
+# The colon lookaround excludes one flanked by digits on both sides (3:00, a 16:9 ratio) — a
+# blanket replacement would turn "3:00" into "3, 00", which is wrong in a completely different
+# way. Semicolons have no equivalent legitimate numeric use worth protecting.
+_COLON_RE = re.compile(r"(?<!\d):(?!\d)")
+_SEMICOLON_RE = re.compile(r";")
+_PAREN_OPEN_RE = re.compile(r"\s*\(\s*")
+_PAREN_CLOSE_RE = re.compile(r"\s*\)")
+# A colon/semicolon/paren landing immediately before existing punctuation (a parenthetical
+# right at the end of a sentence, e.g. "...offerings (like this one)." ) would otherwise leave
+# a stray ", ." or ",," behind once turned into a comma — collapse that down to just the
+# punctuation that was already there.
+_REDUNDANT_PUNCT_RE = re.compile(r",\s*([.,!?;:])")
+
+
+def _pause_out_symbols(text):
+    text = _PAREN_OPEN_RE.sub(", ", text)
+    text = _PAREN_CLOSE_RE.sub(",", text)
+    text = _COLON_RE.sub(",", text)
+    text = _SEMICOLON_RE.sub(",", text)
+    return _REDUNDANT_PUNCT_RE.sub(r"\1", text)
+
+# A blank-line gap (one or more empty/whitespace-only lines) between two lines of text — a
+# real paragraph break, as opposed to a single mid-paragraph line wrap from word-wrapped or
+# pasted text, which must NOT be treated as a break (that would chop a normal sentence in
+# half with a spurious pause). \s* between the two \n's absorbs any number of further blank
+# or whitespace-only lines in the gap (confirmed against a real pasted book excerpt with a
+# "  " line — two bare spaces — sitting between two truly empty ones).
+_PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
+_ENDS_WITH_TERMINAL_PUNCT_RE = re.compile(r"[.!?:;]\s*$")
+
+
+def normalize_paragraph_breaks(text):
+    """A chapter heading, subtitle, or quote attribution pasted from a book/document
+    typically has no sentence-ending punctuation of its own — chunk_text's sentence splitter
+    only recognizes .!?, so a title with none of those just runs straight into whatever comes
+    next as one giant "sentence," which is exactly what read as the model "blowing past" the
+    section breaks (confirmed against a real pasted chapter opening: title, subtitle, and an
+    Einstein quote's byline all glued into one unpunctuated run). Giving every blank-line-
+    separated paragraph a real terminal punctuation mark — appending a period if it doesn't
+    already have one — makes each one its own proper sentence/chunk boundary, without asking
+    the user to reformat anything themselves."""
+    paragraphs = [p.strip() for p in _PARAGRAPH_SPLIT_RE.split(text) if p.strip()]
+    fixed = [p if _ENDS_WITH_TERMINAL_PUNCT_RE.search(p) else p + "." for p in paragraphs]
+    return " ".join(fixed)
+
 
 def sanitize_for_speech(text):
     """Text-level cleanup applied before any provider (System/Kokoro/ElevenLabs/OpenAI) gets
@@ -52,4 +105,5 @@ def sanitize_for_speech(text):
     text = _CONFUSABLE_RE.sub(lambda m: CONFUSABLE_LETTERS[m.group(0)], text)
     text = _FILENAME_DOT_RE.sub(lambda m: f"{m.group(1)} dot {m.group(2)}", text)
     text = _OVERRIDE_RE.sub(lambda m: PRONUNCIATION_OVERRIDES[m.group(0)], text)
+    text = _pause_out_symbols(text)
     return text

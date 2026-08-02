@@ -384,6 +384,15 @@ class HoverButton(AppKit.NSButton):
         self._fade_duration = fade_duration
         self.setBordered_(False)
         self.setBezelStyle_(AppKit.NSBezelStyleRegularSquare)
+        # setBordered_(False) does NOT disable NSButtonCell's own native highlight rendering —
+        # confirmed directly: highlightsBy() still returns a mask including
+        # NSChangeBackgroundCellMask by default, meaning the cell was independently darkening
+        # its own background on press this whole time, underneath/alongside every _fill() call
+        # this class makes. That's what read as a flicker on release — the cell's own native
+        # highlight snapping off at a slightly different moment than this class's explicit
+        # settle-back. Zeroing the mask hands 100% of the visual state to _fill(); the cell
+        # itself no longer draws anything on its own.
+        self.cell().setHighlightsBy_(0)
         self.setWantsLayer_(True)
         self.layer().setCornerRadius_(corner)
         self._fill(base_alpha, animated=False)
@@ -439,6 +448,31 @@ class HoverButton(AppKit.NSButton):
     def mouseExited_(self, event):
         self._fill(self._base_alpha)
 
+    def mouseDown_(self, event):
+        # Genuinely missing until now — configure() sets setBordered_(False), which also
+        # throws away NSButton's own native press-highlight, so every text_button/icon_button
+        # in the app had hover feedback but nothing at all for an actual press-and-hold.
+        # objc.super's mouseDown_ blocks here for the whole press/drag/release tracking loop
+        # (that's also what actually fires the target/action on a valid click) — the pressed
+        # fill has to be set BEFORE that call to be visible during the hold, and settled back
+        # to hover-or-base AFTER it returns, once the final cursor position is known.
+        # +0.06, not +0.10 — 0.10 read as too bright a jump for buttons whose hover_alpha is
+        # already fairly low (e.g. 0.14), confirmed directly.
+        if self.isEnabled():
+            self._fill(min(1.0, self._hover_alpha + 0.06))
+        objc.super(HoverButton, self).mouseDown_(event)
+        # The click's own action may have already rebuilt/replaced the whole screen this
+        # button lived on (Confirm, the mode/value pills, etc. all call showSettingsScreen
+        # again) — by the time control returns here, `self` can already be detached from any
+        # window. Touching its fill in that state visibly flickered, since the stale,
+        # about-to-be-discarded instance's color change rendered independently of (and after)
+        # the new screen that already replaced it. Skipping the settle-back entirely once the
+        # button's no longer in a window sidesteps that; there's nothing left to visually
+        # settle on a view that's already gone.
+        if self.isEnabled() and self.window() is not None:
+            point = self.convertPoint_fromView_(self.window().mouseLocationOutsideOfEventStream(), None)
+            self._fill(self._hover_alpha if NSPointInRect(point, self.bounds()) else self._base_alpha)
+
 
 def icon_button(symbol, pt, frame, action, target, base=0.08, hover=0.16, corner=10.0, tint=0.85):
     btn = HoverButton.alloc().initWithFrame_(frame)
@@ -484,6 +518,152 @@ def cta_button(title, frame, action, target):
     return btn
 
 
+class ContextMenuButton(HoverButton):
+    """A HoverButton that also shows a real, native right-click context menu — right-click is
+    the one interaction in this app where reaching for actual NSMenu chrome is the correct
+    call rather than a custom dark popover: it's the universal system convention (Finder,
+    Mail, Notes, ...) and there's no existing in-app custom equivalent to stay consistent
+    with, unlike the dropdown menus (which DO have one) or a color picker (which doesn't need
+    native chrome at all). Set .context_menu_items to a list of (title, callback) tuples —
+    a (None, None) entry renders as a separator — before this is ever right-clicked."""
+
+    def rightMouseDown_(self, event):
+        items = getattr(self, "context_menu_items", None)
+        if not items:
+            return
+        menu = AppKit.NSMenu.alloc().init()
+        for title, callback in items:
+            if title is None:
+                menu.addItem_(AppKit.NSMenuItem.separatorItem())
+                continue
+            item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, "_contextMenuItemClicked:", "")
+            item.setTarget_(self)
+            # NOT item._callback = callback — a bare NSMenuItem (unlike our own Python
+            # subclasses, e.g. HoverButton) is a plain bridged Objective-C instance with no
+            # Python-side __dict__ for PyObjC to hang an ad-hoc attribute on, so that raised
+            # AttributeError the instant this ran, aborting the menu build before
+            # popUpContextMenu_withEvent_forView_ was ever reached — confirmed by calling
+            # rightMouseDown_ directly and watching it crash on exactly this line. This is
+            # what actually made the whole right-click menu do nothing. representedObject is
+            # the real, supported slot for attaching an arbitrary payload to a menu item.
+            item.setRepresentedObject_(callback)
+            menu.addItem_(item)
+        AppKit.NSMenu.popUpContextMenu_withEvent_forView_(menu, event, self)
+
+    def _contextMenuItemClicked_(self, sender):
+        cb = sender.representedObject()
+        if cb:
+            cb()
+
+
+class SegmentedPillControl(AppKit.NSView):
+    """A rounded track with a highlight pill that slides beneath whichever segment is
+    selected (e.g. a Recent/Saved tab switcher) — not just two independently-styled static
+    buttons. Deliberately built to be kept alive as ONE instance across a selection change
+    (call .select(index) on the same object) rather than rebuilt from scratch the way every
+    other screen in this app is — a full rebuild would just snap the new state in with
+    nothing to animate FROM. Callers should build this with its real final frame up front
+    (its own width never needs to change after that — only reposition via autoresizing
+    margins — so there's no resize-driven relayout to handle beyond what those margins
+    already do on their own)."""
+
+    @objc.python_method
+    def configure(self, labels, on_change):
+        self.labels = labels
+        self.on_change = on_change
+        self.selected_index = 0
+        self.setWantsLayer_(True)
+        self.layer().setBackgroundColor_(white(0.05).CGColor())
+        self.layer().setBorderColor_(white(0.1).CGColor())
+        self.layer().setBorderWidth_(1.0)
+        self.indicator_layer = Quartz.CALayer.layer()
+        self.indicator_layer.setBackgroundColor_(white(0.18).CGColor())
+        self.layer().addSublayer_(self.indicator_layer)
+        self.buttons = []
+        font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightSemibold)
+        for i, label in enumerate(labels):
+            btn = BrightenOnHoverButton.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
+            # Real colors get set below by _applySelectionColors — these are just placeholders
+            # so configureBrighten has something to build its two overlaid labels from. No
+            # explicit label_frame needed — it defaults to the button's own full bounds, which
+            # is correctly vertically centered now that configureBrighten's labels use
+            # _VerticallyCenteredTextField (see that class's docstring for why a plain
+            # NSTextField wasn't centering on its own here).
+            btn.configureBrighten(label, font, white(0.5), white(0.85))
+            btn.setTarget_(self)
+            btn.setAction_("_segClicked:")
+            btn._seg_index = i
+            self.addSubview_(btn)
+            self.buttons.append(btn)
+        self._applySelectionColors()
+        self._layoutSegments(animated=False)
+
+    @objc.python_method
+    def select(self, index, animated=True):
+        if index == self.selected_index:
+            return
+        self.selected_index = index
+        self._applySelectionColors()
+        self._layoutSegments(animated=animated)
+
+    @objc.python_method
+    def _applySelectionColors(self):
+        # Directly recoloring the existing dim/bright label instances configureBrighten
+        # already built — NOT calling configureBrighten again, which addSubview_s a fresh
+        # label pair every time with no removal of the old ones (fine for a one-shot build,
+        # would silently stack duplicate overlapping labels here).
+        for i, btn in enumerate(self.buttons):
+            if i == self.selected_index:
+                btn._dim_label.setTextColor_(white(0.95))
+                btn._bright_label.setTextColor_(white(0.95))
+            else:
+                btn._dim_label.setTextColor_(white(0.5))
+                btn._bright_label.setTextColor_(white(0.85))
+
+    @objc.python_method
+    def _layoutSegments(self, animated):
+        b = self.bounds()
+        if b.size.width <= 0 or b.size.height <= 0 or not self.buttons:
+            return
+        n = len(self.buttons)
+        seg_w = b.size.width / n
+        pad = 3.0
+        self.layer().setCornerRadius_(b.size.height / 2.0)
+        for i, btn in enumerate(self.buttons):
+            btn.setFrame_(NSMakeRect(i * seg_w, 0, seg_w, b.size.height))
+        indicator_frame = NSMakeRect(self.selected_index * seg_w + pad, pad,
+                                      seg_w - pad * 2, b.size.height - pad * 2)
+        AppKit.CATransaction.begin()
+        if animated:
+            AppKit.CATransaction.setAnimationDuration_(0.22)
+        else:
+            AppKit.CATransaction.setDisableActions_(True)
+        self.indicator_layer.setFrame_(indicator_frame)
+        self.indicator_layer.setCornerRadius_((b.size.height - pad * 2) / 2.0)
+        AppKit.CATransaction.commit()
+
+    def _segClicked_(self, sender):
+        idx = getattr(sender, "_seg_index", 0)
+        if idx == self.selected_index:
+            return
+        self.select(idx, animated=True)
+        if self.on_change:
+            self.on_change(idx)
+
+
+class _VerticallyCenteredTextField(AppKit.NSTextField):
+    """A plain NSTextField, except its cell actually centers content vertically instead of
+    top-aligning it whenever the field's frame is taller than one line of text — see
+    VerticallyCenteredCell. cellClass() is the standard Cocoa hook for this: it's consulted by
+    NSTextField's own init/initWithFrame_, so every field built this way gets the corrected
+    cell automatically, with no per-instance cell-swapping needed."""
+
+    @classmethod
+    def cellClass(cls):
+        return VerticallyCenteredCell
+
+
 class BrightenOnHoverButton(HoverButton):
     """Text-only hover feedback: the title itself brightens instead of a background box
     appearing — for a button that should always read as plain text (e.g. a Cancel action),
@@ -504,7 +684,16 @@ class BrightenOnHoverButton(HoverButton):
         frame = label_frame if label_frame is not None else self.bounds()
         autoresize = (AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable) if label_frame is None else (
             AppKit.NSViewWidthSizable | AppKit.NSViewMinYMargin | AppKit.NSViewMaxYMargin)
-        dim = AppKit.NSTextField.alloc().init()
+        # _VerticallyCenteredTextField, NOT plain NSTextField — a plain NSTextFieldCell
+        # top-aligns once its frame is taller than the text's own tight bounding box, which
+        # every caller's frame always is (a comfortable click target, not a snug text box).
+        # Confirmed by direct pixel measurement on the segmented pill control (SegmentedPillControl):
+        # text sat ~8pt above the frame's true vertical center — a caller-side label_frame resize
+        # alone doesn't fix it, since it still top-aligns within whatever frame it's given; the
+        # cell itself has to center. Applied here (not just at the one call site that surfaced
+        # it) since every other BrightenOnHoverButton user has the same latent issue, just less
+        # visually obvious where the frame height is already close to the text's own height.
+        dim = _VerticallyCenteredTextField.alloc().init()
         dim.setBezeled_(False)
         dim.setDrawsBackground_(False)
         dim.setEditable_(False)
@@ -515,7 +704,7 @@ class BrightenOnHoverButton(HoverButton):
         dim.setStringValue_(title)
         dim.setFrame_(frame)
         dim.setAutoresizingMask_(autoresize)
-        bright = AppKit.NSTextField.alloc().init()
+        bright = _VerticallyCenteredTextField.alloc().init()
         bright.setBezeled_(False)
         bright.setDrawsBackground_(False)
         bright.setEditable_(False)
@@ -650,7 +839,14 @@ class PulsingLabel(AppKit.NSTextField):
             self._pulse_gradient.setLocations_([center + o for o in offsets])
             AppKit.CATransaction.commit()
 
-        self._pulse_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(1.0 / 30.0, True, tick)
+        # NOT scheduledTimerWithTimeInterval_repeats_block_ — that only fires in
+        # NSDefaultRunLoopMode, which AppKit suspends during interactive tracking loops (a live
+        # window resize drag, a scrollbar drag, menu tracking), so the pulse visibly freezes
+        # mid-resize and jumps back on mouse-up (confirmed directly, same underlying cause as
+        # ShimmerBorderView's own resize glitch below). Adding it to NSRunLoopCommonModes
+        # instead keeps it ticking through those tracking loops too.
+        self._pulse_timer = AppKit.NSTimer.timerWithTimeInterval_repeats_block_(1.0 / 30.0, True, tick)
+        AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(self._pulse_timer, AppKit.NSRunLoopCommonModes)
 
     @objc.python_method
     def stopPulsing(self):
@@ -684,14 +880,33 @@ class ShimmerBorderView(AppKit.NSView):
         self._shimmering = False
 
     @objc.python_method
+    def _layoutShimmerBorder(self):
+        # Re-derives the stroke path and both layers' frames from the view's CURRENT bounds —
+        # called both on initial creation and on every resize (see setFrame_ below). Without
+        # this, the path/frame baked in at creation time stay put while the view itself grows
+        # or shrinks around them, leaving the glow stuck tracing the view's OLD size (confirmed
+        # directly: after a window resize, the stroke ended up running through the middle of
+        # the now-larger box instead of along its edge).
+        if self._shimmer_layer is None:
+            return
+        b = self.bounds()
+        inset = NSMakeRect(0.5, 0.5, b.size.width - 1.0, b.size.height - 1.0)
+        path = Quartz.CGPathCreateWithRoundedRect(inset, self._shimmer_radius, self._shimmer_radius, None)
+        AppKit.CATransaction.begin()
+        AppKit.CATransaction.setDisableActions_(True)
+        self._shimmer_layer.setFrame_(b)
+        self._shimmer_layer.setPath_(path)
+        self._shimmer_gradient.setFrame_(b)
+        AppKit.CATransaction.commit()
+
+    def setFrame_(self, frame):
+        objc.super(ShimmerBorderView, self).setFrame_(frame)
+        self._layoutShimmerBorder()
+
+    @objc.python_method
     def startBorderShimmer(self):
         if self._shimmer_layer is None:
-            b = self.bounds()
-            inset = NSMakeRect(0.5, 0.5, b.size.width - 1.0, b.size.height - 1.0)
-            path = Quartz.CGPathCreateWithRoundedRect(inset, self._shimmer_radius, self._shimmer_radius, None)
             shape = Quartz.CAShapeLayer.layer()
-            shape.setFrame_(b)
-            shape.setPath_(path)
             shape.setFillColor_(None)
             shape.setStrokeColor_(self._shimmer_color.CGColor())
             shape.setLineWidth_(1.0)
@@ -699,7 +914,6 @@ class ShimmerBorderView(AppKit.NSView):
             self._shimmer_layer = shape
 
             gradient = Quartz.CAGradientLayer.layer()
-            gradient.setFrame_(b)
             # CAGradientLayer's unit space has (0,0) at the bottom-left and (1,1) at the
             # top-right regardless of view flippedness — top-left to bottom-right is (0,1) to (1,0).
             gradient.setStartPoint_(NSMakePoint(0.0, 1.0))
@@ -709,6 +923,7 @@ class ShimmerBorderView(AppKit.NSView):
             gradient.setColors_([clear, clear, solid, clear, clear])
             shape.setMask_(gradient)
             self._shimmer_gradient = gradient
+            self._layoutShimmerBorder()
 
         self._shimmer_layer.setHidden_(False)
         if self._shimmering:
@@ -728,7 +943,13 @@ class ShimmerBorderView(AppKit.NSView):
             self._shimmer_gradient.setLocations_([center + o for o in offsets])
             AppKit.CATransaction.commit()
 
-        self._shimmer_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(1.0 / 30.0, True, tick)
+        # NSRunLoopCommonModes, not the plain scheduled-timer default mode — confirmed directly:
+        # a timer only in NSDefaultRunLoopMode stops firing for the whole duration of a live
+        # window-resize drag (AppKit runs NSEventTrackingRunLoopMode during that drag instead),
+        # so the shimmer visibly froze mid-drag and snapped back on mouse-up. Common modes
+        # covers both, so it keeps animating through the drag.
+        self._shimmer_timer = AppKit.NSTimer.timerWithTimeInterval_repeats_block_(1.0 / 30.0, True, tick)
+        AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(self._shimmer_timer, AppKit.NSRunLoopCommonModes)
 
     @objc.python_method
     def stopBorderShimmer(self):
@@ -890,7 +1111,20 @@ class FlatPopUpButton(HoverButton):
             chevron.setContentTintColor_(white(0.5))
         chevron.setAutoresizingMask_(AppKit.NSViewMinXMargin)
         self.addSubview_(chevron)
+        self._chevron = chevron
         return self
+
+    def setEnabled_(self, enabled):
+        # This is a fully custom-drawn control (no native bezel), so disabling it via the
+        # standard NSButton mechanism alone is functionally correct but visually silent —
+        # nothing dims to signal why clicking it does nothing. Fading the label/chevron gives
+        # that same "grayed out" read a native disabled control gets for free.
+        objc.super(FlatPopUpButton, self).setEnabled_(enabled)
+        alpha = 1.0 if enabled else 0.35
+        if getattr(self, "_title_label", None) is not None:
+            self._title_label.setAlphaValue_(alpha)
+        if getattr(self, "_chevron", None) is not None:
+            self._chevron.setAlphaValue_(alpha)
 
     @objc.python_method
     def addItemWithTitle_(self, title):

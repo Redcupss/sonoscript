@@ -1,4 +1,5 @@
 import random
+import time
 
 import AppKit
 import Quartz
@@ -98,3 +99,16 @@ def format_playback_time(seconds):
     seconds = max(0, int(seconds))
     m, s = divmod(seconds, 60)
     return f"{m}:{s:02d}"
+
+
+def format_relative_time(timestamp):
+    delta = max(0.0, time.time() - timestamp)
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    if delta < 7 * 86400:
+        return f"{int(delta // 86400)}d ago"
+    return time.strftime("%b %-d", time.localtime(timestamp))

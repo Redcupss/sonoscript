@@ -6,8 +6,10 @@ import json
 import math
 import os
 import queue
+import re
 import shlex
 import ssl
+import string
 import struct
 import subprocess
 import sys
@@ -32,13 +34,17 @@ from Foundation import (
 from chunking import chunk_text, CHUNK_TARGET_CHARS, chatterbox_chunk_target
 from config import load_config, save_config, sesame_voices_path
 import history
-from text_prep import sanitize_for_speech
-from ui_helpers import white, fix_anchor, build_waveform_bars, make_label, symbol_image, format_playback_time
+import saved
+from text_prep import sanitize_for_speech, normalize_paragraph_breaks
+from ui_helpers import (
+    white, fix_anchor, build_waveform_bars, make_label, symbol_image, format_playback_time,
+    format_relative_time,
+)
 from widgets import (
     ClickThroughTextField, ScrubberView, HoverButton, icon_button, text_button, cta_button,
     FlatPopUpButton, ControlRow, FocusTextView, BackdropView, CardView, DropdownPanel,
     LevelMeterView, EditableNameField, RecordButton, text_button_brighten, BrightenOnHoverButton,
-    PulsingLabel, ShimmerBorderView,
+    PulsingLabel, ShimmerBorderView, ContextMenuButton, SegmentedPillControl,
 )
 
 APP_NAME = "SonoScript"
@@ -105,6 +111,29 @@ SESAME_VOICES = [
      "ref_text": ("To Henry, the journey of a thousand miles begins with a single step. For "
                   "wherever he lived, he would place to place and he kept his dream alive and "
                   "burning.")},
+    # Sesame's own official demo/reference clips (from sesame/csm-1b's gated repo — pulled via
+    # the ungated mlx-community/csm-1b mirror instead, which re-hosts the same files) rather
+    # than a bundled or recorded one. 30s each, right in the middle of the model's own
+    # documented ideal reference-length range — see RECORD_MIN/MAX_SECONDS' own comment. Voice
+    # gender/character unconfirmed (never listened to directly) — labeled neutrally rather
+    # than guessed. Their transcripts are casual, unpunctuated, mid-thought speech (Sesame's
+    # own conditioning source), which may carry into a more conversational, less formal
+    # reading style than Ben/Sadie/Manny when reading arbitrary book-style text — worth a
+    # direct listen before treating them as equivalent alternatives.
+    {"id": "conversational_a", "label": "Alex (Conversational)", "ref_audio": "conversational_a.wav",
+     "ref_text": ("like revising for an exam I'd have to try and like keep up the momentum because I'd "
+                  "start really early I'd be like okay I'm gonna start revising now and then like "
+                  "you're revising for ages and then I just like start losing steam I didn't do that "
+                  "for the exam we had recently to be fair that was a more of a last minute scenario "
+                  "but like yeah I'm trying to like yeah I noticed this yesterday that like Mondays I "
+                  "sort of start the day with this not like a panic but like a")},
+    {"id": "conversational_b", "label": "Jordan (Conversational)", "ref_audio": "conversational_b.wav",
+     "ref_text": ("like a super Mario level. Like it's very like high detail. And like, once you get "
+                  "into the park, it just like, everything looks like a computer game and they have all "
+                  "these, like, you know, if, if there's like a, you know, like in a Mario game, they "
+                  "will have like a question block. And if you like, you know, punch it, a coin will "
+                  "come out. So like everyone, when they come into the park, they get like this little "
+                  "bracelet and then you can go punching question blocks around.")},
 ]
 
 # Same defensive pattern as Chatterbox's runaway-generation guard — CSM's default sampler
@@ -114,22 +143,119 @@ SESAME_VOICES = [
 # provisional (based on a small sample) pending more real-world usage data.
 SESAME_MIN_CHARS_PER_SEC = 11.5
 SESAME_MIN_CHARS_FOR_CHECK = 50
-SESAME_MAX_RETRIES = 2
+# A real, isolated-process 16-trial batch measured this failure mode at a ~44% per-attempt
+# rate (confirmed a known, unfixed CSM base-model bug — see _generateSesameAudio) — at the
+# old MAX_RETRIES=2 (3 attempts total), that's roughly a 1-in-13 chance EVERY attempt fails
+# and a garbled chunk plays anyway, which compounds fast across a multi-chunk document. 4
+# (5 attempts total) brings a single chunk's all-fail odds down to roughly 1-in-60 — worth
+# the extra worst-case wait now that max_audio_length_ms caps how long each failed attempt
+# takes, instead of running all the way to the library's old 90-second default first.
+SESAME_MAX_RETRIES = 4
 
 CREATE_VOICE_SENTINEL = "__sesame_create_your_own__"
 RECORD_SAMPLE_RATE = 44100
-RECORD_MIN_SECONDS = 5.0
-RECORD_MAX_SECONDS = 10.0
-# A fixed, app-dictated script — never user-editable — means the app always knows the exact
-# ground-truth transcript with zero risk of a mismatch, and no ASR/transcription step is ever
-# needed (keeping voice creation fully offline, matching the rest of the app). ~21 words lands
-# comfortably inside the 5-10s window even at a slow, careful reading pace. One statement + one
-# question gives the reference clip natural pitch variation instead of a flat monotone.
-RECORD_SCRIPT_TEXT = ("Hi, thanks for recording this with me today. I've been looking forward "
-                      "to trying this out — how's your week been going?")
+# Sesame's own official demo reference clips run 20-45s — a real, direct research finding
+# (confirmed by reading the model's actual conditioning mechanism: the reference audio and
+# its transcript get concatenated into one unbroken segment the model uses to learn where the
+# reference ends and new speech begins, so a short clip gives it less to work with) — the old
+# 5-10s window traded stability for a quicker recording experience. Matches the model's own
+# full ~45s ceiling now rather than a self-imposed lower cap — asked directly, and the answer
+# was to favor a longer recording over a shorter one if it gets a better result.
+RECORD_MIN_SECONDS = 15.0
+RECORD_MAX_SECONDS = 45.0
+# A fixed, app-dictated script per style — never user-editable — means the app always knows
+# the exact ground-truth transcript with zero risk of a mismatch, and no ASR/transcription
+# step is ever needed (keeping voice creation fully offline, matching the rest of the app).
+#
+# Multiple styles, not one script: confirmed directly against real generated output — Ben's
+# formal, complete-sentence reference produced a narrator-style clone, while Sesame's own
+# casual, self-correcting "conversational" demo reference (see conversational_a/b above)
+# produced something much closer to a natural presenter/lecturer reading the same book text.
+# The word content itself is what a reader has to work with — direction alone ("read this
+# casually") only goes so far if the words themselves are stylistically neutral, the same way
+# a screenplay's actual dialogue shapes a performance more than a stage direction does. Each
+# script below is written to embody its own style through word choice and structure, not just
+# labeled with one.
+#
+# Word counts (and pace assumptions) are calibrated from two real, directly-reported reading
+# times, not guessed: casual text (the original 59-word script) read in 15s (~3.9 words/sec),
+# vs. dense informational text (the "Reading" script below) read in 44.4s for 99 words (~2.2
+# words/sec) — nearly HALF the pace. Formal/informational registers are read noticeably slower
+# than casual ones by the same person, so each script here is sized for its own register's
+# real pace against the 15-45s window, not a single flat words-per-second assumption. Trimmed
+# for margin under the 45s ceiling even at a slower-than-estimated pace — landing right at the
+# edge risks the recording buffer cutting off mid-sentence, which would leave ref_text (the
+# exact transcript this app pairs with the audio) claiming words that were never actually
+# captured, corrupting the exact alignment the model's cloning depends on.
+RECORD_SCRIPT_PRESETS = [
+    {
+        "id": "narrator",
+        "label": "Narrator",
+        "description": "Warm and deliberate — like a documentary voiceover.",
+        "script": (
+            "Deep in the heart of every great story lies a single, defining moment — the "
+            "moment everything changes. For years, this place stood quiet, its secrets "
+            "waiting patiently to be uncovered, hidden from every eye that dared to look. "
+            "Explorers came and went, each one certain they had found the truth, and each "
+            "one leaving with more questions than answers. But today, at last, that story "
+            "can finally be told, and it will stay with you long after the final word."
+        ),
+    },
+    {
+        "id": "conversational",
+        "label": "Conversational",
+        "description": "Casual and natural — like explaining something to a friend.",
+        "script": (
+            "Okay, so — this is going to sound random, but I've been thinking about this "
+            "all day, and I just have to say it out loud. You know that feeling when you "
+            "plan something out perfectly, like down to the smallest detail, and then it "
+            "just... doesn't go that way at all? That actually happened to me this week, "
+            "which was kind of funny, honestly. I mean, not in a bad way, just — it turned "
+            "out completely different than I expected, you know? And normally that would "
+            "stress me out, but this time I was like, actually, you know what, this is kind "
+            "of fine. Anyway, that's basically where my head's been at today."
+        ),
+    },
+    {
+        "id": "reading",
+        "label": "Reading",
+        "description": "Clear and steady — like reading a book or article aloud.",
+        # Real excerpt, not written for this — a direct suggestion, from the same business-
+        # textbook chapter used to test this whole feature. Trimmed by one sentence from the
+        # original (per that same suggestion: "you could even cut the last sentence if it's
+        # too long") for margin under the 45s ceiling at this register's slower real pace.
+        "script": (
+            "Depending on the degree of novelty involved, there are two main types of new "
+            "offerings: revolutionary offerings that deliver new-to-the-world benefits, and "
+            "evolutionary offerings that involve relatively minor modifications of existing "
+            "offerings, such as different colors, sizes, or packaging. Revolutionary "
+            "offerings — like Netflix, Uber, and Airbnb — can disrupt entire industries with "
+            "benefits no competitor can easily match."
+        ),
+    },
+]
 
 
 # ---------- app ----------
+
+class _SpeechTimingDelegate(NSObject):
+    """A fresh, call-scoped AVSpeechSynthesizerDelegate — created new per _requestSystemTTS
+    call rather than reusing AppDelegate itself as the delegate, so its on_range callback can
+    close over that ONE call's own local text/collected-buffer state with no shared/global
+    state and no risk of a stale callback from a previous generation ever firing. Confirmed via
+    a standalone spike that willSpeakRangeOfSpeechString fires interleaved with (and just
+    before) the buffer callback for that word's own audio — the cumulative sample count in
+    the buffer AT THE MOMENT this fires is the word's real, exact start time, not an estimate."""
+
+    def init(self):
+        self = objc.super(_SpeechTimingDelegate, self).init()
+        self.on_range = None
+        return self
+
+    def speechSynthesizer_willSpeakRangeOfSpeechString_utterance_(self, synth, range_val, utterance):
+        if self.on_range is not None:
+            self.on_range(range_val.location, range_val.length)
+
 
 class AppDelegate(NSObject):
     # ----- lifecycle -----
@@ -140,6 +266,7 @@ class AppDelegate(NSObject):
             self.config.pop("voice_id", None)  # Kokoro's voice ids don't exist in the new list
             save_config(self.config)
         self.voice_ids = []
+        self._voice_labels = []  # cached by _populateVoiceMenu, restored by showMainScreen
         self.player = None
         self._chatterbox_engine = None  # lazy-loaded once, reused for every chunk — see _chatterboxEngine
         self._chatterbox_lock = threading.Lock()
@@ -164,8 +291,25 @@ class AppDelegate(NSObject):
         self._rec_preview_audio = None  # (float32 ndarray, sample_rate) once a take passes validation
         self._rec_preview_player = None  # AVAudioPlayer, scoped to this flow only — never touches self.player
         self._pending_delete_voice_id = None  # set right before the Manage Voices delete-confirm card opens
+        self._pending_delete_history_id = None  # set right before the History row delete-confirm card opens
+        self._pending_delete_saved_path = None  # set right before the Saved row delete-confirm card opens
+        self._recordings_seg = None  # the persistent SegmentedPillControl instance, so tab switches can animate
+        self._recordings_list_box = None  # the persistent list container tab switches rebuild content into
+        self.current_recordings_tab = "recent"
         self._manage_voice_fields = {}  # voice_id -> its NSTextField in the Manage Voices card, for rename commits
         self._rec_return_to = None  # callable to reopen instead of dismissing to the main screen, or None
+        self._rec_selected_script = None  # one of RECORD_SCRIPT_PRESETS, chosen on _showStyleChoiceCard
+        self._rec_script_fade_observer = None
+        # Settings > Data & Storage pending state — what the user is currently configuring,
+        # separate from what's actually stored in history.py until storageConfirmClicked_
+        # applies it. Init'd from real config the first time showSettingsScreen runs.
+        self._settings_storage_mode = None
+        self._settings_storage_value = None
+        self._pending_storage_mode = None
+        self._pending_storage_value = None
+        self._list_scroll_observer = []  # see _installScrollReclamp
+        self._width_rebuild_observer = None  # see _installWidthRebuildTrigger
+        self._width_rebuild_timer = None
         # Chunked playback state — see playPauseClicked_/_beginChunkPlayback for the pipeline.
         # playback_token identifies one Play session; background chunk results carrying a
         # stale token (from a Stop or a new Play superseding it) are dropped on arrival.
@@ -180,6 +324,10 @@ class AppDelegate(NSObject):
                                       # (same bytes, same real duration) instead of a fresh,
                                       # not-necessarily-identical regeneration, and doesn't
                                       # spend a fresh request on content you already paid for.
+        self.chunk_word_timings = {}  # index -> that chunk's word_timings list (System voice
+                                       # only, see _requestSystemTTS) — parallels chunk_audio_cache
+        self._last_word_timings = None  # side-channel _requestSystemTTS uses to hand its result
+                                         # to _chunkWorker without changing _requestTTS's signature
         self.session_text = None  # text the current all_chunks/cache were generated from — lets
                                    # playPauseClicked_ tell "replay what just finished" (same
                                    # text, still cached) apart from "text changed, start fresh"
@@ -206,6 +354,17 @@ class AppDelegate(NSObject):
         if self._isConfigured():
             self.showMainScreen()
             self.fetchVoices()
+            # Loading the local model is a real, unavoidable few-tens-of-seconds cost — the
+            # first Play of a session was paying it inline, on top of actual generation time,
+            # making that first wait look far worse than the model actually is. Queuing the
+            # load now overlaps it with however long the user spends reading/pasting text
+            # instead, so by the time they hit Play it may already be warm — queued (not a
+            # separate thread) so it runs on the same persistent MLX thread as everything else.
+            provider = self.config.get("provider")
+            if provider == "Chatterbox":
+                self._tts_job_queue.put(self._chatterboxEngine)
+            elif provider == "Sesame":
+                self._tts_job_queue.put(self._sesameEngine)
         else:
             self.showWelcomeScreen(show_intro=True)
 
@@ -231,14 +390,24 @@ class AppDelegate(NSObject):
         app_item = AppKit.NSMenuItem.alloc().init()
         main_menu.addItem_(app_item)
         app_menu = AppKit.NSMenu.alloc().init()
-        for title, action, key in [
+        items = [
             (f"About {APP_NAME}", "showAbout:", ""),
             ("Check for Updates", "checkForUpdatesClicked:", ""),
             (None, None, None),
-            ("Set API Key", "resetApiKey:", ""),
-            (None, None, None),
-            (f"Quit {APP_NAME}", "terminate:", "q"),
-        ]:
+            ("Recordings", "recordingsClicked:", ""),
+            ("Voice Provider", "resetApiKey:", ""),
+            ("Settings", "settingsClicked:", ""),
+        ]
+        # sys.frozen is set by py2app on the actual packaged .app, never on a plain `python3
+        # main.py` dev run — this is a testing tool for comparing resize behavior against a
+        # known-good starting size/aspect ratio, not a real feature, and must never reach a
+        # real user's copy of the app.
+        if not getattr(sys, "frozen", False):
+            items.append((None, None, None))
+            items.append(("Reset Window Size (Dev)", "devResetWindowSizeClicked:", ""))
+        items.append((None, None, None))
+        items.append((f"Quit {APP_NAME}", "terminate:", "q"))
+        for title, action, key in items:
             if title is None:
                 app_menu.addItem_(AppKit.NSMenuItem.separatorItem())
                 continue
@@ -262,6 +431,12 @@ class AppDelegate(NSObject):
             edit_menu.addItem_(AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key))
         edit_item.setSubmenu_(edit_menu)
         AppKit.NSApp.setMainMenu_(main_menu)
+
+    def devResetWindowSizeClicked_(self, sender):
+        # Keeps the top-left corner fixed and just resets the content size — matches
+        # build_window's own initial NSMakeRect(0, 0, 440, 520) exactly, so this is a real
+        # "back to launch size" rather than an approximation.
+        self.window.setContentSize_(NSMakeSize(440, 520))
 
     # ----- window shell -----
     def build_window(self):
@@ -320,10 +495,37 @@ class AppDelegate(NSObject):
         # wordmark button, top-right of title bar; opens the app popup menu
         h = rect.size.height
         font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightSemibold)
-        self.wordmark = text_button_brighten(
-            APP_NAME, NSMakeRect(rect.size.width - 96, h - 32, 84, 26),
-            "wordmarkClicked:", self, font, white(0.55), white(1.0),
-        )
+        # Measured the traffic lights directly (pixel-analyzed a real screenshot): their dot
+        # bounding box sits exactly 8pt from both the left and top window edges.
+        #
+        # Tried narrowing a CENTERED frame to match the text width instead — that's a losing
+        # game: three different ways of measuring "SonoScript"'s width (raw attributed-string,
+        # a plain field's cellSizeForBounds_, and the actual BrightenOnHoverButton's own field)
+        # gave three different answers (67.6 / 71.6 / 75.6pt), and centering math amplifies
+        # whichever one is wrong into visible drift on both edges — confirmed directly, one
+        # attempt clipped the final "t", the next left ~13pt of margin instead of the 8pt
+        # targeted. Right-aligning the text within a generously-wide frame sidesteps needing an
+        # exact width at all: the frame's own right edge (a real, known number) IS the text's
+        # right edge, whatever the glyphs actually measure. Same technique already used for the
+        # sidebar's own left-aligned rows.
+        # y is 8pt higher than the "obvious" h-34 — configureBrighten's labels now correctly
+        # center vertically within whatever frame they're given (see _VerticallyCenteredTextField),
+        # and centering the text within this button's full 26pt height reads as extra empty
+        # space above it versus the old (buggy) top-alignment this position was originally
+        # tuned against. Tried shrinking the label_frame instead first, expecting the text to
+        # then sit flush with the button's own top edge — measured that directly and it did NOT
+        # land where predicted (NSAttributedString's reported size already includes the font's
+        # own leading, which isn't eliminated just by matching the frame to it). Measuring the
+        # actual simple case instead (full-height frame, centered) gave a clean, real 16pt
+        # margin — 8pt more than the 8pt target — so the outer frame itself is shifted up by
+        # exactly that measured gap instead of fighting text metrics with a shrunk frame.
+        self.wordmark = BrightenOnHoverButton.alloc().initWithFrame_(
+            NSMakeRect(rect.size.width - 108, h - 26, 100, 26))
+        self.wordmark.configureBrighten(
+            APP_NAME, font, white(0.55), white(1.0),
+            align=AppKit.NSTextAlignmentRight, label_frame=NSMakeRect(0, 0, 100, 26))
+        self.wordmark.setTarget_(self)
+        self.wordmark.setAction_("wordmarkClicked:")
         self.wordmark.setAutoresizingMask_(AppKit.NSViewMinXMargin | AppKit.NSViewMinYMargin)
         self.root.addSubview_(self.wordmark)
 
@@ -354,11 +556,13 @@ class AppDelegate(NSObject):
             {"title": f"About {APP_NAME}", "on_click": lambda: self.showAbout_(None)},
             {"title": "Check for Updates", "on_click": lambda: self.checkForUpdatesClicked_(None)},
             None,
-            {"title": "Set API Key", "on_click": lambda: self.resetApiKey_(None)},
+            {"title": "Recordings", "on_click": lambda: self.recordingsClicked_(None)},
+            {"title": "Voice Provider", "on_click": lambda: self.resetApiKey_(None)},
+            {"title": "Settings", "on_click": lambda: self.settingsClicked_(None)},
         ]
         if self.config.get("provider") == "Sesame":
             rows.append(None)
-            rows.append({"title": "Manage Voices", "on_click": lambda: self._showManageVoicesCard()})
+            rows.append({"title": "Manage Voices", "on_click": lambda: self.showSettingsScreen("voices")})
         self._showDropdown(sender, rows, align="right", direction="down")
 
     # ----- custom dropdown / menu panel (matches mockup card styling; no native NSMenu chrome) -----
@@ -409,6 +613,115 @@ class AppDelegate(NSObject):
             panel.orderOut_(None)
             self.window.makeKeyAndOrderFront_(None)
         AppKit.NSAnimationContext.runAnimationGroup_completionHandler_(fade_out, done)
+
+    def volumeClicked_(self, sender):
+        if self.dropdown_anchor is sender and self.dropdown_panel is not None:
+            self._closeDropdown()
+            return
+        self._showVolumePopover(sender)
+
+    @objc.python_method
+    def _showVolumePopover(self, anchor):
+        """Small custom popover (not a row menu, so it doesn't go through _showDropdown) —
+        reuses the exact same panel-shell styling and dismiss-monitor machinery (dropdown_panel/
+        dropdown_anchor/_closeDropdown) so it opens/closes/dismisses identically to every other
+        menu in the app, just with a slider instead of rows."""
+        self._closeDropdownImmediate()
+        w, h, pad = 190.0, 78.0, 14.0
+
+        anchor_screen = anchor.window().convertRectToScreen_(
+            anchor.convertRect_toView_(anchor.bounds(), None))
+        x = anchor_screen.origin.x + anchor_screen.size.width / 2.0 - w / 2.0
+        y = anchor_screen.origin.y + anchor_screen.size.height + 14.0
+
+        panel = DropdownPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(x, y, w, h), AppKit.NSWindowStyleMaskBorderless,
+            AppKit.NSBackingStoreBuffered, False)
+        panel.setOpaque_(False)
+        panel.setBackgroundColor_(AppKit.NSColor.clearColor())
+        panel.setHasShadow_(True)
+        panel.setLevel_(AppKit.NSPopUpMenuWindowLevel)
+        panel.setAppearance_(AppKit.NSAppearance.appearanceNamed_("NSAppearanceNameVibrantDark"))
+
+        outer = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+        outer.setWantsLayer_(True)
+        outer.layer().setBorderColor_(white(0.14).CGColor())
+        outer.layer().setBorderWidth_(1.0)
+        outer.layer().setCornerRadius_(12.0)
+        outer.layer().setMasksToBounds_(True)
+
+        blur = AppKit.NSVisualEffectView.alloc().initWithFrame_(outer.bounds())
+        blur.setMaterial_(AppKit.NSVisualEffectMaterialPopover)
+        blur.setBlendingMode_(AppKit.NSVisualEffectBlendingModeBehindWindow)
+        blur.setState_(AppKit.NSVisualEffectStateActive)
+        blur.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        outer.addSubview_(blur)
+
+        tint = AppKit.NSView.alloc().initWithFrame_(outer.bounds())
+        tint.setWantsLayer_(True)
+        tint.layer().setBackgroundColor_(AppKit.NSColor.colorWithWhite_alpha_(0.08, 0.28).CGColor())
+        tint.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        outer.addSubview_(tint)
+
+        vol = max(0.0, min(1.0, self.config.get("volume", 1.0)))
+        label = make_label("Volume", 12, 0.6)
+        label.setFrame_(NSMakeRect(pad, h - pad - 16, w - pad * 2 - 40, 16))
+        self.volume_pct_label = make_label(f"{int(round(vol * 100))}%", 12, 0.85, align=AppKit.NSTextAlignmentRight)
+        self.volume_pct_label.setFrame_(NSMakeRect(w - pad - 36, h - pad - 16, 36, 16))
+        outer.addSubview_(label)
+        outer.addSubview_(self.volume_pct_label)
+
+        self.volume_slider = ScrubberView.alloc().initWithFrame_(NSMakeRect(pad, pad, w - pad * 2, 24))
+        self.volume_slider.configure()
+        self.volume_slider.setFraction(vol)
+        self.volume_slider.on_scrub = self._volumeDragged
+        self.volume_slider.on_scrub_end = self._volumeReleased
+        outer.addSubview_(self.volume_slider)
+
+        panel.setContentView_(outer)
+        self.dropdown_panel = panel
+        self.dropdown_anchor = anchor
+        self.window.addChildWindow_ordered_(panel, AppKit.NSWindowAbove)
+        panel.setAlphaValue_(0.0)
+        panel.makeKeyAndOrderFront_(None)
+
+        def fade_in(ctx):
+            ctx.setDuration_(0.12)
+            panel.animator().setAlphaValue_(1.0)
+        AppKit.NSAnimationContext.runAnimationGroup_(fade_in)
+
+        self.dropdown_monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            AppKit.NSEventMaskLeftMouseDown | AppKit.NSEventMaskRightMouseDown, lambda e: self._closeDropdown())
+
+        def local_handler(event):
+            p = getattr(self, "dropdown_panel", None)
+            if p is None:
+                return event
+            if event.window() is p:
+                return event  # click lands inside the popover (the slider); let it handle itself
+            a = getattr(self, "dropdown_anchor", None)
+            if a is not None and event.window() is a.window():
+                pt = a.convertPoint_fromView_(event.locationInWindow(), None)
+                if AppKit.NSPointInRect(pt, a.bounds()):
+                    return event  # click is on the anchor button itself; its own action toggles it closed
+            self._closeDropdown()
+            return event
+        self.dropdown_local_monitor = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+            AppKit.NSEventMaskLeftMouseDown, local_handler)
+
+    @objc.python_method
+    def _volumeDragged(self, fraction):
+        vol = max(0.0, min(1.0, fraction))
+        self.volume_slider.setFraction(vol)
+        self.volume_pct_label.setStringValue_(f"{int(round(vol * 100))}%")
+        if self.player is not None:
+            self.player.setVolume_(vol)
+
+    @objc.python_method
+    def _volumeReleased(self, fraction):
+        vol = max(0.0, min(1.0, fraction))
+        self.config["volume"] = vol
+        save_config(self.config)
 
     @objc.python_method
     def _showDropdown(self, anchor, rows, width=None, align="right", direction="up"):
@@ -927,7 +1240,18 @@ class AppDelegate(NSObject):
         # 12pt gap below the key field, matching the pills-to-field gap exactly (both measure
         # 12pt from the element above), so pills/field/continue/cancel all have identical
         # spacing rather than three visually-different-sized gaps
-        self.continue_btn = cta_button("Continue", NSMakeRect(mx - field_w / 2.0, my - 175, field_w, 38), "saveApiKey:", self)
+        # text_button, NOT cta_button — cta_button deliberately disables HoverButton's native
+        # hover-fill mechanism (it wants a flat static color), which is exactly why this button
+        # had zero hover/press feedback despite looking interactive. Same base as the pills
+        # (0.04/white(0.1) border), but hover dialed back to 0.10 (pills use 0.14) — this
+        # button covers a lot more area than a pill does, and the identical alpha read as
+        # noticeably brighter here simply from covering more of the visual field, confirmed
+        # directly.
+        continue_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightSemibold)
+        self.continue_btn = text_button(
+            "Continue", NSMakeRect(mx - field_w / 2.0, my - 175, field_w, 38), "saveApiKey:", self,
+            continue_font, 0.04, 0.10, 9.0, white(0.95))
+        self.continue_btn.layer().setBorderWidth_(1.0)
         self._updateContinueState()
 
         extras = [icon_bg, title, tagline, caption, self.key_field_box, self.continue_btn]
@@ -1188,7 +1512,7 @@ class AppDelegate(NSObject):
         field = notification.object()
         # A raw NSTextField (unlike a custom subclass such as HoverButton) rejects arbitrary
         # Python attributes outright — self._manage_voice_fields (voice_id -> field) is the
-        # forward mapping built in _showManageVoicesCard; find this field's id by identity
+        # forward mapping built in _buildVoicesSection; find this field's id by identity
         # instead of trying to tag the field itself.
         voice_id = next((vid for vid, f in self._manage_voice_fields.items() if f is field), None)
         if voice_id is None:
@@ -1212,15 +1536,11 @@ class AppDelegate(NSObject):
         # attributed-title color is set, which was compounding with white(0.45) below and
         # rendering darker than the actual placeholder text it was supposed to match.
         # saveApiKey_ already no-ops on an empty key, so disabling isn't needed for correctness.
-        # match the key field's own dark card styling exactly rather than the bright CTA
-        # white — a full-white flash the moment you type read as jarring. Enabled/disabled is
-        # now conveyed by text brightness only, never by the button itself turning white.
-        # white(0.06)/white(0.12), not colorWithWhite_alpha_(...,1.0) — the key field's card
-        # uses translucent white-tint fills (letting the blur show through), and an opaque
-        # flat gray at the same numbers renders visibly different (solid vs. translucent).
-        self.continue_btn.layer().setBackgroundColor_(white(0.06).CGColor())
-        self.continue_btn.layer().setBorderColor_(white(0.12).CGColor())
-        self.continue_btn.layer().setBorderWidth_(1.0)
+        # Background is NOT touched here anymore — continue_btn is a real HoverButton now
+        # (configure(0.06, 0.14, ...) at construction), so its own _fill mechanism already
+        # owns the resting/hover background; setting it again here would just be redundant.
+        # Enabled/disabled is conveyed by text brightness only, same as before.
+        self.continue_btn.layer().setBorderColor_(white(0.1).CGColor())
         attrs = {
             AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightSemibold),
             # disabled: exact same luminosity as the key field's placeholder text (white(0.45)
@@ -1319,7 +1639,25 @@ class AppDelegate(NSObject):
 
     # ----- main screen -----
     def showMainScreen(self):
+        # Captured before text_view gets reassigned below (a fresh NSTextView every call, same
+        # as every other screen's own content) — without this, any round-trip through History/
+        # Settings/Recordings that DOESN'T end in an explicit setString_ call of its own (e.g.
+        # just clicking Back after changing a Settings pill, with nothing typed and never
+        # played) silently lost whatever was typed but never generated. Confirmed via direct
+        # reproduction: text was genuinely empty after such a round-trip, not just visually.
+        prior_text = str(self.text_view.string()) if getattr(self, "text_view", None) is not None else ""
         self._teardownWelcomeEscMonitor()
+        if self._list_scroll_observer:
+            nc = AppKit.NSNotificationCenter.defaultCenter()
+            for token in self._list_scroll_observer:
+                nc.removeObserver_(token)
+            self._list_scroll_observer = []
+        if self._width_rebuild_observer is not None:
+            AppKit.NSNotificationCenter.defaultCenter().removeObserver_(self._width_rebuild_observer)
+            self._width_rebuild_observer = None
+        if self._width_rebuild_timer is not None:
+            self._width_rebuild_timer.invalidate()
+            self._width_rebuild_timer = None
         v = AppKit.NSView.alloc().initWithFrame_(self.root.bounds())
         b = v.bounds()
         W = b.size.width
@@ -1351,9 +1689,21 @@ class AppDelegate(NSObject):
         scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
 
         self.text_view = FocusTextView.alloc().initWithFrame_(scroll.bounds())
-        self.text_view.setFont_(AppKit.NSFont.systemFontOfSize_(14))
+        self._body_font = AppKit.NSFont.systemFontOfSize_(14)
+        self.text_view.setFont_(self._body_font)
         self.text_view.setRichText_(False)
         self.text_view.setDrawsBackground_(False)
+        # Layer-backed so a word-highlight overlay (System voice, "Highlight" style — see
+        # _syncWordHighlightNow) can be added as a sublayer. Rebuilt fresh here since text_view
+        # itself is rebuilt fresh every showMainScreen() call — _highlight_overlay is reset to
+        # None alongside it so it gets lazily recreated against the new text_view/layer.
+        self.text_view.setWantsLayer_(True)
+        self._highlight_overlay = None
+        self._highlight_word_index = -1
+        self._highlight_chunk_index = None
+        self._highlight_search_cursor = 0
+        self._highlight_prev_range = None
+        self._highlight_timer = None
         self.text_view.setTextContainerInset_(NSMakeSize(10, 10))
         self.text_view.setVerticallyResizable_(True)
         self.text_view.setHorizontallyResizable_(False)
@@ -1361,9 +1711,24 @@ class AppDelegate(NSObject):
         # allowsUndo defaults to NO for a plain (non-field-editor) NSTextView — without this,
         # Cmd-Z/Cmd-Shift-Z are silent no-ops no matter how the undo manager itself resolves.
         self.text_view.setAllowsUndo_(True)
+        # A programmatically-created NSTextView defaults spell-checking off. Continuous
+        # checking (the red squiggle) only, not automatic correction — this box is mostly
+        # pasted text from elsewhere, and silently rewriting someone's pasted words would be
+        # far worse than leaving an actual typo unflagged.
+        self.text_view.setContinuousSpellCheckingEnabled_(True)
+        self.text_view.setGrammarCheckingEnabled_(True)
+        self.text_view.setAutomaticSpellingCorrectionEnabled_(False)
         self.text_view.setDelegate_(self)
         self.text_view.focus_callback = self._cardFocusChanged
         scroll.setDocumentView_(self.text_view)
+        self.scroll_view = scroll
+        # A layer-backed NSView always composites its sublayers on top of its own drawn content,
+        # so the word-highlight overlay (_ensureHighlightOverlay) can never sit behind text_view's
+        # own glyphs if it's parented to text_view's own layer. The clip view is text_view's real
+        # superview and sits behind it in the actual view hierarchy — giving it its own layer lets
+        # the overlay be inserted there instead, genuinely behind the text.
+        self.scroll_view.contentView().setWantsLayer_(True)
+        self.scroll_view.contentView().layer().setMasksToBounds_(True)
 
         # ClickThroughTextField, not make_label: this sits on top of the scroll view's top
         # edge (see below), and setHidden_ only keeps it out of the way once there's text —
@@ -1429,18 +1794,34 @@ class AppDelegate(NSObject):
 
         voice_lbl = make_label("Voice", 13, 0.85)
         voice_lbl.setFrame_(NSMakeRect(20, 20, 44, 20))
-        self.voice_popup = FlatPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(72, 14, W - 92, 36), False)
+        self.volume_btn = icon_button("speaker.wave.2.fill", 13, NSMakeRect(W - 20 - 32, 15, 32, 32),
+                                       "volumeClicked:", self, base=0.0, hover=0.10, corner=16.0)
+        self.volume_btn.setAutoresizingMask_(AppKit.NSViewMinXMargin)
+        self.voice_popup = FlatPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(72, 14, W - 92 - 40, 36), False)
         self.voice_popup.setAutoresizingMask_(AppKit.NSViewWidthSizable)
         self.voice_popup.setTarget_(self)
         self.voice_popup.setAction_("voiceChanged:")
 
         for sub in (self.usage_label, self.card, row, self.elapsed_label, self.remaining_label,
-                    self.scrubber, self.status_label, voice_lbl, self.voice_popup):
+                    self.scrubber, self.status_label, voice_lbl, self.voice_popup, self.volume_btn):
             v.addSubview_(sub)
+        # Restores what a freshly-rebuilt voice_popup/text_view would otherwise silently lose —
+        # see the comments where prior_text and _voice_labels are captured/cached. Callers that
+        # want something ELSE showing (e.g. _playHistoryEntry, _playSavedEntry) already call
+        # setString_ themselves right after showMainScreen() returns, which still correctly
+        # overrides this.
+        if self._voice_labels:
+            self._populateVoiceMenu(self._voice_labels)
+        if prior_text:
+            self.text_view.setString_(prior_text)
         self.current_screen = "main"
         self.swap_screen(v)
         self._syncPlaybackUI()
         self.updateCharCount()
+        # Handles a Settings/History/etc round-trip that rebuilds text_view mid-playback (e.g.
+        # changing highlight style while something is already playing) — its own guard clauses
+        # make this a safe no-op when nothing is actually playing.
+        self._syncWordHighlightNow()
 
     @objc.python_method
     def _cardFocusChanged(self, focused):
@@ -1557,9 +1938,20 @@ class AppDelegate(NSObject):
         # Chatterbox shows shifted display labels (see CHATTERBOX_SPEED_DISPLAY) — every other
         # provider shows its real value as-is. self.config["speed"] always stores the REAL
         # value regardless of provider, so switching providers never loses the actual setting.
+        self.speed_popup.removeAllItems()
+        if self.config.get("provider") == "Sesame":
+            # The same time-stretch technique that works for Chatterbox does not hold up on
+            # Sesame's output — confirmed directly at 0.8x. Locked to 1.0x here rather than
+            # left adjustable-but-broken; _requestSesameTTS ignores speed unconditionally too,
+            # as a backstop, but the control itself should look locked, not just silently
+            # do nothing when changed.
+            self.speed_popup.addItemWithTitle_("1.0x")
+            self.speed_popup.selectItemWithTitle_("1.0x")
+            self.speed_popup.setEnabled_(False)
+            return
+        self.speed_popup.setEnabled_(True)
         real = self.config.get("speed", "0.8x")
         is_cb = self.config.get("provider") == "Chatterbox"
-        self.speed_popup.removeAllItems()
         for s in SPEEDS:
             self.speed_popup.addItemWithTitle_(CHATTERBOX_SPEED_DISPLAY.get(s, s) if is_cb else s)
         selected = CHATTERBOX_SPEED_DISPLAY.get(real, real) if is_cb else real
@@ -1577,11 +1969,24 @@ class AppDelegate(NSObject):
                 # other entry point, which sets this to come back to Manage Voices instead.
                 self._rec_return_to = None
                 self._revertVoiceMenuSelection()
-                self._showRecordingCaptureCard()
+                self._showStyleChoiceCard()
                 return
-            self.config["voice_id"] = chosen
-            save_config(self.config)
+            self._setVoiceId(chosen)
             self._invalidateUngeneratedChunks()
+
+    @objc.python_method
+    def _setVoiceId(self, voice_id, provider=None):
+        # config["voice_id"] stays the single "currently active" value every generation/
+        # history call site already reads — this ADDS a per-provider memory alongside it, so
+        # switching providers restores whatever THAT provider's own last pick was instead of
+        # always resetting to its first/default voice (which is what a single shared voice_id
+        # meant in practice: it almost never matched the new provider's own id namespace).
+        provider = provider or self.config.get("provider", "ElevenLabs")
+        self.config["voice_id"] = voice_id
+        per_provider = self.config.get("voice_ids_by_provider", {})
+        per_provider[provider] = voice_id
+        self.config["voice_ids_by_provider"] = per_provider
+        save_config(self.config)
 
     @objc.python_method
     def _revertVoiceMenuSelection(self):
@@ -1604,6 +2009,13 @@ class AppDelegate(NSObject):
         if not self.all_chunks:
             return
         self.chunk_audio_cache = {}
+        # Preserve the CURRENTLY PLAYING chunk's own word timings — despite this function's own
+        # comment above ("the chunk currently playing keeps playing as-is"), wiping the whole
+        # dict unconditionally also wiped that chunk's entry, silently killing word-highlighting
+        # for the rest of it on any mid-playback voice/speed change (chunk_word_timings is read
+        # live by _scheduleNextWordTimer/_syncWordHighlightNow every time a word timer fires).
+        current_timings = self.chunk_word_timings.get(self.chunk_index)
+        self.chunk_word_timings = {self.chunk_index: current_timings} if current_timings else {}
         self.next_chunk_audio = None
         self.chunk_durations = [None] * len(self.all_chunks)
         self.avg_chars_per_sec = None
@@ -1662,6 +2074,32 @@ class AppDelegate(NSObject):
         return f"{voice.name()} (English {region}, {quality})"
 
     @objc.python_method
+    def _historyVoiceLabel(self, provider, voice_id):
+        # History entries store the raw voice id (whatever fetchVoices populated self.voice_ids
+        # with at generation time), not a friendly label — every other place in the app that
+        # shows a voice always shows v["label"]/voice.name(), never the raw id, so resolving it
+        # here keeps that same idiom (a history row would otherwise read something like
+        # "Sesame · custom_7f3a91bc · 2h ago" instead of the voice's actual name). Falls back to
+        # the raw id if the voice can't be found (e.g. deleted since, or an ElevenLabs voice —
+        # not worth a network call just to label a history row).
+        if provider == "System":
+            voice = AVFoundation.AVSpeechSynthesisVoice.voiceWithIdentifier_(voice_id)
+            if voice is not None:
+                return self._systemVoiceLabel(voice)
+        elif provider == "Chatterbox":
+            match = next((v for v in CHATTERBOX_VOICES if v["id"] == voice_id), None)
+            if match is not None:
+                return match["label"]
+        elif provider == "Sesame":
+            catalog = list(SESAME_VOICES) + list(self.config.get("sesame_custom_voices", []))
+            match = next((v for v in catalog if v["id"] == voice_id), None)
+            if match is not None:
+                return match["label"]
+        elif provider in ("OpenAI", "Other") and voice_id in OPENAI_VOICES:
+            return voice_id.capitalize()
+        return voice_id
+
+    @objc.python_method
     def _request_json(self, url, headers):
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as resp:
@@ -1705,15 +2143,37 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _populateVoiceMenu(self, labels):
+        # Cached so showMainScreen() can restore the SAME labels into a freshly-rebuilt
+        # voice_popup on any later screen round-trip without a real re-fetch (wasteful for
+        # ElevenLabs specifically — a network call — and voice_ids/labels don't change just
+        # because the user navigated to Settings and back). Confirmed via direct reproduction:
+        # voice_ids stayed populated across a round-trip, but the freshly-rebuilt popup itself
+        # showed zero items — nothing was ever re-populating it, only the initial fetchVoices()
+        # call at launch ever had.
+        self._voice_labels = list(labels)
         self.voice_popup.removeAllItems()
         for label in labels:
             self.voice_popup.addItemWithTitle_(label)
-        saved = self.config.get("voice_id")
-        idx = self.voice_ids.index(saved) if saved in self.voice_ids else 0
+        provider = self.config.get("provider", "ElevenLabs")
+        per_provider = self.config.get("voice_ids_by_provider", {})
+        # Falls back to the flat voice_id the first time THIS provider is seen since this
+        # per-provider memory shipped — a natural one-time migration (whatever was already
+        # active becomes this provider's own remembered choice) rather than a hard reset to
+        # its first/default voice, which is what happened before: a single shared voice_id
+        # almost never matched a DIFFERENT provider's own id namespace, so switching providers
+        # silently landed on idx 0 every time instead of what was actually last picked for it.
+        saved = per_provider.get(provider, self.config.get("voice_id"))
+        found = saved in self.voice_ids
+        idx = self.voice_ids.index(saved) if found else 0
         if labels:
             self.voice_popup.selectItemAtIndex_(idx)
-            self.config["voice_id"] = self.voice_ids[idx]
-            save_config(self.config)
+            # Only persist when the saved choice actually resolved — landing on idx 0 because
+            # `saved` didn't match anything in the current voice_ids (a transient fetch race, a
+            # renamed/removed voice, etc.) must NOT overwrite the real remembered preference with
+            # that fallback. This was a real bug: any single lookup miss permanently replaced the
+            # correct per-provider memory with voice_ids[0], since this ran unconditionally.
+            if found:
+                self._setVoiceId(self.voice_ids[idx], provider)
 
     def updateUsageMain_(self, text):
         self.usage_label.setStringValue_(str(text))
@@ -1741,11 +2201,19 @@ class AppDelegate(NSObject):
             else:
                 self.player.play()
                 self._startProgressTimer()
+                # Recomputes from live currentTime(), so an arbitrary pause duration is handled
+                # for free — no separate "how long were we paused" bookkeeping needed.
+                self._syncWordHighlightNow()
             self._syncPlaybackUI()
             return
         text = str(self.text_view.string())
         if not text or not self._isConfigured():
             return
+        # Must happen before the session_text comparison just below, not only right before
+        # chunking — otherwise every replay of the exact same pasted text would compare its
+        # raw form against a normalized session_text and never match, silently breaking the
+        # "restart what's already cached" path every single time.
+        text = normalize_paragraph_breaks(text)
         if self.all_chunks and self.session_text == text:
             # Playback ran to the end and was never a "real" stop — all_chunks and
             # chunk_audio_cache are still sitting there from that session, so this is just
@@ -1760,6 +2228,7 @@ class AppDelegate(NSObject):
         # Text differs from whatever session_text left behind (or there was none) — any cache
         # still sitting around belongs to that other text and must not be reused for this one.
         self.chunk_audio_cache = {}
+        self.chunk_word_timings = {}
         self.next_chunk_audio = None
         self.session_text = text
         self.all_chunks = chunks
@@ -1810,6 +2279,23 @@ class AppDelegate(NSObject):
         utterance.setRate_(max(min_rate, min(max_rate, base_rate * speed)))
 
         collected = {"pcm": bytearray(), "sample_rate": None, "channels": None, "done": False}
+        # Word timing for live highlighting during playback (see _SpeechTimingDelegate) — only
+        # meaningful for System voice; Chatterbox/Sesame/ElevenLabs have no equivalent yet
+        # (that's forced alignment, separate work). Recorded as the exact cumulative sample
+        # count already written to collected["pcm"] at the moment each word's range callback
+        # fires — real audio-frame position, not a wall-clock guess from a separate pass.
+        word_timings = []
+
+        def on_range(loc, length):
+            channels = collected["channels"] or 1
+            sample_rate = collected["sample_rate"]
+            frames_so_far = len(collected["pcm"]) // (2 * channels)
+            start_time = (frames_so_far / sample_rate) if sample_rate else 0.0
+            word_timings.append({"start": start_time, "loc": loc, "length": length, "text": text[loc:loc + length]})
+
+        timing_delegate = _SpeechTimingDelegate.alloc().init()
+        timing_delegate.on_range = on_range
+        synthesizer.setDelegate_(timing_delegate)
 
         def callback(buffer):
             if buffer is None or buffer.frameLength() == 0:
@@ -1839,6 +2325,20 @@ class AppDelegate(NSObject):
         deadline = time.time() + 30
         while not collected["done"] and time.time() < deadline:
             rl.runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.05))
+        # Enforce a minimum gap between consecutive words' start times — two independent async
+        # callback streams (willSpeakRangeOfSpeechString_ and the buffer-delivery callback) feed
+        # this data, and if two words ever land on the same or near-same captured start, the
+        # earlier one becomes mathematically unselectable (or visible for ~0 seconds) no matter
+        # how the highlight is later scheduled against this list.
+        for i in range(1, len(word_timings)):
+            min_start = word_timings[i - 1]["start"] + self.HIGHLIGHT_MIN_WORD_WINDOW
+            if word_timings[i]["start"] < min_start:
+                word_timings[i]["start"] = min_start
+        # Side-channel, not a return-value change — _requestTTS's return type (just WAV bytes)
+        # stays identical for every provider; _chunkWorker reads this immediately afterward, on
+        # the same single persistent TTS worker thread that called this, so there's no
+        # concurrent-access risk despite it being an instance attribute.
+        self._last_word_timings = word_timings
 
         if not collected["pcm"] or not collected["sample_rate"]:
             raise RuntimeError("The system voice produced no audio.")
@@ -1941,7 +2441,20 @@ class AppDelegate(NSObject):
         # already in this machine's own huggingface cache (network access allowed here,
         # unlike the frozen/offline app) rather than a bundled snapshot path. Replace the
         # fallback branch with a real bundled-snapshot resolution (matching
-        # _chatterboxEngine exactly) once sesame_assets/ is actually packaged.
+        # _chatterboxEngine exactly) once sesame_assets/ is actually packaged — bundle the
+        # 8bit snapshot specifically (see csm-1b-8bit below), not the fp one.
+        #
+        # 8bit, not the full-precision csm-1b: confirmed directly, 8 isolated-process trials
+        # each — fp had a 38% "runaway generation" rate (audio 2-4x too long, garbled) and
+        # averaged 10.3s per generation; csm-1b-8bit had 0% anomalies over the same 8 trials
+        # and averaged 5.1s. Research into CSM's own GitHub issues afterward confirmed the
+        # runaway-generation failure mode is a known, maintainer-acknowledged base-model bug
+        # (unreliable end-of-speech detection, not a bundled-model corruption on our end) —
+        # nothing in that research explains WHY 8bit specifically tests more stable here (the
+        # general quantization literature actually points the opposite direction at low bit
+        # widths, though 8bit itself sits in the "no expected effect" range), so treat this as
+        # an empirically-verified choice for this exact build, not a general "quantized is
+        # always better" rule.
         if getattr(self, "_sesame_engine", None) is not None:
             return self._sesame_engine
         with self._sesame_lock:
@@ -1949,22 +2462,42 @@ class AppDelegate(NSObject):
                 from mlx_audio.tts.utils import load_model
                 hub_dir = self._resourcePath(
                     "sesame_assets", "hf_cache", "hub",
-                    "models--mlx-community--csm-1b", "snapshots")
+                    "models--mlx-community--csm-1b-8bit", "snapshots")
                 if os.path.isdir(hub_dir):
                     snapshot_dir = os.path.join(hub_dir, os.listdir(hub_dir)[0])
                 else:
-                    snapshot_dir = "mlx-community/csm-1b"
+                    snapshot_dir = "mlx-community/csm-1b-8bit"
                 self._sesame_engine = load_model(snapshot_dir)
         return self._sesame_engine
 
     @objc.python_method
     def _generateSesameAudio(self, engine, text, ref_audio, ref_text):
         import numpy as np
-        # Same runaway-generation guard as Chatterbox's — see SESAME_MIN_CHARS_PER_SEC's
-        # comment for why, given CSM's own default sampler is even more stochastic.
+        # CSM's own EOS detection (does the model spontaneously emit an all-zero codebook
+        # frame) has no repetition penalty or loop guard behind it — confirmed via CSM's own
+        # GitHub issues (e.g. SesameAILabs/csm#122) to be a known, maintainer-acknowledged
+        # base-model limitation, not something specific to this app's setup or fixable from
+        # here. A lower temperature was tried first (the same fix that stabilized Chatterbox)
+        # but made things WORSE in direct testing — plausible in hindsight, since CSM's
+        # failure mode is specifically a repetition loop, and lower/more-deterministic
+        # sampling tends to make loops MORE persistent once started, not less; that's a
+        # different failure mode than whatever temperature was fixing for Chatterbox.
+        # Left at the library default (temp=0.9) for that reason.
+        #
+        # max_audio_length_ms IS capped, though — not because it reduces how often a runaway
+        # happens (it doesn't, confirmed directly), but because it makes a runaway fail much
+        # faster on a SHORT chunk instead of running all the way to the library's flat
+        # 90-second default. 200ms/char (~5 chars/sec) is a deliberately generous floor —
+        # slower than even SESAME_MIN_CHARS_PER_SEC's own "barely acceptable" 11.5 chars/sec
+        # — chosen after a first attempt at this (basing the multiplier off
+        # SESAME_MIN_CHARS_PER_SEC directly) produced a cap LARGER than 90s for this app's
+        # real ~600-char chunks, the opposite of the intent — confirmed directly when a real
+        # first-chunk generation ran past two minutes before this got caught. min(90_000, ...)
+        # guarantees this can never regress past the library's own original ceiling either way.
+        max_ms = min(90_000, max(20_000, len(text) * 200))
         for attempt in range(SESAME_MAX_RETRIES + 1):
             results = list(engine.generate(
-                text=text, ref_audio=ref_audio, ref_text=ref_text, split_pattern=None))
+                text=text, ref_audio=ref_audio, ref_text=ref_text, max_audio_length_ms=max_ms))
             audio = np.concatenate([np.array(r.audio) for r in results])
             sample_rate = results[0].sample_rate
             if len(text) < SESAME_MIN_CHARS_FOR_CHECK or attempt == SESAME_MAX_RETRIES:
@@ -1989,10 +2522,11 @@ class AppDelegate(NSObject):
 
         audio, sample_rate = self._generateSesameAudio(engine, text, ref_audio, voice["ref_text"])
 
-        # Same speed/time-stretch treatment as Chatterbox — CSM has no native speed parameter either.
-        if speed != 1.0:
-            from pitch_shift import time_stretch
-            audio = time_stretch(audio, sample_rate, speed)
+        # Unlike Chatterbox, the same time-stretch treatment does not hold up on Sesame's
+        # output — confirmed directly at 0.8x ("she didn't even know how to talk"). The speed
+        # control is locked to 1.0x for this provider (see _populateSpeedMenu) as the real
+        # fix; ignoring `speed` here too is a deliberate backstop in case a leftover non-1.0x
+        # value from another provider is still sitting in config when this runs.
 
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
         buf = io.BytesIO()
@@ -2005,6 +2539,92 @@ class AppDelegate(NSObject):
         return buf.getvalue()
 
     # ----- Sesame voice recording -----
+    @objc.python_method
+    def _showStyleChoiceCard(self):
+        # A reader "embodies" whatever's actually on the page — a script written with formal,
+        # complete sentences reads like a narrator; one written with casual self-corrections
+        # and filler words reads like a natural conversation — confirmed directly against real
+        # generated output (Ben's formal reference vs. Sesame's own casual "conversational"
+        # demo reference produced clearly different delivery styles from the same book text).
+        # This screen exists so the user picks which of RECORD_SCRIPT_PRESETS' styles they
+        # want BEFORE recording, not after — the style is baked into the reference clip, not
+        # something adjustable later.
+        cw = 340
+        row_w = cw - 40
+        row_h = 74
+
+        title = make_label("Choose a reading style", 15, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+        sub = make_label(
+            "The words on the page shape how your voice comes out — pick whichever fits.",
+            11.5, 0.5, align=AppKit.NSTextAlignmentCenter)
+
+        cursor = 16
+        cancel_y, cancel_h = cursor, 24
+        cursor += cancel_h + 12
+        row_ys = []
+        for _ in RECORD_SCRIPT_PRESETS:
+            row_ys.append(cursor)
+            cursor += row_h + 10
+        cursor += 4
+        sub_y, sub_h = cursor, 32
+        cursor += sub_h + 4
+        title_y, title_h = cursor, 20
+        cursor += title_h + 16
+        ch = cursor
+
+        card = self._makeCard(cw, ch)
+        title.setFrame_(NSMakeRect(0, title_y, cw, title_h))
+        sub.setFrame_(NSMakeRect(20, sub_y, cw - 40, sub_h))
+
+        cancel_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+        # NOT "dismissOverlay:" — dismissOverlay is a zero-arg method (def dismissOverlay(self)),
+        # so wiring a button straight to the "dismissOverlay:" selector (which passes sender)
+        # never matched any real method on this object; the button silently did nothing when
+        # clicked (confirmed directly: reported as "cancel doesn't even work... it does
+        # nothing"). styleChoiceCancelClicked_ below is the real target/action pair.
+        cancel_btn = text_button_brighten("Cancel", NSMakeRect(cw / 2 - 40, cancel_y, 80, cancel_h),
+                                           "styleChoiceCancelClicked:", self, cancel_font, white(0.5), white(0.85))
+
+        subviews = [title, sub, cancel_btn]
+        for preset, y in zip(RECORD_SCRIPT_PRESETS, row_ys):
+            row = HoverButton.alloc().initWithFrame_(NSMakeRect(20, y, row_w, row_h))
+            row.configure(0.05, 0.11, 10.0)
+            row.setTitle_("")
+            row.setTarget_(self)
+            row.setAction_("_styleChosenClicked:")
+            row._style_id = preset["id"]
+
+            label = make_label(preset["label"], 13.5, 0.95, AppKit.NSFontWeightSemibold)
+            label.setFrame_(NSMakeRect(14, row_h - 30, row_w - 28, 18))
+            desc = make_label(preset["description"], 11.5, 0.55)
+            desc.cell().setWraps_(True)
+            desc.setFrame_(NSMakeRect(14, 12, row_w - 28, 30))
+            row.addSubview_(label)
+            row.addSubview_(desc)
+            subviews.append(row)
+
+        for sub_view in subviews:
+            card.addSubview_(sub_view)
+        self._presentOverlay(card)
+
+    def styleChoiceCancelClicked_(self, sender):
+        # This is the FIRST step of the whole record-a-voice flow, so Cancel here genuinely
+        # means "abort the flow" (unlike the capture card one step later, which has a real
+        # "Back" — see recordingCaptureBackClicked_). Same return_to/dismiss fallback already
+        # used by recordingCancelClicked_/useRecordingClicked_: lands back on Manage Voices if
+        # that's where the flow was entered from, or the main screen otherwise.
+        return_to, self._rec_return_to = self._rec_return_to, None
+        if return_to is not None:
+            return_to()
+        else:
+            self.dismissOverlay()
+
+    def _styleChosenClicked_(self, sender):
+        style_id = getattr(sender, "_style_id", None)
+        self._rec_selected_script = next(
+            (p for p in RECORD_SCRIPT_PRESETS if p["id"] == style_id), RECORD_SCRIPT_PRESETS[0])
+        self._showRecordingCaptureCard()
+
     @objc.python_method
     def _showRecordingCaptureCard(self):
         self._rec_recording_active = False
@@ -2027,13 +2647,36 @@ class AppDelegate(NSObject):
             AppKit.NSForegroundColorAttributeName: white(0.85),
             AppKit.NSParagraphStyleAttributeName: style,
         }
-        script_attr_str = AppKit.NSAttributedString.alloc().initWithString_attributes_(RECORD_SCRIPT_TEXT, script_attrs)
-        # Measured, not guessed — a hardcoded label height taller than the actual wrapped text
-        # is exactly what left visible dead space below the script text inside its own box.
-        text_h = math.ceil(script_attr_str.boundingRectWithSize_options_(
-            NSMakeSize(text_w, 1000), AppKit.NSStringDrawingUsesLineFragmentOrigin).size.height)
+        script_text = (self._rec_selected_script or RECORD_SCRIPT_PRESETS[0])["script"]
+        script_attr_str = AppKit.NSAttributedString.alloc().initWithString_attributes_(script_text, script_attrs)
+        script_label = AppKit.NSTextField.alloc().init()
+        script_label.setBezeled_(False)
+        script_label.setDrawsBackground_(False)
+        script_label.setEditable_(False)
+        script_label.setSelectable_(False)
+        script_label.setAttributedStringValue_(script_attr_str)
+        # Measured via the label's own cell (cellSizeForBounds_), not
+        # NSAttributedString.boundingRectWithSize_options_ — confirmed empirically the two can
+        # disagree for real text: for the Narrator script specifically, boundingRect measured
+        # 226pt while the cell's own layout actually needed 247pt (a full line short), silently
+        # clipping the last line inside the label's own frame regardless of the surrounding
+        # scroll math being correct. Conversational/Reading happened to measure identically
+        # either way, which is why only Narrator ever showed the bug. cellSizeForBounds_
+        # reflects what the field will actually render at this width, so it can't drift from
+        # the real layout the way a separate Core Text estimate can.
+        text_h = math.ceil(script_label.cell().cellSizeForBounds_(NSMakeRect(0, 0, text_w, 10000)).height)
         box_pad = 10
-        box_h = text_h + box_pad * 2
+        content_h = text_h + box_pad * 2
+        # Confirmed directly: the longer, style-specific scripts can produce a box tall enough
+        # that the whole card no longer fits in the window (clipped at the bottom, cutting off
+        # the record button and Cancel entirely) — capped here, with the box itself scrolling
+        # internally for whatever doesn't fit, rather than the box (and everything below it)
+        # just growing without limit. 170 comfortably fits even the longest current script's
+        # first several lines before it needs to scroll, and still leaves room for
+        # record/cancel/etc. within this app's minimum window size, not just its default one.
+        MAX_BOX_H = 170.0
+        box_h = min(content_h, MAX_BOX_H)
+        needs_scroll = content_h > box_h
 
         # Built bottom-up from fixed, tight gaps so the card's total height is exactly what its
         # content needs — no leftover space "because the card used to be taller."
@@ -2065,14 +2708,73 @@ class AppDelegate(NSObject):
         script_box.layer().setBorderColor_(white(0.12).CGColor())
         script_box.layer().setBorderWidth_(1.0)
         script_box.layer().setCornerRadius_(10.0)
-        script_label = AppKit.NSTextField.alloc().init()
-        script_label.setBezeled_(False)
-        script_label.setDrawsBackground_(False)
-        script_label.setEditable_(False)
-        script_label.setSelectable_(False)
-        script_label.setAttributedStringValue_(script_attr_str)
+        script_box.layer().setMasksToBounds_(True)  # clip scrolled content to the rounded box
+
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(script_box.bounds())
+        scroll.setBorderType_(AppKit.NSNoBorder)
+        scroll.setDrawsBackground_(False)
+        scroll.setHasVerticalScroller_(needs_scroll)
+        scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+
+        container = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, content_h))
         script_label.setFrame_(NSMakeRect(12, box_pad, text_w, text_h))
-        script_box.addSubview_(script_label)
+        container.addSubview_(script_label)
+        scroll.setDocumentView_(container)
+        script_box.addSubview_(scroll)
+
+        if needs_scroll:
+            # Same top-of-content fix already used for the main dropdown's own scroll view —
+            # NSScrollView's clip view defaults its visible origin to (0, 0), which in this
+            # bottom-up coordinate layout is the BOTTOM of the text, not the top. A script
+            # should always open showing its first line, not its last.
+            clip = scroll.contentView()
+            clip.scrollToPoint_(NSMakePoint(0, content_h - box_h))
+            scroll.reflectScrolledClipView_(clip)
+
+            # A scrollbar alone isn't a reliable "there's more" cue — confirmed directly, a
+            # real user couldn't tell the text was cut off rather than just ending there, since
+            # macOS's default overlay-style scroller stays invisible until actively scrolled.
+            # Same edge-fade technique as the dropdown's own scroll view (text genuinely fades
+            # toward transparent approaching the hidden edge, via a mask on the scroll view's
+            # own layer — not a colored overlay, which would look like a patch sitting on top
+            # rather than the text dissolving into the box's real background).
+            #
+            # This MUST track scroll position, not sit static at the viewport's bottom 28pt —
+            # a static fade there also covers the true final words once the user actually
+            # scrolls all the way down, since it has no idea the content ended (confirmed
+            # directly: the user scrolled to the end and reported "there's nothing," because
+            # the last line was sitting inside the permanently-transparent zone). Reuses the
+            # dropdown's own scroll-tracked edge-fade math (see _installHorizontalEdgeFade /
+            # the voice-menu dropdown above) — bottom_alpha goes to 1.0 (no fade, fully opaque)
+            # exactly when origin_y reaches 0, the true end of the scrollable content.
+            fade_h = 28.0
+            scroll.setWantsLayer_(True)
+            mask = Quartz.CAGradientLayer.layer()
+            mask.setFrame_(scroll.bounds())
+            mask.setStartPoint_(NSMakePoint(0.5, 0.0))
+            mask.setEndPoint_(NSMakePoint(0.5, 1.0))
+            # Confirmed empirically for this exact gradient orientation elsewhere in this file
+            # (see the dropdown's own edge-fade comment): location 0.0 renders at the visual
+            # TOP of the view, location 1.0 at the visual BOTTOM.
+            mask.setLocations_([0.0, max(0.0, 1.0 - fade_h / box_h), 1.0])
+
+            def update_script_fade(note=None):
+                origin_y = clip.bounds().origin.y
+                bottom_alpha = 1.0 - max(0.0, min(1.0, origin_y / fade_h))
+                AppKit.CATransaction.begin()
+                AppKit.CATransaction.setDisableActions_(True)
+                mask.setColors_([
+                    AppKit.NSColor.whiteColor().CGColor(),
+                    AppKit.NSColor.whiteColor().CGColor(),
+                    AppKit.NSColor.whiteColor().colorWithAlphaComponent_(bottom_alpha).CGColor(),
+                ])
+                AppKit.CATransaction.commit()
+
+            scroll.layer().setMask_(mask)
+            update_script_fade()
+            clip.setPostsBoundsChangedNotifications_(True)
+            self._rec_script_fade_observer = AppKit.NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
+                AppKit.NSViewBoundsDidChangeNotification, clip, None, update_script_fade)
 
         error_label = ClickThroughTextField.alloc().init()
         error_label.setBezeled_(False)
@@ -2098,8 +2800,16 @@ class AppDelegate(NSObject):
         self.rec_toggle_btn = record_btn
 
         cancel_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
-        cancel_btn = text_button_brighten("Cancel", NSMakeRect(cw / 2 - 40, cancel_y, 80, cancel_h),
-                                           "recordingCancelClicked:", self, cancel_font, white(0.5), white(0.85))
+        # "Back", not "Cancel" — this card is the SECOND step of the flow (style choice came
+        # first), and unlike the later confirm/naming card (which has a separate "Re-record"
+        # button for stepping back, so its own Cancel can legitimately exit the whole flow),
+        # this card has no other way to go back one step. Reusing recordingCancelClicked_ here
+        # was exactly the bug: it exits the ENTIRE flow via _rec_return_to (e.g. straight to
+        # Manage Voices), skipping back past the style-choice screen entirely instead of
+        # landing on it. recordingCaptureBackClicked_ below does the same in-flight cleanup but
+        # always steps back to style choice specifically.
+        cancel_btn = text_button_brighten("Back", NSMakeRect(cw / 2 - 40, cancel_y, 80, cancel_h),
+                                           "recordingCaptureBackClicked:", self, cancel_font, white(0.5), white(0.85))
 
         for sub in (title, script_box, meter, elapsed_label, error_label, record_btn, cancel_btn):
             card.addSubview_(sub)
@@ -2115,6 +2825,14 @@ class AppDelegate(NSObject):
     def _startRecording(self):
         import sounddevice as sd
         import numpy as np
+        # Confirmed directly: text-to-speech playback kept going right through the mic capture
+        # otherwise, bleeding straight into the recorded reference clip. Paused, not stopped —
+        # this preserves where they were so they can pick playback back up afterward, rather
+        # than resetting the whole session over what might just be a quick voice-creation detour.
+        if self.player is not None and self.player.isPlaying():
+            self.player.pause()
+            self._stopProgressTimer()
+            self._syncPlaybackUI()
         self._rec_buffer = np.zeros(int(RECORD_MAX_SECONDS * RECORD_SAMPLE_RATE), dtype=np.float32)
         self._rec_write_pos = 0
 
@@ -2165,6 +2883,16 @@ class AppDelegate(NSObject):
             self.rec_elapsed_label.setStringValue_("0:00")
             self._flashInlineError(self.rec_error_label, message)
             return
+        # Peak-normalize to roughly match the bundled reference clips' own level (Ben/Sadie
+        # both sit around -6 to -7.5 dBFS peak) — confirmed directly that a real user's
+        # recording can land 5-11dB quieter than that with a normal mic/room setup, and that
+        # gap measurably degrades Sesame's voice cloning, up to fully incoherent output on
+        # the quietest one tested. This is why it applies before the preview too, not just
+        # before the final save — what you hear in preview should be what the model actually
+        # gets.
+        peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+        if peak > 1e-6:
+            audio = audio * (0.5 / peak)
         # Let the button's own release animation (shrinking back down) actually play on
         # screen before swapping to the confirm card, instead of cutting it off instantly.
         AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
@@ -2182,7 +2910,7 @@ class AppDelegate(NSObject):
         import numpy as np
         duration = len(audio) / sample_rate
         if duration < RECORD_MIN_SECONDS:
-            return False, f"That was too short — read the whole sentence in one go (needs to be at least {int(RECORD_MIN_SECONDS)} seconds)."
+            return False, "Too short — please read the whole script."
         peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
         if peak < 0.02:
             return False, "We didn't pick up any sound — check the right microphone is selected and try again."
@@ -2270,6 +2998,7 @@ class AppDelegate(NSObject):
             self.showError_("Could not play back the recording.")
             return
         self._rec_preview_player = player
+        player.setVolume_(max(0.0, min(1.0, self.config.get("volume", 1.0))))
         player.play()
         img = symbol_image("pause.fill", 15)
         if img:
@@ -2303,6 +3032,28 @@ class AppDelegate(NSObject):
         else:
             self.dismissOverlay()
 
+    def recordingCaptureBackClicked_(self, sender):
+        # Same in-flight cleanup as recordingCancelClicked_ (stop/close a live mic stream,
+        # stop any preview player), but always steps back to style choice rather than exiting
+        # the whole flow — deliberately does NOT touch/consume _rec_return_to, since that's
+        # still needed later (either if the user backs out further from style choice, or once
+        # they actually save the voice).
+        stream, self._rec_stream = self._rec_stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+        player, self._rec_preview_player = self._rec_preview_player, None
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+        self._rec_recording_active = False
+        self._showStyleChoiceCard()
+
     def useRecordingClicked_(self, sender):
         name = str(self.rec_name_field.stringValue()).strip()
         if not name:
@@ -2320,10 +3071,16 @@ class AppDelegate(NSObject):
                 w.setsampwidth(2)
                 w.setframerate(int(sample_rate))
                 w.writeframes(pcm)
-            entry = {"id": voice_id, "label": name, "audio_file": audio_file, "ref_text": RECORD_SCRIPT_TEXT}
+            ref_text = (self._rec_selected_script or RECORD_SCRIPT_PRESETS[0])["script"]
+            entry = {"id": voice_id, "label": name, "audio_file": audio_file, "ref_text": ref_text}
             self.config.setdefault("sesame_custom_voices", []).append(entry)
-            self.config["voice_id"] = voice_id
-            save_config(self.config)
+            self._setVoiceId(voice_id, "Sesame")  # saves the whole config, sesame_custom_voices included
+            # Unlike a normal dropdown voice switch (voiceChanged_), this path never went
+            # through that handler, so nothing invalidated the previous voice's cached audio —
+            # confirmed directly: the UI correctly showed the new voice selected, but pressing
+            # Play replayed the OLD voice's cached chunks anyway, since the cache-hit check in
+            # playPauseClicked_ only compares the text, not which voice generated it.
+            self._invalidateUngeneratedChunks()
         except Exception:
             traceback.print_exc(file=sys.stderr)
             # Clear the guard BEFORE showError_ — showError_ itself calls dismissOverlay(),
@@ -2357,38 +3114,34 @@ class AppDelegate(NSObject):
             2.5, False, lambda t: self.setStatus(""))
 
     @objc.python_method
-    def _showManageVoicesCard(self):
-        # Modeled on macOS's own list-editing sheets (System Settings' Text Replacements,
-        # Login Items): plain rows separated by hairlines rather than each name sitting in its
-        # own bordered box, and a "+" to add another entry sitting right next to "Done" —
-        # instead of a flat list of bezeled text-entry forms, which read more like a stack of
-        # small forms than a single coherent list.
+    def _buildVoicesSection(self, content):
+        # Inline in Settings now, not its own popup card — modeled on macOS's own
+        # list-editing sheets (System Settings' Text Replacements, Login Items): plain rows
+        # separated by hairlines rather than each name sitting in its own bordered box.
         customs = list(self.config.get("sesame_custom_voices", []))
-        cw, ch = 320, 400
-        card = self._makeCard(cw, ch)
+        cb = content.bounds()
+        box_w, box_h = cb.size.width, cb.size.height
 
-        title = make_label("Manage Voices", 15, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
-        title.setFrame_(NSMakeRect(0, ch - 36, cw, 20))
-        card.addSubview_(title)
-
-        list_bottom, list_h, row_h = 64, 296, 40
+        list_bottom, row_h = 60, 40
+        list_h = box_h - list_bottom
         # CardView (not a plain NSView) so clicking blank space anywhere in the list — between
         # rows, below the last one — ends any active rename the same way clicking the card's
         # own background does; a plain NSView never becomes first responder on click, so an
         # active field editor would never resign and a rename would never commit that way.
-        list_box = CardView.alloc().initWithFrame_(NSMakeRect(20, list_bottom, cw - 40, list_h))
+        list_box = CardView.alloc().initWithFrame_(NSMakeRect(0, list_bottom, box_w, list_h))
+        list_box.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
         list_box.setWantsLayer_(True)
         list_box.layer().setBackgroundColor_(white(0.05).CGColor())
         list_box.layer().setBorderColor_(white(0.09).CGColor())
         list_box.layer().setBorderWidth_(1.0)
         list_box.layer().setCornerRadius_(10.0)
         list_box.layer().setMasksToBounds_(True)
-        card.addSubview_(list_box)
-        box_w = cw - 40
+        content.addSubview_(list_box)
 
         if not customs:
             empty = make_label("You haven't created any custom voices yet.", 12, 0.45, align=AppKit.NSTextAlignmentCenter)
             empty.setFrame_(NSMakeRect(10, list_h / 2 - 16, box_w - 20, 32))
+            empty.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
             list_box.addSubview_(empty)
         else:
             content_h = max(list_h, len(customs) * row_h)
@@ -2396,6 +3149,7 @@ class AppDelegate(NSObject):
             scroll.setBorderType_(AppKit.NSNoBorder)
             scroll.setHasVerticalScroller_(True)
             scroll.setDrawsBackground_(False)
+            scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
             container = CardView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, content_h))
             cy = content_h
             self._manage_voice_fields = {}
@@ -2428,25 +3182,29 @@ class AppDelegate(NSObject):
             clip = scroll.contentView()
             clip.scrollToPoint_(NSMakePoint(0, max(0.0, content_h - list_h)))
             scroll.reflectScrolledClipView_(clip)
+            # The REAL bug behind the shrink-to-blank failure: content_h (used above to size
+            # the initial container/positions) is max(list_h, len(customs)*row_h) — at build
+            # time that's fine, but it means content_h can be INFLATED by whatever the viewport
+            # happened to be at that moment, not the list's own true minimum size. Passing that
+            # inflated number as natural_h made _installScrollReclamp treat it as a floor the
+            # container could never shrink below — confirmed directly via debug logging: once
+            # the window had been big, this stayed locked at that height forever, so shrinking
+            # the window just scrolled the (still-oversized) container to reveal empty space
+            # below its unmoved rows instead of actually shrinking to match. The list's real
+            # minimum is len(customs)*row_h, full stop — that's what natural_h needs to be.
+            self._installScrollReclamp(scroll, container, len(customs) * row_h)
             list_box.addSubview_(scroll)
 
-        add_btn = icon_button("plus", 14, NSMakeRect(20, 16, 36, 32), "addVoiceFromManageClicked:", self,
+        add_btn = icon_button("plus", 14, NSMakeRect(0, 16, 36, 32), "addVoiceFromManageClicked:", self,
                                base=0.08, hover=0.16, corner=9.0, tint=0.85)
-        done_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
-        done_btn = text_button("Done", NSMakeRect(64, 16, cw - 84, 32), "dismissManageVoices:", self,
-                                done_font, 0.08, 0.16, 9.0, white(0.85))
-        card.addSubview_(add_btn)
-        card.addSubview_(done_btn)
-        self._presentOverlay(card)
+        content.addSubview_(add_btn)
 
     def addVoiceFromManageClicked_(self, sender):
-        # Entered from Manage Voices — Cancel and a successful Save should both come back here
-        # (refreshed, in Save's case), not dump you out to the main text-input screen.
-        self._rec_return_to = self._showManageVoicesCard
-        self._showRecordingCaptureCard()
-
-    def dismissManageVoices_(self, sender):
-        self.dismissOverlay()
+        # Entered from Settings' Voices section — Cancel and a successful Save should both
+        # come back here (refreshed, in Save's case), not dump you out to the main text-input
+        # screen.
+        self._rec_return_to = lambda: self.showSettingsScreen("voices")
+        self._showStyleChoiceCard()
 
     def manageVoiceDeleteClicked_(self, sender):
         voice_id = getattr(sender, "_manage_voice_id", None)
@@ -2482,7 +3240,7 @@ class AppDelegate(NSObject):
 
     def cancelDeleteVoice_(self, sender):
         self._pending_delete_voice_id = None
-        self._showManageVoicesCard()  # back to the list, not fully closed
+        self.showSettingsScreen("voices")  # back to the list, not fully closed
 
     def confirmDeleteVoiceClicked_(self, sender):
         voice_id = self._pending_delete_voice_id
@@ -2496,13 +3254,1510 @@ class AppDelegate(NSObject):
                 pass
             self.config["sesame_custom_voices"] = [v for v in customs if v["id"] != voice_id]
             if self.config.get("voice_id") == voice_id:
-                self.config["voice_id"] = SESAME_VOICES[0]["id"]  # fall back to the first built-in
-            save_config(self.config)
+                self._setVoiceId(SESAME_VOICES[0]["id"], "Sesame")  # fall back to the first built-in
+            else:
+                save_config(self.config)  # still need to persist the sesame_custom_voices removal above
         self.fetchVoices()
-        self._showManageVoicesCard()  # refreshed list, still in the management screen
+        self.showSettingsScreen("voices")  # refreshed list, still in the management screen
         self.setStatus("Voice deleted.")
         AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
             2.0, False, lambda t: self.setStatus(""))
+
+    def recordingsClicked_(self, sender):
+        self.showRecordingsScreen(self.current_recordings_tab)
+
+    def backToMainClicked_(self, sender):
+        self.showMainScreen()
+
+    # Shared vertical geometry for every full-screen destination (History, Settings) — the
+    # title sits alone at top with real breathing room, Back sits alone at bottom-left, and
+    # everything in between is "safe content" that can't collide with either. HEADER_H/FOOTER_H
+    # are how much of the window's total height each end reserves.
+    SCREEN_HEADER_H = 54.0
+    SCREEN_FOOTER_H = 58.0
+
+    @objc.python_method
+    def _wrapIntoLines(self, items, gap, max_w):
+        """items: [(width, payload), ...]. Groups into lines that fit within max_w, in order —
+        a real flow-wrap (like text wrapping, or CSS flex-wrap), not just a single fixed row.
+        Used so pill rows (Storage's mode/size buttons) drop to a new line instead of either
+        clipping or requiring horizontal scroll when the window is narrower than they need.
+        Verified in isolation against known inputs before wiring into real layout code."""
+        lines = []
+        current = []
+        current_w = 0.0
+        for item_w, payload in items:
+            added_w = item_w if not current else item_w + gap
+            if current and current_w + added_w > max_w:
+                lines.append(current)
+                current = []
+                current_w = 0.0
+                added_w = item_w
+            current.append((item_w, payload))
+            current_w += added_w
+        if current:
+            lines.append(current)
+        return lines
+
+    @objc.python_method
+    def _installWidthRebuildTrigger(self, v, rebuild_fn):
+        # Growing/shrinking a scroll's document view (see _installScrollReclamp) is enough for
+        # height, and for simple left-aligned content it was enough for width too — but real
+        # reflow (Storage's pills dropping to a new line, History/Voices' row dividers and
+        # trash icons actually tracking the new width) needs the same construction logic this
+        # screen already uses at build time, not an incremental patch bolted onto individual
+        # elements after the fact. Rebuilds live, on every real width change during the drag
+        # (not debounced to mouse-up) — explicitly wanted: the reflow should be visible while
+        # actually resizing, not just appear once you let go.
+        if self._width_rebuild_observer is not None:
+            AppKit.NSNotificationCenter.defaultCenter().removeObserver_(self._width_rebuild_observer)
+            self._width_rebuild_observer = None
+        if self._width_rebuild_timer is not None:
+            self._width_rebuild_timer.invalidate()
+            self._width_rebuild_timer = None
+        v.setPostsFrameChangedNotifications_(True)
+        state = {"w": v.frame().size.width}
+
+        def on_frame_change(note):
+            new_w = v.frame().size.width
+            if abs(new_w - state["w"]) < 1.0:
+                return
+            state["w"] = new_w
+            rebuild_fn()
+
+        self._width_rebuild_observer = AppKit.NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
+            AppKit.NSViewFrameDidChangeNotification, v, None, on_frame_change)
+
+    @objc.python_method
+    def _installScrollReclamp(self, scroll, container, natural_h, natural_w=None):
+        # Two related bugs, both from the same root cause: NSScrollView's document view
+        # (container) is a fixed size set once at build time, and neither its size nor the
+        # scroll offset ever get re-synced against a LIVE window resize on their own.
+        #
+        # Bug 1 — short content sinks to the BOTTOM instead of staying pinned to the top:
+        # when the viewport is taller than the content actually needs (natural_h), container
+        # was left at exactly natural_h, so it doesn't fill the viewport — and since its own
+        # origin is what's fixed (not its top edge), the empty leftover space appears ABOVE
+        # it, not below. Confirmed directly: Data & Storage's controls rendered hugging the
+        # bottom of the window instead of the top. Fixed by growing container to at least the
+        # viewport's height whenever there's slack, and shifting its existing content down by
+        # the same amount that growth adds below — so the content's position relative to
+        # container's TOP edge never changes, only how much empty space trails below it.
+        #
+        # Bug 2 — an existing scroll offset can point at a stale, now-nonsensical position
+        # once the viewport's own height changes (confirmed: the Voices list visibly "floated"
+        # at an arbitrary spot after a resize). Reclamped back into valid range afterward.
+        #
+        # Runs on every clip bounds change (a resize, or an ordinary scroll) — the resize-sync
+        # only ever ADDS height when there's new slack (never removes it, so a normal scroll
+        # never fights this), and the reclamp only ever pulls an offset that's gone invalid
+        # back in, never touching an already-valid one.
+        if self._list_scroll_observer:
+            nc0 = AppKit.NSNotificationCenter.defaultCenter()
+            for token in self._list_scroll_observer:
+                nc0.removeObserver_(token)
+            self._list_scroll_observer = []
+        clip = scroll.contentView()
+        clip.setPostsBoundsChangedNotifications_(True)
+        scroll.setPostsFrameChangedNotifications_(True)
+        state = {"h": container.frame().size.height, "w": container.frame().size.width}
+
+        def sync(note=None):
+            visible_h = clip.bounds().size.height
+            visible_w = clip.bounds().size.width
+            new_h = max(natural_h, visible_h)
+            new_w = max(natural_w, visible_w) if natural_w is not None else state["w"]
+            if new_h != state["h"] or new_w != state["w"]:
+                # `!=`, not `>` — the real bug. Growing was handled, but shrinking back down
+                # after the window had been made bigger was not, so container stayed stuck at
+                # its largest-ever size: shrinking the window afterward left the real content
+                # (still positioned near what used to be the top of that oversized container)
+                # scrolled miles out of the now-small viewport — confirmed directly, it showed
+                # as a big blank area with just a scrollbar and nothing else visible.
+                #
+                # Width was a SEPARATE bug found afterward: container's width was frozen at
+                # whatever it was at build time and never tracked the viewport at all (only
+                # height did) — confirmed directly via screenshot, pill rows built at a wider
+                # window got clipped at the right edge once the window was narrower. No
+                # x-shift needed for width the way height needed a y-shift: this content is
+                # left-aligned already, so growing/shrinking width just changes how much empty
+                # space trails on the right, not where anything starts.
+                delta_h = new_h - state["h"]
+                f = container.frame()
+                container.setFrame_(NSMakeRect(f.origin.x, f.origin.y, new_w, new_h))
+                if delta_h:
+                    for sub in list(container.subviews()):
+                        sf = sub.frame()
+                        sub.setFrameOrigin_(NSMakePoint(sf.origin.x, sf.origin.y + delta_h))
+                state["h"] = new_h
+                state["w"] = new_w
+                # A resize invalidates whatever the scroll position meant relative to the old
+                # size — always resnap to showing the top rather than trying to preserve a
+                # stale relative offset, which is simple and correct for what this exists to
+                # fix (content ending up sunk to the bottom, or scrolled to nothing at all).
+                clip.scrollToPoint_(NSMakePoint(0, max(0.0, new_h - visible_h)))
+                scroll.reflectScrolledClipView_(clip)
+                return
+            max_origin = max(0.0, state["h"] - visible_h)
+            if clip.bounds().origin.y > max_origin:
+                clip.scrollToPoint_(NSMakePoint(0, max_origin))
+                scroll.reflectScrolledClipView_(clip)
+
+        sync()
+        nc = AppKit.NSNotificationCenter.defaultCenter()
+        self._list_scroll_observer = [
+            nc.addObserverForName_object_queue_usingBlock_(AppKit.NSViewBoundsDidChangeNotification, clip, None, sync),
+            # ALSO listening on scroll's own frame-change, not just the clip's bounds-change —
+            # this is the actual fix being tested: a resize driven by an autoresizing mask
+            # (i.e. a real window drag, as opposed to a direct setBounds_/scrollToPoint_ call)
+            # may not reliably post NSViewBoundsDidChangeNotification, which would explain
+            # content never tracking a live resize at all (confirmed: it stayed exactly at its
+            # original size/position, just floating wherever that lands in a since-grown
+            # viewport, rather than growing or shrinking with it).
+            nc.addObserverForName_object_queue_usingBlock_(AppKit.NSViewFrameDidChangeNotification, scroll, None, sync),
+        ]
+
+    @objc.python_method
+    def _screenHeader(self, v, w, h, title_text, right_control=None):
+        # Back moved to bottom-left — used to share the top row with the title, cramped up
+        # against the traffic lights, and read as an afterthought rather than a real,
+        # deliberate control. x=20 to match list_box/sidebar's own left margin exactly (was
+        # 16, one pixel off from everything else on these screens — confirmed visually).
+        # text_button, not cta_button — same reasoning as Continue on the welcome screen: a
+        # bordered, dark fill with the pills' own real hover/press feedback, not a flat static
+        # white block with none.
+        back_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightSemibold)
+        # No background box, no border — plain text with the same brighten-on-hover feedback
+        # as the sidebar rows and the wordmark (BrightenOnHoverButton), left-aligned to match
+        # "Storage"/"Voices" exactly rather than approximating it via a snug centered box.
+        # y shifted +8 from the "obvious" 16, same empirically-measured correction and same
+        # frame height as the wordmark — see its comment for why (centering vs. the old
+        # top-alignment this position was tuned against, and why shrinking the label_frame
+        # instead didn't land where predicted).
+        back_btn = BrightenOnHoverButton.alloc().initWithFrame_(NSMakeRect(20, 24, 60, 26))
+        back_btn.configureBrighten(
+            "‹ Back", back_font, white(0.55), white(0.95),
+            align=AppKit.NSTextAlignmentLeft, label_frame=NSMakeRect(0, 0, 60, 26))
+        back_btn.setTarget_(self)
+        back_btn.setAction_("backToMainClicked:")
+        back_btn.setAutoresizingMask_(AppKit.NSViewMaxXMargin | AppKit.NSViewMaxYMargin)
+        v.addSubview_(back_btn)
+        # Empty title_text ("") means the destination doesn't need one — Settings' own sidebar
+        # already says where you are (Storage/Voices/...), so a redundant "Settings" heading
+        # above it was just consuming space no other screen needed. Skipped entirely rather
+        # than added-but-invisible, so it doesn't reserve empty space for nothing.
+        if title_text:
+            # A little lower than the very top edge — the whole header band (title + wordmark)
+            # reads more like one deliberate row this way instead of the title crowding the top.
+            title = make_label(title_text, 16, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+            title.setFrame_(NSMakeRect(0, h - 46, w, 22))
+            title.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewMinYMargin)
+            v.addSubview_(title)
+        if right_control is not None:
+            v.addSubview_(right_control)
+
+    @objc.python_method
+    def showRecordingsScreen(self, tab="recent"):
+        # One screen, two tabs via a sliding pill selector — replaces the earlier version
+        # where Saved was three clicks deep in Settings > File Location while Recent was one
+        # click from the wordmark, a real inconsistency once both existed side by side. The
+        # pill control (see SegmentedPillControl) is deliberately kept ALIVE across a tab
+        # switch instead of going through a full rebuild like every other change on this
+        # screen — see _recordingsTabChanged.
+        self.current_recordings_tab = tab
+        v = AppKit.NSView.alloc().initWithFrame_(self.root.bounds())
+        b = v.bounds()
+        W, H = b.size.width, b.size.height
+        self._screenHeader(v, W, H, "Recordings")
+
+        pill_w, pill_h = 176.0, 30.0
+        seg = SegmentedPillControl.alloc().initWithFrame_(
+            NSMakeRect((W - pill_w) / 2.0, H - 46.0 - 12.0 - pill_h, pill_w, pill_h))
+        seg.configure(["Recent", "Saved"], self._recordingsTabChanged)
+        seg.selected_index = 0 if tab == "recent" else 1
+        seg._applySelectionColors()
+        seg._layoutSegments(animated=False)
+        # Fixed width, centered — only its X position needs to track a resize (autoresizing
+        # handles that on its own); see SegmentedPillControl's own docstring for why it
+        # doesn't need a resize-driven relayout hook the way the list below does.
+        seg.setAutoresizingMask_(AppKit.NSViewMinXMargin | AppKit.NSViewMaxXMargin | AppKit.NSViewMinYMargin)
+        v.addSubview_(seg)
+        self._recordings_seg = seg
+
+        cog = icon_button("gearshape", 13, NSMakeRect(W - 46, 20, 26, 26),
+                           "recordingsCogClicked:", self, base=0.0, hover=0.12, corner=8.0, tint=0.55)
+        cog.setAutoresizingMask_(AppKit.NSViewMinXMargin | AppKit.NSViewMaxYMargin)
+        v.addSubview_(cog)
+
+        # 42 = the pill row's own height (30) + a 12pt gap above the list — same reserved-
+        # band idiom as SCREEN_HEADER_H/SCREEN_FOOTER_H, scoped to this one screen since it's
+        # the only one with a second header row.
+        list_top, list_bottom = H - self.SCREEN_HEADER_H - 42.0, self.SCREEN_FOOTER_H
+        list_h = max(1.0, list_top - list_bottom)
+        list_box = CardView.alloc().initWithFrame_(NSMakeRect(20, list_bottom, W - 40, list_h))
+        list_box.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        list_box.setWantsLayer_(True)
+        list_box.layer().setBackgroundColor_(white(0.05).CGColor())
+        list_box.layer().setBorderColor_(white(0.09).CGColor())
+        list_box.layer().setBorderWidth_(1.0)
+        list_box.layer().setCornerRadius_(10.0)
+        list_box.layer().setMasksToBounds_(True)
+        v.addSubview_(list_box)
+        self._recordings_list_box = list_box
+
+        self._buildRecordingsList(tab)
+
+        self.current_screen = "recordings"
+        self.swap_screen(v)
+        self._installWidthRebuildTrigger(v, lambda: self.showRecordingsScreen(self.current_recordings_tab))
+
+    @objc.python_method
+    def _recordingsTabChanged(self, index):
+        # Fires from the pill control AFTER it's already updated its own selected_index and
+        # animated the slide — this only swaps what's listed below it, not the header/pill.
+        tab = "recent" if index == 0 else "saved"
+        self.current_recordings_tab = tab
+        self._buildRecordingsList(tab)
+
+    @objc.python_method
+    def _buildRecordingsList(self, tab):
+        list_box = self._recordings_list_box
+        for sub in list(list_box.subviews()):
+            sub.removeFromSuperview()
+        box_w = list_box.bounds().size.width
+        list_h = list_box.bounds().size.height
+        if tab == "recent":
+            self._buildRecentRows(list_box, box_w, list_h)
+        else:
+            self._buildSavedRows(list_box, box_w, list_h)
+
+    def recordingsCogClicked_(self, sender):
+        self.showSettingsScreen("storage" if self.current_recordings_tab == "recent" else "location")
+
+    @objc.python_method
+    def _buildRecentRows(self, list_box, box_w, list_h):
+        entries = history.list_entries()
+        row_h = 56
+        if not entries:
+            empty = make_label(
+                "Nothing here yet — finished generations you play all the way through are "
+                "saved automatically.", 12, 0.45, align=AppKit.NSTextAlignmentCenter)
+            empty.setFrame_(NSMakeRect(10, list_h / 2 - 28, box_w - 20, 56))
+            empty.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+            list_box.addSubview_(empty)
+            return
+        content_h = max(list_h, len(entries) * row_h)
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, list_h))
+        scroll.setBorderType_(AppKit.NSNoBorder)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        container = CardView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, content_h))
+        cy = content_h
+        for i, entry in enumerate(entries):
+            cy -= row_h
+            if i > 0:
+                line = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, cy + row_h - 1, box_w, 1))
+                line.setWantsLayer_(True)
+                line.layer().setBackgroundColor_(white(0.09).CGColor())
+                container.addSubview_(line)
+
+            # Whole-row clickable/hoverable background — ContextMenuButton (not plain
+            # HoverButton) so a right-click offers "Save to Permanent Location", the
+            # promote-a-cache-entry-to-real-storage action this row otherwise has no
+            # way to trigger (left-click is already spoken for: loads the text).
+            row = ContextMenuButton.alloc().initWithFrame_(NSMakeRect(0, cy, box_w, row_h))
+            row.configure(0.0, 0.06, 8.0)
+            row.setTitle_("")
+            row.setTarget_(self)
+            row.setAction_("_historyRowClicked:")
+            row._history_entry_id = entry["id"]
+            row.context_menu_items = [
+                ("Save to Permanent Location", lambda eid=entry["id"]: self._historySaveClicked(eid)),
+            ]
+            container.addSubview_(row)
+
+            # ClickThroughTextField so these labels never swallow clicks meant for the row
+            # button underneath them (same idiom as placeholder_label).
+            preview = ClickThroughTextField.alloc().init()
+            preview.setBezeled_(False)
+            preview.setDrawsBackground_(False)
+            preview.setEditable_(False)
+            preview.setSelectable_(False)
+            preview.setFont_(AppKit.NSFont.systemFontOfSize_(13))
+            preview.setTextColor_(white(0.85))
+            preview.cell().setLineBreakMode_(AppKit.NSLineBreakByTruncatingTail)
+            preview.setStringValue_(entry["text"])
+            preview.setFrame_(NSMakeRect(12, cy + 28, box_w - 60, 18))
+            container.addSubview_(preview)
+
+            meta = ClickThroughTextField.alloc().init()
+            meta.setBezeled_(False)
+            meta.setDrawsBackground_(False)
+            meta.setEditable_(False)
+            meta.setSelectable_(False)
+            meta.setFont_(AppKit.NSFont.systemFontOfSize_(11))
+            meta.setTextColor_(white(0.45))
+            meta.cell().setLineBreakMode_(AppKit.NSLineBreakByTruncatingTail)
+            meta.setStringValue_(
+                f"{entry['provider']} · {self._historyVoiceLabel(entry['provider'], entry['voice'])} · "
+                f"{format_relative_time(entry['created_at'])}")
+            meta.setFrame_(NSMakeRect(12, cy + 8, box_w - 60, 14))
+            container.addSubview_(meta)
+
+            trash = icon_button("trash", 13, NSMakeRect(box_w - 40, cy + (row_h - 30) / 2.0, 30, 30),
+                                 "_historyDeleteClicked:", self, base=0.0, hover=0.14, corner=7.0, tint=0.5)
+            trash._history_entry_id = entry["id"]
+            container.addSubview_(trash)
+        scroll.setDocumentView_(container)
+        clip = scroll.contentView()
+        # NSScrollView's clip view defaults to showing the BOTTOM of non-flipped content —
+        # scroll to the top (newest entries) explicitly, same fix used in Manage Voices.
+        clip.scrollToPoint_(NSMakePoint(0, max(0.0, content_h - list_h)))
+        scroll.reflectScrolledClipView_(clip)
+        # natural_h must be the list's true minimum (len(entries)*row_h), NOT content_h — see
+        # the Voices-section bug this exact reasoning was confirmed against via debug logging.
+        self._installScrollReclamp(scroll, container, len(entries) * row_h)
+        list_box.addSubview_(scroll)
+
+    @objc.python_method
+    def _buildSavedRows(self, list_box, box_w, list_h):
+        location = self._saveLocation()
+        entries = saved.list_saved(location)
+        row_h = 56
+        if not entries:
+            empty = make_label(
+                'Nothing saved yet — right-click a Recent recording and choose "Save to '
+                'Permanent Location."', 12, 0.45, align=AppKit.NSTextAlignmentCenter)
+            empty.cell().setWraps_(True)
+            empty.setFrame_(NSMakeRect(20, list_h / 2 - 28, box_w - 40, 56))
+            empty.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+            list_box.addSubview_(empty)
+            return
+        content_h = max(list_h, len(entries) * row_h)
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, list_h))
+        scroll.setBorderType_(AppKit.NSNoBorder)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        container = CardView.alloc().initWithFrame_(NSMakeRect(0, 0, box_w, content_h))
+        cy = content_h
+        for i, entry in enumerate(entries):
+            cy -= row_h
+            if i > 0:
+                line = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, cy + row_h - 1, box_w, 1))
+                line.setWantsLayer_(True)
+                line.layer().setBackgroundColor_(white(0.09).CGColor())
+                container.addSubview_(line)
+
+            row = ContextMenuButton.alloc().initWithFrame_(NSMakeRect(0, cy, box_w, row_h))
+            row.configure(0.0, 0.06, 8.0)
+            row.setTitle_("")
+            row.setTarget_(self)
+            row.setAction_("savedRowClicked:")
+            row._saved_path = entry["path"]
+            # "Copy Text" only offered when there IS text — a file dragged in from Finder
+            # (no sidecar, see saved.list_saved) has none, and copying an empty string to
+            # the clipboard would just silently clobber whatever the user had there.
+            menu_items = []
+            if entry["text"]:
+                menu_items.append(("Copy Text", lambda text=entry["text"]: self._savedCopyText(text)))
+            menu_items.append(("Reveal in Finder", lambda path=entry["path"]: self._savedReveal(path)))
+            menu_items.append((None, None))
+            menu_items.append(("Delete", lambda path=entry["path"], text=entry["text"], fn=entry["filename"]:
+                                self._savedDeleteRequested(path, text, fn)))
+            row.context_menu_items = menu_items
+            container.addSubview_(row)
+
+            preview = ClickThroughTextField.alloc().init()
+            preview.setBezeled_(False)
+            preview.setDrawsBackground_(False)
+            preview.setEditable_(False)
+            preview.setSelectable_(False)
+            preview.setFont_(AppKit.NSFont.systemFontOfSize_(13))
+            preview.setTextColor_(white(0.85))
+            preview.cell().setLineBreakMode_(AppKit.NSLineBreakByTruncatingTail)
+            # Falls back to the filename when there's no text (dragged in from Finder) —
+            # an unlabeled blank row would otherwise be indistinguishable from any other.
+            preview.setStringValue_(entry["text"] or entry["filename"])
+            preview.setFrame_(NSMakeRect(12, cy + 28, box_w - 60, 18))
+            container.addSubview_(preview)
+
+            meta = ClickThroughTextField.alloc().init()
+            meta.setBezeled_(False)
+            meta.setDrawsBackground_(False)
+            meta.setEditable_(False)
+            meta.setSelectable_(False)
+            meta.setFont_(AppKit.NSFont.systemFontOfSize_(11))
+            meta.setTextColor_(white(0.45))
+            meta.cell().setLineBreakMode_(AppKit.NSLineBreakByTruncatingTail)
+            if entry["provider"]:
+                meta_text = (f"{entry['provider']} · {self._historyVoiceLabel(entry['provider'], entry['voice'])} · "
+                             f"{format_relative_time(entry['modified_at'])} · {self._humanMB(entry['size_bytes'])}")
+            else:
+                meta_text = f"{format_relative_time(entry['modified_at'])} · {self._humanMB(entry['size_bytes'])}"
+            meta.setStringValue_(meta_text)
+            meta.setFrame_(NSMakeRect(12, cy + 8, box_w - 60, 14))
+            container.addSubview_(meta)
+
+            trash = icon_button("trash", 13, NSMakeRect(box_w - 40, cy + (row_h - 30) / 2.0, 30, 30),
+                                 "savedDeleteClicked:", self, base=0.0, hover=0.14, corner=7.0, tint=0.5)
+            trash._saved_path = entry["path"]
+            container.addSubview_(trash)
+        scroll.setDocumentView_(container)
+        clip = scroll.contentView()
+        clip.scrollToPoint_(NSMakePoint(0, max(0.0, content_h - list_h)))
+        scroll.reflectScrolledClipView_(clip)
+        self._installScrollReclamp(scroll, container, len(entries) * row_h)
+        list_box.addSubview_(scroll)
+
+    def savedRowClicked_(self, sender):
+        path = getattr(sender, "_saved_path", None)
+        if path is None:
+            return
+        entry = next((e for e in saved.list_saved(self._saveLocation()) if e["path"] == path), None)
+        if entry is None:
+            return
+        self.showMainScreen()
+        self._playSavedEntry(entry["path"], entry["text"])
+
+    @objc.python_method
+    def _playSavedEntry(self, path, text):
+        try:
+            with open(path, "rb") as f:
+                wav_bytes = f.read()
+        except OSError:
+            self.showError_("That recording is no longer available.")
+            return
+        self.stopPlayback_(None)
+        if text:
+            self.text_view.setString_(text)
+            self.updateCharCount()
+        # Same one-chunk "session" treatment _playHistoryEntry uses — every chunk-aware
+        # consumer (skip back/forward, the scrubber) keeps working unmodified. No
+        # history.touch_entry equivalent here — Saved has no LRU/eviction concept to protect.
+        self.playback_token = object()
+        self.all_chunks = [text or path]
+        self.chunk_durations = [None]
+        self.chunk_index = 0
+        self.next_chunk_audio = None
+        self.chunk_audio_cache = {}
+        self.chunk_word_timings = {}
+        self.avg_chars_per_sec = None
+        self.session_text = None
+        self._beginChunkPlayback(wav_bytes)
+
+    @objc.python_method
+    def _savedCopyText(self, text):
+        pb = AppKit.NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
+        self.setStatus("Text copied.")
+        AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(2.0, False, lambda t: self.setStatus(""))
+
+    @objc.python_method
+    def _savedReveal(self, path):
+        AppKit.NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_([NSURL.fileURLWithPath_(path)])
+
+    def savedDeleteClicked_(self, sender):
+        path = getattr(sender, "_saved_path", None)
+        if path is None:
+            return
+        entry = next((e for e in saved.list_saved(self._saveLocation()) if e["path"] == path), None)
+        if entry is None:
+            return
+        self._savedDeleteRequested(path, entry["text"], entry["filename"])
+
+    @objc.python_method
+    def _savedDeleteRequested(self, path, text, filename):
+        # Same confirm-before-delete treatment just added to History's own trash icon, applied
+        # here from the start rather than needing the same bug report a second time — see
+        # _historyDeleteClicked_'s comment for the full reasoning (recoverable via Trash, but
+        # the app has to actually SAY so, not just silently do it).
+        self._pending_delete_saved_path = path
+        cw, ch = 300, 180
+        card = self._makeCard(cw, ch)
+        title = make_label("Move this recording to the Trash?", 15, 0.92,
+                            AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+        title.cell().setWraps_(True)
+        title.setFrame_(NSMakeRect(20, ch - 56, cw - 40, 36))
+        sub = make_label(
+            "It leaves this list, but stays recoverable in your Mac's Trash until you empty it.",
+            12, 0.5, align=AppKit.NSTextAlignmentCenter)
+        sub.cell().setWraps_(True)
+        sub.setFrame_(NSMakeRect(20, ch - 100, cw - 40, 40))
+
+        cancel_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+        cancel_btn = text_button("Cancel", NSMakeRect(20, 20, (cw - 52) / 2, 34), "cancelSavedDelete:", self,
+                                  cancel_font, 0.08, 0.16, 9.0, white(0.85))
+        trash_btn = cta_button("Move to Trash", NSMakeRect(cw / 2 + 6, 20, (cw - 52) / 2, 34),
+                                "confirmSavedDeleteClicked:", self)
+        trash_btn.layer().setBackgroundColor_(AppKit.NSColor.systemRedColor().colorWithAlphaComponent_(0.85).CGColor())
+        trash_attrs = {
+            AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(11.5, AppKit.NSFontWeightSemibold),
+            AppKit.NSForegroundColorAttributeName: AppKit.NSColor.whiteColor(),
+        }
+        trash_btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_attributes_("Move to Trash", trash_attrs))
+
+        for s in (title, sub, cancel_btn, trash_btn):
+            card.addSubview_(s)
+        self._presentOverlay(card)
+
+    def cancelSavedDelete_(self, sender):
+        self._pending_delete_saved_path = None
+        self.dismissOverlay()
+
+    def confirmSavedDeleteClicked_(self, sender):
+        path = self._pending_delete_saved_path
+        self._pending_delete_saved_path = None
+        self.dismissOverlay()
+        if path is not None:
+            saved.delete_saved(path)
+        self.showRecordingsScreen("saved")
+
+    def _historyRowClicked_(self, sender):
+        entry_id = getattr(sender, "_history_entry_id", None)
+        # Back to the main screen first so the user actually sees the real transport controls
+        # (play/pause icon, scrubber) animate — those live on the main screen, not here.
+        self.showMainScreen()
+        self._playHistoryEntry(entry_id)
+
+    def _historyDeleteClicked_(self, sender):
+        # Used to delete immediately on click, no confirmation, no way for the user to tell
+        # from the UI alone that it's actually recoverable (Trash, not gone for good — see
+        # history.trash_file) — confirmed via a direct NSFileManager test that the trash
+        # operation itself does succeed, but the app never SAID so, which reads identically to
+        # a real permanent delete from the user's side. Same confirm-card treatment as
+        # Manage Voices' delete and Storage's eviction — the message says explicitly that this
+        # one specifically stays recoverable, since that's exactly what was missing.
+        entry_id = getattr(sender, "_history_entry_id", None)
+        entry = next((e for e in history.list_entries() if e["id"] == entry_id), None)
+        if entry is None:
+            return
+        self._pending_delete_history_id = entry_id
+
+        cw, ch = 300, 180
+        card = self._makeCard(cw, ch)
+        title = make_label("Move this recording to the Trash?", 15, 0.92,
+                            AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+        title.cell().setWraps_(True)
+        title.setFrame_(NSMakeRect(20, ch - 56, cw - 40, 36))
+        sub = make_label(
+            "It leaves this list, but stays recoverable in your Mac's Trash until you empty it.",
+            12, 0.5, align=AppKit.NSTextAlignmentCenter)
+        sub.cell().setWraps_(True)
+        sub.setFrame_(NSMakeRect(20, ch - 100, cw - 40, 40))
+
+        cancel_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+        cancel_btn = text_button("Cancel", NSMakeRect(20, 20, (cw - 52) / 2, 34), "cancelHistoryDelete:", self,
+                                  cancel_font, 0.08, 0.16, 9.0, white(0.85))
+        trash_btn = cta_button("Move to Trash", NSMakeRect(cw / 2 + 6, 20, (cw - 52) / 2, 34),
+                                "confirmHistoryDeleteClicked:", self)
+        trash_btn.layer().setBackgroundColor_(AppKit.NSColor.systemRedColor().colorWithAlphaComponent_(0.85).CGColor())
+        trash_attrs = {
+            AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(11.5, AppKit.NSFontWeightSemibold),
+            AppKit.NSForegroundColorAttributeName: AppKit.NSColor.whiteColor(),
+        }
+        trash_btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_attributes_("Move to Trash", trash_attrs))
+
+        for s in (title, sub, cancel_btn, trash_btn):
+            card.addSubview_(s)
+        self._presentOverlay(card)
+
+    def cancelHistoryDelete_(self, sender):
+        self._pending_delete_history_id = None
+        self.dismissOverlay()
+
+    def confirmHistoryDeleteClicked_(self, sender):
+        entry_id = self._pending_delete_history_id
+        self._pending_delete_history_id = None
+        self.dismissOverlay()
+        if entry_id is not None:
+            history.remove_entry(entry_id)  # moved to Trash, not gone for good — see history.trash_file
+        self.showRecordingsScreen("recent")  # mutate then fully re-render, same shape as confirmDeleteVoiceClicked_
+
+    @objc.python_method
+    def _historySaveClicked(self, entry_id):
+        # location is read here, on the main thread, and passed down as a plain arg — not
+        # re-read from self.config inside the background worker, matching the existing
+        # convention (see audioPlayerDidFinishPlaying_successfully_'s call into
+        # _saveSessionToHistoryWorker) for keeping self.config access off background threads.
+        location = self._saveLocation()
+        threading.Thread(target=self._saveHistoryEntryPermanentlyWorker, args=(entry_id, location), daemon=True).start()
+
+    @objc.python_method
+    def _saveHistoryEntryPermanentlyWorker(self, entry_id, location):
+        entry = next((e for e in history.list_entries() if e["id"] == entry_id), None)
+        if entry is None:
+            return
+        wav_path = os.path.join(history.CACHE_DIR, entry["audio_file"])
+        try:
+            with open(wav_path, "rb") as f:
+                wav_bytes = f.read()
+            saved.save_generation(location, entry["text"], entry["provider"], entry["voice"], wav_bytes)
+        except OSError:
+            self.performSelectorOnMainThread_withObject_waitUntilDone_("historySaveFailedMain:", "", False)
+            return
+        self.performSelectorOnMainThread_withObject_waitUntilDone_("historySavedMain:", "", False)
+
+    def historySavedMain_(self, sender):
+        self.setStatus("Saved to permanent location.")
+        AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(2.0, False, lambda t: self.setStatus(""))
+
+    def historySaveFailedMain_(self, sender):
+        self.showError_("Could not save this recording.")
+
+    @objc.python_method
+    def _playHistoryEntry(self, entry_id):
+        entry = next((e for e in history.list_entries() if e["id"] == entry_id), None)
+        if entry is None:
+            return
+        path = os.path.join(history.CACHE_DIR, entry["audio_file"])
+        try:
+            with open(path, "rb") as f:
+                wav_bytes = f.read()
+        except OSError:
+            self.showError_("That recording is no longer available.")
+            return
+        # Same teardown the Stop button uses — guarantees no leftover chunked-session state
+        # from whatever was playing before this.
+        self.stopPlayback_(None)
+        # Drop the original text back into the box too, not just the audio — same
+        # setString_/updateCharCount pairing pasteClicked_ already uses to set text
+        # programmatically (setString_ alone doesn't post textDidChange_, so this can't
+        # collide with the one-chunk playback session set up just below).
+        self.text_view.setString_(entry["text"])
+        self.updateCharCount()
+        history.touch_entry(entry_id)
+        # A cached entry is a single, already-concatenated WAV blob — treat it as a one-chunk
+        # "session" so every existing chunk-aware consumer (skip back/forward, the scrubber,
+        # the natural-end-of-session check) keeps working unmodified.
+        self.playback_token = object()
+        self.all_chunks = [entry["text"]]
+        self.chunk_durations = [None]
+        self.chunk_index = 0
+        self.next_chunk_audio = None
+        self.chunk_audio_cache = {}
+        self.chunk_word_timings = {}
+        self.avg_chars_per_sec = None
+        # Deliberately None, NOT entry["text"] — audioPlayerDidFinishPlaying_successfully_ only
+        # resaves to history when session_text is truthy at the natural end of playback; leaving
+        # it set to the entry's real text would silently create a fresh duplicate entry every
+        # time this same clip gets replayed to completion.
+        self.session_text = None
+        self._beginChunkPlayback(wav_bytes)
+
+    # ----- settings -----
+    SETTINGS_SECTIONS = [
+        ("personalization", "Personalization"), ("storage", "Storage"),
+        ("voices", "Voices"), ("location", "File Location"),
+    ]
+    STORAGE_COUNT_OPTIONS = [5, 10, 20, 50, 100]
+    STORAGE_SIZE_OPTIONS = [50 * 1024 * 1024, 100 * 1024 * 1024, 250 * 1024 * 1024, 500 * 1024 * 1024]
+
+    # Word-highlight personalization (Settings > Personalization). Controls how the spoken
+    # word gets emphasized during playback — this section builds the config UI only; the live
+    # highlighting-during-playback engine itself (System-voice word timing, forced alignment
+    # for cloned voices) is separate, larger, not-yet-started work.
+    DEFAULT_HIGHLIGHT_COLOR = "#CC5500"  # burnt orange — the original proposal that started this feature
+    # Floor below the smallest real word-to-word gap seen in practice (58ms) — guards only
+    # against the pathological case of two words landing on the same/near-same captured start
+    # (two independent async callback streams feeding word_timings), which would otherwise make
+    # the earlier of the two mathematically unselectable, or visible for ~0 seconds, regardless
+    # of how the highlight is scheduled. See _requestSystemTTS.
+    HIGHLIGHT_MIN_WORD_WINDOW = 0.04
+    # Moves each word's highlight moment slightly ahead of its actual captured audio start —
+    # a natural reader's eyes move onto the next word before finishing hearing/saying the
+    # current one (the well-documented "eye-voice span" in oral-reading research), so a
+    # highlight synced exactly to audio onset reads as trailing behind where the eye already
+    # wants to be. General reading eye-tracking and saccadic-latency research puts this kind of
+    # effect more in the 100-200ms range than 15-30ms (saccadic reaction time alone — the delay
+    # between a visual cue and the eye actually beginning to move to it — is consistently
+    # measured around 140-240ms); tunable here rather than hard-guessed, since the "right" feel
+    # is inherently subjective and worth testing directly against real playback.
+    HIGHLIGHT_LEAD_TIME = 0.12
+    # NSStrokeWidthAttributeName's magnitude is a percentage of the font's point size, not an
+    # absolute stroke thickness — -3.0 (an earlier guess) turned out visually indistinguishable
+    # from regular weight at 14pt. Compared side by side against true bold at several
+    # magnitudes (rendered to a bitmap and inspected directly): -7.0 is the point where it
+    # actually reads as bold and roughly matches true bold's visual weight, without going thick
+    # enough to look blotchy.
+    HIGHLIGHT_BOLD_STROKE_WIDTH = -7.0
+    HIGHLIGHT_COLOR_PRESETS = [
+        ("#CC5500", "Burnt Orange"), ("#D4A017", "Amber"), ("#2E8B8B", "Teal"),
+        ("#4A90D9", "Sky Blue"), ("#8A63D2", "Violet"), ("#D9538A", "Rose"),
+        ("#4CAF80", "Mint"), ("#B0B0B0", "Neutral Gray"),
+    ]
+    HIGHLIGHT_STYLE_OPTIONS = [
+        ("highlight", "Highlight"), ("bold", "Bold"),
+        ("underline", "Underline"), ("color", "Text Color"), ("none", "Off"),
+    ]
+    HIGHLIGHT_SHAPE_OPTIONS = [("rounded", "Rounded"), ("pill", "Pill")]
+    HIGHLIGHT_THICKNESS_OPTIONS = [("single", "Single"), ("thick", "Thick")]
+    HIGHLIGHT_ANIMATION_OPTIONS = [("snap", "Snap"), ("slide", "Slide")]
+    HIGHLIGHT_PREVIEW_PREFIX = "The quick "
+    HIGHLIGHT_PREVIEW_WORD = "brown"
+    HIGHLIGHT_PREVIEW_SUFFIX = " fox jumps."
+
+    def settingsClicked_(self, sender):
+        self.showSettingsScreen("personalization")
+
+    def backToMainFromSettingsClicked_(self, sender):
+        self.showMainScreen()
+
+    def settingsSectionClicked_(self, sender):
+        self.showSettingsScreen(getattr(sender, "_settings_section", "personalization"))
+
+    @objc.python_method
+    def _humanMB(self, num_bytes):
+        return f"{num_bytes / (1024 * 1024):.1f} MB"
+
+    @objc.python_method
+    def _storageAverageBytesPerEntry(self):
+        entries = history.list_entries()
+        if not entries:
+            return None
+        return sum(e["size_bytes"] for e in entries) / len(entries)
+
+    @objc.python_method
+    def _storagePreviewText(self):
+        avg = self._storageAverageBytesPerEntry()
+        mode, value = self._settings_storage_mode, self._settings_storage_value
+        if avg is None:
+            # Nothing generated yet to estimate from — say so plainly rather than showing a
+            # fabricated number, which is exactly the kind of silently-wrong conversion that
+            # caused the "will 50MB actually keep 50 recordings?" confusion in the first place.
+            return "No recordings yet to estimate size from."
+        if mode == "count":
+            total = value * avg
+            secs = history.estimate_seconds_for_bytes(total)
+            return (f"Keeping the last {value} recordings ≈ {self._humanMB(total)}, "
+                    f"about {secs / 60:.0f} min of audio (based on your current average size).")
+        if value is None:
+            return "No size limit — recordings are only capped by how many are kept elsewhere."
+        approx_count = int(value / avg) if avg else 0
+        return (f"A {self._humanMB(value)} limit keeps roughly {approx_count} recordings at your "
+                f"current average size (~{self._humanMB(avg)} each) — not a fixed count.")
+
+    @objc.python_method
+    def showSettingsScreen(self, section="personalization"):
+        # Full-screen destination, same swap_screen mechanism as History/the main screen — a
+        # real, standalone place to browse settings, not something you get dumped into and
+        # auto-bounced out of. Reached from the wordmark dropdown/app menu directly, or via
+        # History's cog (landing straight on the "storage" section).
+        idx = history.load_index()
+        # _settings_storage_mode/_value are transient "what the user is currently configuring"
+        # state — NOT written to history.py until storageConfirmClicked_ actually applies it.
+        # Only (re)initialized from the real stored config the first time this screen is
+        # entered in a session; clicking pills just updates this pending state and re-renders,
+        # so exploring options never touches real data until Confirm.
+        if getattr(self, "_settings_storage_mode", None) is None:
+            if idx.get("max_bytes"):
+                self._settings_storage_mode = "size"
+                self._settings_storage_value = idx.get("max_bytes")
+            else:
+                self._settings_storage_mode = "count"
+                self._settings_storage_value = idx.get("max_entries") or history.DEFAULT_MAX_ENTRIES
+
+        v = AppKit.NSView.alloc().initWithFrame_(self.root.bounds())
+        b = v.bounds()
+        W, H = b.size.width, b.size.height
+        self._screenHeader(v, W, H, "")  # no "Settings" title — the sidebar itself already says where you are
+
+        # x=20 everywhere on this screen (sidebar, divider, list_box on History) — was 12 for
+        # the sidebar specifically, a leftover inconsistency with everything else.
+        # "Personalization" is the longest label now — measured ~97px, +6px inset each side.
+        sidebar_w = 114
+        content_y = self.SCREEN_FOOTER_H
+        # A smaller top reservation than SCREEN_HEADER_H (54, sized to fit a real title) — with
+        # no title here, the sidebar/content only need to clear the wordmark's own top-right
+        # corner and a bit of breathing room, not a whole title row's worth of space.
+        SETTINGS_HEADER_H = 24.0
+        content_h = H - SETTINGS_HEADER_H - self.SCREEN_FOOTER_H
+        sidebar = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(20, content_y, sidebar_w, content_h))
+        sidebar.setAutoresizingMask_(AppKit.NSViewHeightSizable)
+        row_h = 32
+        for i, (key, label) in enumerate(self.SETTINGS_SECTIONS):
+            # Text-only hover/selected feedback, no background pill/border — same
+            # BrightenOnHoverButton treatment as the voice dropdown's own rows, so this reads
+            # as one consistent "menu" style across the app instead of a second, different-
+            # looking kind of list control.
+            row = BrightenOnHoverButton.alloc().initWithFrame_(NSMakeRect(0, content_h - (i + 1) * row_h, sidebar_w, row_h))
+            # Anchored to the TOP of sidebar (fixed distance from sidebar's own top edge), not
+            # left at its build-time position — sidebar's OWN frame stretches on window resize
+            # (HeightSizable above), and without this every row stayed frozen at its original
+            # y, which read as "nothing moves" until the window got tall enough to reveal a
+            # growing gap above them. Same fix applies throughout this screen and History.
+            row.setAutoresizingMask_(AppKit.NSViewMinYMargin)
+            sel = key == section
+            row_font = AppKit.NSFont.systemFontOfSize_weight_(13, AppKit.NSFontWeightSemibold if sel else AppKit.NSFontWeightRegular)
+            dim_color = white(0.92 if sel else 0.5)
+            row.configureBrighten(label, row_font, dim_color, white(0.85), align=AppKit.NSTextAlignmentLeft,
+                                   label_frame=NSMakeRect(6, 0, sidebar_w - 12, row_h))
+            row.setTarget_(self)
+            row.setAction_("settingsSectionClicked:")
+            row._settings_section = key
+            sidebar.addSubview_(row)
+        v.addSubview_(sidebar)
+
+        # Thin divider instead of bare whitespace — the empty gap alone read as "too much
+        # space for no reason"; a deliberate line makes the same (now smaller) gap read as an
+        # intentional boundary. Doesn't reach the very top/bottom of the content band: starts
+        # a little above the first sidebar row, ends a little above the Back button.
+        # Bottom was y=28 — BELOW Back's own top edge (16+34=50), so it ran straight through
+        # Back's vertical band instead of stopping above it. content_y (58) sits a real 8pt
+        # clear of Back's top; the divider's height is content_h+4 so its top lands a few
+        # points above the sidebar's own top row.
+        divider_x = 20 + sidebar_w + 8
+        divider = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(divider_x, content_y, 1, content_h + 4))
+        divider.setAutoresizingMask_(AppKit.NSViewHeightSizable)
+        divider.setWantsLayer_(True)
+        divider.layer().setBackgroundColor_(white(0.14).CGColor())
+        v.addSubview_(divider)
+
+        content_x = divider_x + 8
+        content = AppKit.NSView.alloc().initWithFrame_(
+            NSMakeRect(content_x, content_y, W - content_x - 20, content_h))
+        content.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        if section == "voices":
+            self._buildVoicesSection(content)
+        elif section == "personalization":
+            self._buildPersonalizationSection(content)
+        elif section == "location":
+            self._buildLocationSection(content)
+        else:
+            self._buildStorageSection(content)
+        v.addSubview_(content)
+
+        self.current_screen = "settings"
+        self.swap_screen(v)
+        self._installWidthRebuildTrigger(v, lambda: self.showSettingsScreen(section))
+
+    @objc.python_method
+    def _hexToColor(self, hex_str):
+        h = hex_str.lstrip("#")
+        r, g, b = int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0
+        return AppKit.NSColor.colorWithRed_green_blue_alpha_(r, g, b, 1.0)
+
+    @objc.python_method
+    def _buildPersonalizationSection(self, content):
+        # Same scroll+reclamp+wrap treatment every other Settings section uses (see
+        # _buildStorageSection's comment on why) — this section has the MOST pill rows of any
+        # of them (style, optionally shape or thickness, color swatches, animation), so getting
+        # the wrap/resize handling right from the start matters even more here than usual.
+        cb = content.bounds()
+        w = cb.size.width
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(cb)
+        scroll.setBorderType_(AppKit.NSNoBorder)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        content.addSubview_(scroll)
+
+        style = self.config.get("highlight_style", "highlight")
+        shape = self.config.get("highlight_shape", "pill")
+        thickness = self.config.get("highlight_underline_thickness", "single")
+        animation = self.config.get("highlight_animation", "slide")
+        color_hex = self.config.get("highlight_color", self.DEFAULT_HIGHLIGHT_COLOR)
+        # Color applies to every style except "none" (nothing to color) — highlight uses it as
+        # the background, bold/underline/color all use it as the word's own text/underline
+        # color (see _buildHighlightPreview). Animation is meaningless with no visual change
+        # happening at all, so it's tied to the same "none" gate as color.
+        show_shape = style == "highlight"
+        show_thickness = style == "underline"
+        show_color = style != "none"
+        show_animation = style != "none"
+
+        pill_font = AppKit.NSFont.systemFontOfSize_weight_(11, AppKit.NSFontWeightMedium)
+        label_h, PILL_H, LINE_GAP, ROW_GAP = 16.0, 26.0, 6.0, 18.0
+        SWATCH_D = 30.0
+        PREVIEW_H = 64.0
+
+        def pill_lines_for(options, gap=6):
+            items = [(max(32.0, 10.0 + len(label) * 7.0), (key, label)) for key, label in options]
+            lines = self._wrapIntoLines(items, gap, w)
+            rows_h = len(lines) * PILL_H + (len(lines) - 1) * LINE_GAP
+            return lines, rows_h
+
+        # Every row is a (label_text, lines, item_h, line_gap, render_kind, selected/extra) tuple,
+        # built up in top-to-bottom display order, then laid out generically below in one pass —
+        # replaces hand-rolling each row's cursor math individually, which stopped scaling once
+        # Color/Animation also became conditional (on top of Shape/Thickness already being so).
+        rows = [("Style", *pill_lines_for(self.HIGHLIGHT_STYLE_OPTIONS), PILL_H, LINE_GAP, "pills", style,
+                 "personalizationStyleClicked:")]
+        if show_shape:
+            rows.append(("Shape", *pill_lines_for(self.HIGHLIGHT_SHAPE_OPTIONS), PILL_H, LINE_GAP, "pills", shape,
+                         "personalizationShapeClicked:"))
+        if show_thickness:
+            rows.append(("Underline Thickness", *pill_lines_for(self.HIGHLIGHT_THICKNESS_OPTIONS), PILL_H, LINE_GAP,
+                         "pills", thickness, "personalizationThicknessClicked:"))
+        if show_color:
+            swatch_items = [(SWATCH_D, (hexv, label)) for hexv, label in self.HIGHLIGHT_COLOR_PRESETS]
+            swatch_lines = self._wrapIntoLines(swatch_items, 8, w)
+            swatch_rows_h = len(swatch_lines) * SWATCH_D + (len(swatch_lines) - 1) * 8.0
+            rows.append(("Color", swatch_lines, swatch_rows_h, SWATCH_D, 8.0, "swatches", color_hex, None))
+        if show_animation:
+            rows.append(("Word-to-Word Animation", *pill_lines_for(self.HIGHLIGHT_ANIMATION_OPTIONS), PILL_H, LINE_GAP,
+                         "pills", animation, "personalizationAnimationClicked:"))
+
+        NATURAL_H = 4 + PREVIEW_H
+        for label_text, lines, rows_h, item_h, gap, kind, selected, action in rows:
+            NATURAL_H += ROW_GAP + label_h + 8 + rows_h
+        NATURAL_H += 4
+        container = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, NATURAL_H))
+
+        cursor = NATURAL_H - 4
+        cursor -= PREVIEW_H
+        preview_y = cursor
+
+        positions = []
+        for label_text, lines, rows_h, item_h, gap, kind, selected, action in rows:
+            cursor -= ROW_GAP
+            cursor -= label_h
+            label_y = cursor
+            cursor -= 8
+            first_line_y = cursor - item_h
+            cursor -= rows_h
+            positions.append((label_text, lines, item_h, gap, kind, selected, action, label_y, first_line_y))
+
+        # ----- preview -----
+        preview_bg = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, preview_y, w, PREVIEW_H))
+        preview_bg.setWantsLayer_(True)
+        preview_bg.layer().setBackgroundColor_(white(0.045).CGColor())
+        preview_bg.layer().setBorderColor_(white(0.1).CGColor())
+        preview_bg.layer().setBorderWidth_(1.0)
+        preview_bg.layer().setCornerRadius_(10.0)
+        container.addSubview_(preview_bg)
+        self._buildHighlightPreview(preview_bg, style, shape, thickness, self._hexToColor(color_hex))
+
+        # ----- rows -----
+        for label_text, lines, item_h, gap, kind, selected, action, label_y, first_line_y in positions:
+            label = make_label(label_text, 12, 0.55)
+            label.setFrame_(NSMakeRect(0, label_y, 220, label_h))
+            container.addSubview_(label)
+            if kind == "pills":
+                self._addPillLines(container, lines, first_line_y, item_h, gap, pill_font, selected, action)
+            else:
+                self._addColorSwatches(container, lines, first_line_y, item_h, gap, selected)
+
+        scroll.setDocumentView_(container)
+        clip = scroll.contentView()
+        clip.scrollToPoint_(NSMakePoint(0, max(0.0, NATURAL_H - cb.size.height)))
+        scroll.reflectScrolledClipView_(clip)
+        self._installScrollReclamp(scroll, container, NATURAL_H)
+
+    @objc.python_method
+    def _addColorSwatches(self, container, lines, first_line_y, sw_d, gap, color_hex):
+        pill_font = AppKit.NSFont.systemFontOfSize_weight_(11, AppKit.NSFontWeightMedium)
+        line_y = first_line_y
+        for line in lines:
+            px = 0.0
+            for _, (hexv, label) in line:
+                swatch = text_button("", NSMakeRect(px, line_y, sw_d, sw_d), "personalizationColorClicked:", self,
+                                      pill_font, 0.0, 0.0, sw_d / 2.0, white(0.0))
+                swatch.layer().setBackgroundColor_(self._hexToColor(hexv).CGColor())
+                sel = hexv.upper() == color_hex.upper()
+                swatch.layer().setBorderWidth_(2.0 if sel else 1.0)
+                swatch.layer().setBorderColor_((white(0.95) if sel else white(0.2)).CGColor())
+                swatch._base_alpha = None
+                swatch._fill = lambda *a, **k: None  # plain color swatch — no separate hover fill on top of it
+                swatch._highlight_color_hex = hexv
+                swatch.setToolTip_(label)
+                container.addSubview_(swatch)
+                px += sw_d + gap
+            line_y -= (sw_d + gap)
+
+    @objc.python_method
+    def _addPillLines(self, container, lines, first_line_y, pill_h, line_gap, font, selected_key, action):
+        line_y = first_line_y
+        for line in lines:
+            px = 0.0
+            for btn_w, (key, label_text) in line:
+                btn = text_button(label_text, NSMakeRect(px, line_y, btn_w, pill_h), action, self,
+                                   font, 0.04, 0.14, 9.0, white(0.55))
+                btn.layer().setBorderWidth_(1.0)
+                sel = key == selected_key
+                btn.layer().setBackgroundColor_(white(0.16 if sel else 0.04).CGColor())
+                btn.layer().setBorderColor_(white(0.3 if sel else 0.1).CGColor())
+                attrs = {AppKit.NSFontAttributeName: font, AppKit.NSForegroundColorAttributeName: white(0.95 if sel else 0.55)}
+                btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_attributes_(label_text, attrs))
+                btn._base_alpha = 0.16 if sel else 0.04
+                btn._pill_key = key
+                container.addSubview_(btn)
+                px += btn_w + 8
+            line_y -= (pill_h + line_gap)
+
+    @objc.python_method
+    def _buildHighlightPreview(self, preview_bg, style, shape, thickness, nscolor):
+        # Built as a single real NSTextView measured through NSLayoutManager — NOT three
+        # separately-positioned NSTextField labels sized via NSAttributedString.size(), which
+        # is what this used to be. That approximate approach kept drifting out of sync with
+        # what real playback (_glyphRectForRange, also NSLayoutManager-based) actually renders,
+        # no matter how the padding constants were tuned — confirmed directly: two rounds of
+        # numeric tuning left the preview and live view visibly different every time. Sharing
+        # the exact same measurement mechanism as the live highlight is what actually fixes it.
+        pw = preview_bg.bounds().size.width
+        ph = preview_bg.bounds().size.height
+        font = AppKit.NSFont.systemFontOfSize_(14)
+        sentence = self.HIGHLIGHT_PREVIEW_PREFIX + self.HIGHLIGHT_PREVIEW_WORD + self.HIGHLIGHT_PREVIEW_SUFFIX
+        word_loc = len(self.HIGHLIGHT_PREVIEW_PREFIX)
+        word_len = len(self.HIGHLIGHT_PREVIEW_WORD)
+        word_range = AppKit.NSMakeRange(word_loc, word_len)
+
+        tv = AppKit.NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, pw - 32, 22))
+        tv.setString_(sentence)
+        tv.setFont_(font)
+        tv.setTextColor_(white(0.7))
+        tv.setEditable_(False)
+        tv.setSelectable_(False)
+        tv.setDrawsBackground_(False)
+        tv.setVerticallyResizable_(False)
+        tv.setHorizontallyResizable_(False)
+        tv.setTextContainerInset_(NSMakeSize(0, 0))
+        tv.textContainer().setLineFragmentPadding_(0)
+        tv.setWantsLayer_(True)
+
+        storage = tv.textStorage()
+        storage.beginEditing()
+        # Every style except "highlight" (background does the coloring instead — the word's
+        # own text stays a neutral white, same as a real highlighter marks text without
+        # recoloring it) and "none" (nothing to color) applies the chosen color to the word's
+        # text directly, not just "Text Color" specifically.
+        storage.addAttribute_value_range_(AppKit.NSForegroundColorAttributeName, white(0.92), word_range)
+        if style == "bold":
+            # Faux bold (negative stroke width on the REGULAR font), not a true bold font — see
+            # the matching comment in _applyTextStyleHighlight — keeps this preview's word the
+            # same width real playback renders it at, instead of a wider true-bold substitute.
+            storage.addAttribute_value_range_(
+                AppKit.NSStrokeWidthAttributeName, self.HIGHLIGHT_BOLD_STROKE_WIDTH, word_range)
+            storage.addAttribute_value_range_(AppKit.NSStrokeColorAttributeName, nscolor, word_range)
+            storage.addAttribute_value_range_(AppKit.NSForegroundColorAttributeName, nscolor, word_range)
+        elif style == "underline":
+            underline_style = AppKit.NSUnderlineStyleThick if thickness == "thick" else AppKit.NSUnderlineStyleSingle
+            storage.addAttribute_value_range_(AppKit.NSUnderlineStyleAttributeName, underline_style, word_range)
+            storage.addAttribute_value_range_(AppKit.NSUnderlineColorAttributeName, nscolor, word_range)
+            storage.addAttribute_value_range_(AppKit.NSForegroundColorAttributeName, nscolor, word_range)
+        elif style == "color":
+            storage.addAttribute_value_range_(AppKit.NSForegroundColorAttributeName, nscolor, word_range)
+        storage.endEditing()
+
+        lm = tv.layoutManager()
+        tc = tv.textContainer()
+        lm.ensureLayoutForTextContainer_(tc)
+        used_rect = lm.usedRectForTextContainer_(tc)
+        tv.setFrame_(NSMakeRect(max(16.0, (pw - used_rect.size.width) / 2.0),
+                                 (ph - used_rect.size.height) / 2.0,
+                                 used_rect.size.width, used_rect.size.height))
+
+        if style == "highlight":
+            glyph_range, _ = lm.glyphRangeForCharacterRange_actualCharacterRange_(word_range, None)
+            word_rect = lm.boundingRectForGlyphRange_inTextContainer_(glyph_range, tc)
+            # Same pad_h/pad_v as the real live-playback pill (_applyWordHighlight) — sharing
+            # the constant, not just the same NUMBER independently chosen twice, is the point.
+            pad_h, pad_v = 2.0, 2.0
+            hl = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(
+                tv.frame().origin.x + word_rect.origin.x - pad_h,
+                tv.frame().origin.y + word_rect.origin.y - pad_v,
+                word_rect.size.width + pad_h * 2, word_rect.size.height + pad_v * 2))
+            hl.setWantsLayer_(True)
+            hl.layer().setBackgroundColor_(nscolor.colorWithAlphaComponent_(0.85).CGColor())
+            hl.layer().setCornerRadius_(4.0 if shape == "rounded" else hl.frame().size.height / 2.0)
+            # Added BEFORE tv, not as a sublayer of tv's own layer — same reasoning as
+            # _ensureHighlightOverlay: a layer-backed view's sublayers always render on top of
+            # its own drawn content, so the pill would cover the glyphs instead of sitting
+            # behind them. These are separate SIBLING views under preview_bg, not sublayers of
+            # the same layer, so ordinary AppKit z-order (added-first = behind) is sufficient.
+            preview_bg.addSubview_(hl)
+
+        preview_bg.addSubview_(tv)
+
+    def personalizationStyleClicked_(self, sender):
+        self.config["highlight_style"] = getattr(sender, "_pill_key", "highlight")
+        save_config(self.config)
+        self.showSettingsScreen("personalization")
+
+    def personalizationShapeClicked_(self, sender):
+        self.config["highlight_shape"] = getattr(sender, "_pill_key", "pill")
+        save_config(self.config)
+        self.showSettingsScreen("personalization")
+
+    def personalizationThicknessClicked_(self, sender):
+        self.config["highlight_underline_thickness"] = getattr(sender, "_pill_key", "single")
+        save_config(self.config)
+        self.showSettingsScreen("personalization")
+
+    def personalizationColorClicked_(self, sender):
+        hexv = getattr(sender, "_highlight_color_hex", None)
+        if hexv:
+            self.config["highlight_color"] = hexv
+            save_config(self.config)
+        self.showSettingsScreen("personalization")
+
+    def personalizationAnimationClicked_(self, sender):
+        self.config["highlight_animation"] = getattr(sender, "_pill_key", "slide")
+        save_config(self.config)
+        self.showSettingsScreen("personalization")
+
+    @objc.python_method
+    def _buildStorageSection(self, content):
+        cb = content.bounds()
+        w = cb.size.width
+
+        # Wrapped in its own scroll view instead of positioning everything straight into
+        # content — at default/small window sizes this section's controls simply didn't fit
+        # and had nowhere to go. The scroll view stretches with the window; container's HEIGHT
+        # is whatever this section actually needs at the CURRENT width (recomputed fresh every
+        # build, including width-change rebuilds — see _installWidthRebuildTrigger).
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(cb)
+        scroll.setBorderType_(AppKit.NSNoBorder)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        content.addSubview_(scroll)
+
+        # Pill rows wrap onto additional lines instead of clipping or requiring horizontal
+        # scroll when they don't fit the available width (horizontal scroll was tried and
+        # explicitly rejected — wrapping is what a real user actually wants here). Computed
+        # fresh at the CURRENT width every time this section is built, via the same
+        # _wrapIntoLines helper — a real flow-wrap, not a guess.
+        mode_font = AppKit.NSFont.systemFontOfSize_weight_(12, AppKit.NSFontWeightMedium)
+        mode_items = [(20.0 + len(label) * 6.6, (key, label)) for key, label in
+                      (("count", "Number of recordings"), ("size", "Total file size"))]
+        mode_lines = self._wrapIntoLines(mode_items, 8, w)
+
+        pill_font = AppKit.NSFont.systemFontOfSize_weight_(11, AppKit.NSFontWeightMedium)
+        if self._settings_storage_mode == "count":
+            value_options = [(n, str(n)) for n in self.STORAGE_COUNT_OPTIONS]
+        else:
+            value_options = [(n, self._humanMB(n)) for n in self.STORAGE_SIZE_OPTIONS]
+        value_items = [(max(32.0, 10.0 + len(text) * 7.0), (value, text)) for value, text in value_options]
+        value_lines = self._wrapIntoLines(value_items, 6, w)
+
+        MODE_BTN_H, VALUE_BTN_H, LINE_GAP = 30.0, 26.0, 6.0
+        mode_rows_h = len(mode_lines) * MODE_BTN_H + (len(mode_lines) - 1) * LINE_GAP
+        value_rows_h = len(value_lines) * VALUE_BTN_H + (len(value_lines) - 1) * LINE_GAP
+
+        # Built bottom-up from a single cursor with explicit gaps (same idiom used throughout
+        # this file, e.g. _showRecordingCaptureCard), now accounting for however many lines
+        # each pill row actually needs at this width instead of assuming exactly one.
+        mode_label_h, value_label_h, preview_h, confirm_h = 20.0, 18.0, 50.0, 34.0
+        NATURAL_H = (4 + mode_label_h + 8 + mode_rows_h + 20 + value_label_h + 8 + value_rows_h
+                     + 20 + preview_h + 16 + confirm_h + 4)
+        container = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, NATURAL_H))
+
+        cursor = NATURAL_H - 4
+        cursor -= mode_label_h
+        mode_label_y = cursor
+        cursor -= 8
+        first_mode_line_y = cursor - MODE_BTN_H
+        cursor -= mode_rows_h
+        cursor -= 20
+        cursor -= value_label_h
+        value_label_y = cursor
+        cursor -= 8
+        first_value_line_y = cursor - VALUE_BTN_H
+        cursor -= value_rows_h
+        cursor -= 20
+        cursor -= preview_h
+        preview_y = cursor
+        cursor -= 16
+        cursor -= confirm_h
+        confirm_y = cursor
+
+        mode_label = make_label("Manage the cache by", 12, 0.55)
+        mode_label.setFrame_(NSMakeRect(0, mode_label_y, 260, mode_label_h))
+        container.addSubview_(mode_label)
+
+        line_y = first_mode_line_y
+        for line in mode_lines:
+            px = 0.0
+            for btn_w, (key, label_text) in line:
+                btn = text_button(label_text, NSMakeRect(px, line_y, btn_w, MODE_BTN_H), "storageModeClicked:", self,
+                                   mode_font, 0.04, 0.14, 9.0, white(0.55))
+                btn.layer().setBorderWidth_(1.0)
+                sel = key == self._settings_storage_mode
+                btn.layer().setBackgroundColor_(white(0.16 if sel else 0.04).CGColor())
+                btn.layer().setBorderColor_(white(0.3 if sel else 0.1).CGColor())
+                attrs = {AppKit.NSFontAttributeName: mode_font, AppKit.NSForegroundColorAttributeName: white(0.95 if sel else 0.55)}
+                btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_attributes_(label_text, attrs))
+                btn._base_alpha = 0.16 if sel else 0.04
+                btn._mode_key = key
+                container.addSubview_(btn)
+                px += btn_w + 8
+            line_y -= (MODE_BTN_H + LINE_GAP)
+
+        # Two independent caps used to be able to silently override each other (a size cap
+        # smaller than what a count cap implied would win with zero explanation) — mode is now
+        # exclusive, and applying one always clears the other (see _applyStorageLimit), so this
+        # value row only ever needs to show pills for whichever mode is currently selected.
+        value_label = make_label(
+            "Keep last" if self._settings_storage_mode == "count" else "Limit total size to", 12, 0.55)
+        value_label.setFrame_(NSMakeRect(0, value_label_y, 260, value_label_h))
+        container.addSubview_(value_label)
+
+        action = "storageValueClicked:"
+        line_y = first_value_line_y
+        for line in value_lines:
+            px = 0.0
+            for btn_w, (value, text) in line:
+                btn = text_button(text, NSMakeRect(px, line_y, btn_w, VALUE_BTN_H), action, self,
+                                   pill_font, 0.04, 0.14, 8.0, white(0.55))
+                btn.layer().setBorderWidth_(1.0)
+                sel = value == self._settings_storage_value
+                btn.layer().setBackgroundColor_(white(0.16 if sel else 0.04).CGColor())
+                btn.layer().setBorderColor_(white(0.3 if sel else 0.1).CGColor())
+                attrs = {AppKit.NSFontAttributeName: pill_font, AppKit.NSForegroundColorAttributeName: white(0.95 if sel else 0.55)}
+                btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_attributes_(text, attrs))
+                btn._base_alpha = 0.16 if sel else 0.04
+                btn._limit_value = value
+                container.addSubview_(btn)
+                px += btn_w + 6
+            line_y -= (VALUE_BTN_H + LINE_GAP)
+
+        preview = make_label(self._storagePreviewText(), 12, 0.6)
+        preview.cell().setWraps_(True)
+        preview.setFrame_(NSMakeRect(0, preview_y, w, preview_h))
+        container.addSubview_(preview)
+
+        # Same treatment as Back/Continue — pill base color, hover dialed back to 0.10 to
+        # compensate for this being a much larger filled area than a pill.
+        confirm_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightSemibold)
+        confirm_btn = text_button("Confirm", NSMakeRect(0, confirm_y, 110, confirm_h), "storageConfirmClicked:", self,
+                                   confirm_font, 0.04, 0.10, 9.0, white(0.95))
+        confirm_btn.layer().setBorderWidth_(1.0)
+        confirm_btn.layer().setBorderColor_(white(0.1).CGColor())
+        container.addSubview_(confirm_btn)
+
+        scroll.setDocumentView_(container)
+        clip = scroll.contentView()
+        clip.scrollToPoint_(NSMakePoint(0, max(0.0, NATURAL_H - cb.size.height)))
+        scroll.reflectScrolledClipView_(clip)
+        # No natural_w here anymore — wrapping means container's width should just always
+        # track the viewport directly (nothing left-aligned inside it needs a wider floor the
+        # way un-wrapped pills used to), which is also exactly what a width-change rebuild
+        # produces at NATURAL_H's new value on its own.
+        self._installScrollReclamp(scroll, container, NATURAL_H)
+
+    def storageModeClicked_(self, sender):
+        mode = getattr(sender, "_mode_key", "count")
+        if mode != self._settings_storage_mode:
+            self._settings_storage_mode = mode
+            idx = history.load_index()
+            if mode == "size":
+                self._settings_storage_value = idx.get("max_bytes") or self.STORAGE_SIZE_OPTIONS[0]
+            else:
+                self._settings_storage_value = idx.get("max_entries") or history.DEFAULT_MAX_ENTRIES
+        self.showSettingsScreen("storage")
+
+    def storageValueClicked_(self, sender):
+        self._settings_storage_value = getattr(sender, "_limit_value", None)
+        self.showSettingsScreen("storage")
+
+    def storageConfirmClicked_(self, sender):
+        mode, value = self._settings_storage_mode, self._settings_storage_value
+        evict = history.preview_eviction(
+            max_entries=(value if mode == "count" else 10 ** 9),
+            max_bytes=(value if mode == "size" else None))
+        if evict > 0:
+            self._showStorageConfirmDeleteCard(mode, value, evict)
+        else:
+            self._applyStorageLimit(mode, value)
+
+    @objc.python_method
+    def _applyStorageLimit(self, mode, value):
+        # Mode is mutually exclusive at the STORED-DATA level, not just in the UI — applying
+        # one always explicitly resets the other, so they can never both silently constrain
+        # the cache at once the way the two-independent-caps version used to.
+        if mode == "count":
+            history.set_limits(max_entries=value, max_bytes=None)
+        else:
+            history.set_limits(max_entries=10 ** 9, max_bytes=value)
+        self.showSettingsScreen("storage")
+        self.setStatus("Storage setting applied.")
+        AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+            2.0, False, lambda t: self.setStatus(""))
+
+    @objc.python_method
+    def _showStorageConfirmDeleteCard(self, mode, value, evict_count):
+        self._pending_storage_mode = mode
+        self._pending_storage_value = value
+        plural = "recording" if evict_count == 1 else "recordings"
+
+        cw, ch = 300, 170
+        card = self._makeCard(cw, ch)
+        title = make_label(f"Move {evict_count} {plural} to the Trash?", 15, 0.92,
+                            AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+        title.setFrame_(NSMakeRect(0, ch - 40, cw, 20))
+        sub = make_label(
+            "This setting keeps fewer recordings than you currently have cached — the rest go "
+            "to the Trash, where you can still recover them.", 12, 0.5, align=AppKit.NSTextAlignmentCenter)
+        sub.cell().setWraps_(True)
+        sub.setFrame_(NSMakeRect(20, ch - 78, cw - 40, 40))
+
+        cancel_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+        cancel_btn = text_button("Cancel", NSMakeRect(20, 20, (cw - 52) / 2, 34), "cancelStorageConfirm:", self,
+                                  cancel_font, 0.08, 0.16, 9.0, white(0.85))
+        move_btn = cta_button("Move to Trash", NSMakeRect(cw / 2 + 6, 20, (cw - 52) / 2, 34),
+                               "confirmStorageConfirmClicked:", self)
+        move_btn.layer().setBackgroundColor_(AppKit.NSColor.systemRedColor().colorWithAlphaComponent_(0.85).CGColor())
+        move_attrs = {
+            AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(11.5, AppKit.NSFontWeightSemibold),
+            AppKit.NSForegroundColorAttributeName: AppKit.NSColor.whiteColor(),
+        }
+        move_btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_attributes_("Move to Trash", move_attrs))
+
+        for s in (title, sub, cancel_btn, move_btn):
+            card.addSubview_(s)
+        self._presentOverlay(card)
+
+    def cancelStorageConfirm_(self, sender):
+        self._pending_storage_mode = None
+        self._pending_storage_value = None
+        self.dismissOverlay()
+
+    def confirmStorageConfirmClicked_(self, sender):
+        mode, value = self._pending_storage_mode, self._pending_storage_value
+        self._pending_storage_mode = None
+        self._pending_storage_value = None
+        self.dismissOverlay()
+        if mode is not None:
+            self._applyStorageLimit(mode, value)
+
+    @objc.python_method
+    def _saveLocation(self):
+        return self.config.get("save_location") or saved.DEFAULT_SAVE_DIR
+
+    @objc.python_method
+    def _buildLocationSection(self, content):
+        # Same scroll+reclamp treatment as every other Settings section (see _buildStorageSection's
+        # comment) — the resize bugs fixed earlier today were never section-specific, so every
+        # new section gets this from the start rather than needing its own fix-cycle later.
+        cb = content.bounds()
+        w = cb.size.width
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(cb)
+        scroll.setBorderType_(AppKit.NSNoBorder)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        content.addSubview_(scroll)
+
+        location = self._saveLocation()
+        entries = saved.list_saved(location)
+        count = len(entries)
+        total_bytes = sum(e["size_bytes"] for e in entries)
+        is_default = (location == saved.DEFAULT_SAVE_DIR)
+
+        # Content width here is much narrower than the full window (sidebar + divider eat a
+        # fixed ~150pt), and this row has up to 3 buttons — same overflow risk the Storage
+        # section's pill rows had, so it gets the same real flow-wrap fix instead of assuming
+        # a fixed row width like the button row's first (buggy) draft did.
+        # "View Saved Recordings" used to live here — now redundant, since Saved is a tab on
+        # the Recordings screen itself (one click from the wordmark), not buried in Settings.
+        btn_font = AppKit.NSFont.systemFontOfSize_weight_(12, AppKit.NSFontWeightMedium)
+        btn_specs = [("Choose Folder…", "locationChooseFolderClicked:"), ("Reveal in Finder", "locationRevealClicked:")]
+        if not is_default:
+            btn_specs.append(("Reset to Default", "locationResetClicked:"))
+        btn_items = [(20.0 + len(label) * 6.6, (label, action)) for label, action in btn_specs]
+        btn_lines = self._wrapIntoLines(btn_items, 8, w)
+
+        BTN_H, LINE_GAP = 30.0, 8.0
+        btn_rows_h = len(btn_lines) * BTN_H + (len(btn_lines) - 1) * LINE_GAP
+        title_h, desc_h, path_h, stats_h = 20.0, 34.0, 40.0, 18.0
+        NATURAL_H = (4 + title_h + 8 + desc_h + 16 + path_h + 10 + btn_rows_h + 16 + stats_h + 4)
+        container = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, NATURAL_H))
+
+        cursor = NATURAL_H - 4
+        cursor -= title_h
+        title_y = cursor
+        cursor -= 8
+        cursor -= desc_h
+        desc_y = cursor
+        cursor -= 16
+        cursor -= path_h
+        path_y = cursor
+        cursor -= 10
+        first_btn_line_y = cursor - BTN_H
+        cursor -= btn_rows_h
+        cursor -= 16
+        cursor -= stats_h
+        stats_y = cursor
+
+        title_label = make_label("File Location", 15, 0.75, AppKit.NSFontWeightSemibold)
+        title_label.setFrame_(NSMakeRect(0, title_y, 260, title_h))
+        container.addSubview_(title_label)
+
+        desc = make_label(
+            "Recordings you explicitly save (not the automatic Recents cache) are written here, "
+            "as real files you can find in Finder.", 12.5, 0.5)
+        desc.cell().setWraps_(True)
+        desc.setFrame_(NSMakeRect(0, desc_y, w, desc_h))
+        container.addSubview_(desc)
+
+        path_bg = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, path_y, w, path_h))
+        path_bg.setWantsLayer_(True)
+        path_bg.layer().setBackgroundColor_(white(0.06).CGColor())
+        path_bg.layer().setBorderColor_(white(0.1).CGColor())
+        path_bg.layer().setBorderWidth_(1.0)
+        path_bg.layer().setCornerRadius_(8.0)
+        path_label = make_label(location, 11.5, 0.6)
+        path_label.cell().setLineBreakMode_(AppKit.NSLineBreakByTruncatingMiddle)
+        path_label.setFrame_(NSMakeRect(10, 0, w - 20, path_h))
+        path_bg.addSubview_(path_label)
+        container.addSubview_(path_bg)
+
+        line_y = first_btn_line_y
+        for line in btn_lines:
+            px = 0.0
+            for btn_w, (label, action) in line:
+                btn = text_button(label, NSMakeRect(px, line_y, btn_w, BTN_H), action, self,
+                                   btn_font, 0.04, 0.14, 9.0, white(0.55))
+                btn.layer().setBorderWidth_(1.0)
+                btn.layer().setBorderColor_(white(0.1).CGColor())
+                container.addSubview_(btn)
+                px += btn_w + 8
+            line_y -= (BTN_H + LINE_GAP)
+
+        if count == 0:
+            stats_text = "No saved recordings yet."
+        else:
+            plural = "recording" if count == 1 else "recordings"
+            stats_text = f"{count} saved {plural} · {self._humanMB(total_bytes)}"
+        stats = make_label(stats_text, 12, 0.45)
+        stats.setFrame_(NSMakeRect(0, stats_y, w, stats_h))
+        container.addSubview_(stats)
+
+        scroll.setDocumentView_(container)
+        clip = scroll.contentView()
+        clip.scrollToPoint_(NSMakePoint(0, max(0.0, NATURAL_H - cb.size.height)))
+        scroll.reflectScrolledClipView_(clip)
+        self._installScrollReclamp(scroll, container, NATURAL_H)
+
+    def locationChooseFolderClicked_(self, sender):
+        panel = AppKit.NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(False)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setCanCreateDirectories_(True)
+        panel.setPrompt_("Choose")
+        current = self._saveLocation()
+        if os.path.isdir(current):
+            panel.setDirectoryURL_(NSURL.fileURLWithPath_(current))
+        if panel.runModal() == AppKit.NSModalResponseOK:
+            urls = panel.URLs()
+            if urls:
+                self.config["save_location"] = urls[0].path()
+                save_config(self.config)
+                self.showSettingsScreen("location")
+
+    def locationRevealClicked_(self, sender):
+        location = self._saveLocation()
+        saved.ensure_dir(location)
+        AppKit.NSWorkspace.sharedWorkspace().selectFile_inFileViewerRootedAtPath_(None, location)
+
+    def locationResetClicked_(self, sender):
+        self.config.pop("save_location", None)
+        save_config(self.config)
+        self.showSettingsScreen("location")
 
     def _ttsWorkerLoop(self):
         # Runs forever on the ONE persistent thread MLX ever sees — see the comment where this
@@ -2513,14 +4768,23 @@ class AppDelegate(NSObject):
         while True:
             job = self._tts_job_queue.get()
             try:
-                text, token, role, index, offset = job
-                # A superseded job (Stop, or a new Play/seek issued before this one was even
-                # pulled off the queue) is cheap to skip before spending real generation time
-                # on audio nobody will ever see — chunkResultMain_ still re-checks the token
-                # itself once a result comes back, so this is a pure efficiency win, not a
-                # correctness requirement.
-                if token is self.playback_token:
-                    self._chunkWorker(text, token, role, index, offset)
+                if callable(job):
+                    # A zero-arg job (e.g. warming the model at launch — see
+                    # applicationDidFinishLaunching_) rather than a chunk-generation tuple.
+                    # Must go through this same queue/thread, not a separate one: MLX's
+                    # per-thread stream identity is exactly what the persistent-worker fix
+                    # above exists to keep singular, and loading the model touches MLX just
+                    # as much as generating with it does.
+                    job()
+                else:
+                    text, token, role, index, offset, should_play = job
+                    # A superseded job (Stop, or a new Play/seek issued before this one was
+                    # even pulled off the queue) is cheap to skip before spending real
+                    # generation time on audio nobody will ever see — chunkResultMain_ still
+                    # re-checks the token itself once a result comes back, so this is a pure
+                    # efficiency win, not a correctness requirement.
+                    if token is self.playback_token:
+                        self._chunkWorker(text, token, role, index, offset, should_play)
             except Exception:
                 traceback.print_exc(file=sys.stderr)
                 sys.stderr.flush()
@@ -2528,22 +4792,28 @@ class AppDelegate(NSObject):
                 self._tts_job_queue.task_done()
 
     @objc.python_method
-    def _chunkWorker(self, text, token, role, index, offset):
+    def _chunkWorker(self, text, token, role, index, offset, should_play=True):
         try:
             audio = self._requestTTS(text)
-            result = {"token": token, "role": role, "index": index, "offset": offset, "audio": audio, "error": None}
+            # Set only for System voice (see _requestSystemTTS); None for every other
+            # provider. Read immediately and cleared right away so a later non-System chunk
+            # can never accidentally inherit a previous System chunk's stale timings.
+            word_timings = self._last_word_timings
+            self._last_word_timings = None
+            result = {"token": token, "role": role, "index": index, "offset": offset, "audio": audio,
+                      "word_timings": word_timings, "should_play": should_play, "error": None}
         except urllib.error.HTTPError as e:
             result = {"token": token, "role": role, "index": index, "offset": offset, "audio": None,
-                      "error": f"TTS request failed (HTTP {e.code})."}
+                      "should_play": should_play, "error": f"TTS request failed (HTTP {e.code})."}
         except urllib.error.URLError as e:
             result = {"token": token, "role": role, "index": index, "offset": offset, "audio": None,
-                      "error": f"Could not reach provider: {e.reason}"}
+                      "should_play": should_play, "error": f"Could not reach provider: {e.reason}"}
         except Exception as e:
             # Covers the System voice path (AVSpeechSynthesizer, no urllib involved) — without
             # this, an unexpected failure there would just kill the background thread silently,
             # leaving the UI stuck showing "Generating..." forever with no way out but Stop.
             result = {"token": token, "role": role, "index": index, "offset": offset, "audio": None,
-                      "error": f"Couldn't generate speech: {e}"}
+                      "should_play": should_play, "error": f"Couldn't generate speech: {e}"}
         self.performSelectorOnMainThread_withObject_waitUntilDone_("chunkResultMain:", result, False)
 
     def chunkResultMain_(self, result):
@@ -2572,9 +4842,15 @@ class AppDelegate(NSObject):
                 self._syncPlaybackUI()
             self.showError_(result["error"])
             return
+        # Stored here (once, regardless of which branch below handles playback) rather than
+        # threaded through _beginChunkPlayback as an extra parameter — a chunk's word timing is
+        # a property of the chunk itself, same as chunk_audio_cache, and every branch below
+        # already keys off result["index"]/self.chunk_index into that same dict.
+        self.chunk_word_timings[result["index"]] = result.get("word_timings")
         if result["role"] == "seek":
             self.chunk_index = result["index"]
-            self._beginChunkPlayback(result["audio"], start_offset=result["offset"])
+            self._beginChunkPlayback(
+                result["audio"], start_offset=result["offset"], should_play=result.get("should_play", True))
         elif self.waiting_for_next:
             self.waiting_for_next = False
             self._beginChunkPlayback(result["audio"])
@@ -2583,7 +4859,7 @@ class AppDelegate(NSObject):
             self.chunk_audio_cache[result["index"]] = result["audio"]
 
     @objc.python_method
-    def _beginChunkPlayback(self, audio_bytes, start_offset=0.0):
+    def _beginChunkPlayback(self, audio_bytes, start_offset=0.0, should_play=True):
         player, err = AVFoundation.AVAudioPlayer.alloc().initWithData_error_(bytes(audio_bytes), None)
         if player is None:
             self.showError_("Could not decode the generated audio.")
@@ -2596,10 +4872,19 @@ class AppDelegate(NSObject):
             player.setCurrentTime_(min(start_offset, max(0.0, player.duration() - 0.05)))
         self.player = player
         self.player.setDelegate_(self)
-        self.player.play()
+        self.player.setVolume_(max(0.0, min(1.0, self.config.get("volume", 1.0))))
+        # should_play=False lands a seek at the new position without resuming — a scrub/skip
+        # performed while playback was already stopped/paused shouldn't itself start it (the
+        # only callers that ever pass False are the seek paths below; every other caller here —
+        # first Play, History/Saved replay, natural chunk-to-chunk advance — always wants to
+        # play, hence the True default).
+        if should_play:
+            self.player.play()
         self.setStatus("")
         self._syncPlaybackUI()
-        self._startProgressTimer()
+        if should_play:
+            self._startProgressTimer()
+        self._syncWordHighlightNow()
         if self.config.get("provider", "ElevenLabs") == "ElevenLabs":
             threading.Thread(target=self._fetchElVoicesWorker, daemon=True).start()  # refresh usage
         self._prefetchNextChunk()
@@ -2613,7 +4898,10 @@ class AppDelegate(NSObject):
         if cached is not None:
             self.next_chunk_audio = cached
             return
-        self._tts_job_queue.put((self.all_chunks[next_index], self.playback_token, "prefetch", next_index, 0.0))
+        # should_play is irrelevant for "prefetch" (chunkResultMain_'s prefetch branch just
+        # caches the audio, never calls _beginChunkPlayback) — True only to match the tuple
+        # shape every job on this queue is unpacked with.
+        self._tts_job_queue.put((self.all_chunks[next_index], self.playback_token, "prefetch", next_index, 0.0, True))
 
     @objc.python_method
     def _resetPlaybackState(self):
@@ -2625,6 +4913,7 @@ class AppDelegate(NSObject):
         self.chunk_index = 0
         self.next_chunk_audio = None
         self.chunk_audio_cache = {}
+        self.chunk_word_timings = {}
         self.session_text = None
         self.waiting_for_next = False
 
@@ -2727,13 +5016,13 @@ class AppDelegate(NSObject):
         if self.player is None or not self.all_chunks:
             return
         current = self._cumulativeDurationBefore(self.chunk_index) + self.player.currentTime()
-        self._seekToVirtualTime(current - 15.0)
+        self._seekToVirtualTime(current - 15.0, should_play=self.player.isPlaying())
 
     def skipForward_(self, sender):
         if self.player is None or not self.all_chunks:
             return
         current = self._cumulativeDurationBefore(self.chunk_index) + self.player.currentTime()
-        self._seekToVirtualTime(current + 15.0)
+        self._seekToVirtualTime(current + 15.0, should_play=self.player.isPlaying())
 
     # ----- whole-document virtual timeline (scrubber + duration-aware skip) -----
     @objc.python_method
@@ -2764,9 +5053,19 @@ class AppDelegate(NSObject):
             self.avg_chars_per_sec = known_chars / known_secs
 
     @objc.python_method
-    def _seekToVirtualTime(self, target_seconds):
+    def _seekToVirtualTime(self, target_seconds, should_play=True):
         if not self.all_chunks:
             return
+        # should_play is the CALLER's decision, not auto-detected here — this function is also
+        # the shared landing spot for a brand-new Play click and for restarting a just-finished
+        # session (playPauseClicked_'s two direct calls below), where self.player is None
+        # precisely BECAUSE there's no prior playback to check, not because anything was
+        # paused. Auto-detecting "was playing" from self.player.isPlaying() here would read
+        # that None as False and silently load the audio without ever starting it — confirmed
+        # directly: it turned a first Play click into a no-op, and the very next Pause click
+        # (hitting self.player.isPlaying()==False) started it instead of pausing it. Only the
+        # actual scrub/skip callers (which require an existing player already) compute "was it
+        # playing" themselves and pass it in.
         total = self._totalEstimatedDuration()
         target_seconds = max(0.0, min(target_seconds, max(total - 0.1, 0.0)))
         cumulative = 0.0
@@ -2795,20 +5094,33 @@ class AppDelegate(NSObject):
             # prefetched-but-skipped-past) — reuse the exact same audio instead of a fresh
             # regeneration, which also means the offset lines up exactly with what was heard
             # before rather than drifting by however much a fresh TTS call's timing differs.
-            self._beginChunkPlayback(cached, start_offset=offset)
+            self._beginChunkPlayback(cached, start_offset=offset, should_play=should_play)
             return
 
         self.setStatus("Generating...")
-        self._tts_job_queue.put((self.all_chunks[target_index], self.playback_token, "seek", target_index, offset))
+        self._tts_job_queue.put(
+            (self.all_chunks[target_index], self.playback_token, "seek", target_index, offset, should_play))
 
     @objc.python_method
     def _startProgressTimer(self):
         self._stopProgressTimer()
-        self.progress_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
-            0.25, True, lambda t: self._updateScrubberUI())
+        # NSRunLoopCommonModes, not the plain scheduled-timer default mode — same reasoning as
+        # the shimmer/pulse animation timers in widgets.py: a default-mode-only timer freezes
+        # for the whole duration of a live window-resize drag, so the scrubber/elapsed-time
+        # display would visibly stall if the user resizes mid-playback.
+        # 0.03s just for smooth scrubber/elapsed-time motion — word-highlight timing is no
+        # longer driven by this poll at all (see _scheduleNextWordTimer), so this interval no
+        # longer needs to out-run individual word durations.
+        self.progress_timer = AppKit.NSTimer.timerWithTimeInterval_repeats_block_(
+            0.03, True, lambda t: self._updateScrubberUI())
+        AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(self.progress_timer, AppKit.NSRunLoopCommonModes)
 
     @objc.python_method
     def _stopProgressTimer(self):
+        # Centralized cancellation point for the word-highlight timer chain too — every real
+        # stop/pause/seek/error path in the app already calls this, so hooking it here covers
+        # all of them for free instead of duplicating an invalidate call at each call site.
+        self._invalidateHighlightTimer()
         if self.progress_timer is not None:
             self.progress_timer.invalidate()
             self.progress_timer = None
@@ -2833,9 +5145,393 @@ class AppDelegate(NSObject):
         self.scrubber.setFraction(0.0)
         self.elapsed_label.setStringValue_("0:00")
         self.remaining_label.setStringValue_("0:00")
+        self._clearWordHighlight()
+
+    # ----- live word-highlight during playback (System voice only — see _requestSystemTTS for
+    # how word_timings gets captured; #23 will extend this to cloned voices via forced
+    # alignment) -----
+    #
+    # Event-driven, not polled: each word transition is armed as its own one-shot NSTimer, timed
+    # to that word's exact captured start (recomputed fresh from player.currentTime() every time
+    # a timer is armed, not scheduled once up front) — exactly one timer is ever pending. This
+    # replaces an earlier polling design (checking "what word should be current" on a fixed
+    # 0.03s tick) that measurably still skipped words shorter than the poll interval — sampling
+    # can't structurally guarantee catching every word regardless of how fast it polls, since
+    # real word durations can be shorter than any practical interval. Scheduling each transition
+    # as its own timer removes that failure mode: the only remaining way to miss a word is the
+    # main thread being preempted past that word's own start AND the next word's start together.
+
+    @objc.python_method
+    def _invalidateHighlightTimer(self):
+        timer = getattr(self, "_highlight_timer", None)
+        if timer is not None:
+            timer.invalidate()
+        self._highlight_timer = None
+
+    @objc.python_method
+    def _syncWordHighlightNow(self):
+        # The one "landing" entry point — called whenever playback lands somewhere new (chunk
+        # start, seek, resume, a mid-session screen rebuild), never on a periodic tick. Resolves
+        # the correct current word from live player.currentTime() and arms the next transition.
+        self._invalidateHighlightTimer()
+        try:
+            style = self.config.get("highlight_style", "highlight")
+            if style == "none" or self.config.get("provider") != "System" or self.player is None:
+                self._clearWordHighlight()
+                return
+            timings = self.chunk_word_timings.get(self.chunk_index)
+            if not timings:
+                self._clearWordHighlight()
+                return
+            current_time = self.player.currentTime()
+            idx = -1
+            for i, t in enumerate(timings):
+                if t["start"] <= current_time:
+                    idx = i
+                else:
+                    break
+            # Unconditional, not gated on chunk_index having changed — this only runs at
+            # discrete landing events now, so every call is itself a fresh anchor point. A
+            # same-chunk backward seek used to leave a stale, too-far-ahead search cursor,
+            # making _findWordGlobalRange's forward-only search miss and fall back to a
+            # from-scratch full_text.find() — highlighting the word's FIRST occurrence in the
+            # whole document instead of the one near the seek target.
+            self._highlight_search_cursor = self._approxChunkStartOffset(self.chunk_index)
+            self._highlight_chunk_index = self.chunk_index
+            if idx == -1:
+                # Landed before the first word's own captured start (e.g. right at chunk start —
+                # real speech has a few ms of lead-in before the very first callback fires, so
+                # current_time==0.0 can be earlier than timings[0]["start"]). Nothing should be
+                # showing yet, but this must NOT just give up: _highlight_word_index stays -1 so
+                # the fall-through to _scheduleNextWordTimer below correctly arms word 0
+                # (next_idx = _highlight_word_index + 1 == 0). Returning here instead — as a
+                # simple "nothing to show yet" bail-out — was a real bug: nothing else ever
+                # re-invokes this function until the next landing event, so it silently killed
+                # highlighting for the entire rest of the chunk.
+                self._highlight_word_index = -1
+                self._hideHighlightOverlay()
+                self._revertPrevTextAttributes()
+            else:
+                self._highlight_word_index = idx
+                word = timings[idx]
+                global_range = self._findWordGlobalRange(word["text"])
+                if global_range is not None:
+                    self._applyWordHighlight(global_range, style)
+                else:
+                    # Word simply never found (even the punctuation-tolerant fallback in
+                    # _findWordGlobalRange missed) — should be rare after that fix, but a silent
+                    # skip here has no other visible symptom, so this is worth a real trace.
+                    print(f"Word highlight: no match for {word['text']!r}", file=sys.stderr, flush=True)
+        except Exception:
+            # Moved here from the old polling tick's wrapper — an uncaught exception inside an
+            # NSTimer block callback is silently swallowed with no printed trace, which is
+            # exactly what hid the real bug that broke every highlight update until this was
+            # added. Kept as a permanent safety net, not just debug scaffolding.
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+        # Only chain forward if audio is actually playing — NSTimer measures real wall-clock
+        # time, not player playback time, so a scheduled timer fires on schedule regardless of
+        # whether the player itself is advancing. Landing here paused (should_play=False from a
+        # scrub/skip performed while stopped) with this called unconditionally meant the
+        # highlight kept animating through the text on its own even though the audio never
+        # made a sound — confirmed by the user directly. The word already resolved and shown
+        # above is correct for a paused landing; it just must not advance any further on its
+        # own.
+        if self.player is not None and self.player.isPlaying():
+            self._scheduleNextWordTimer()
+
+    @objc.python_method
+    def _scheduleNextWordTimer(self):
+        self._invalidateHighlightTimer()
+        try:
+            style = self.config.get("highlight_style", "highlight")
+            if style == "none" or self.config.get("provider") != "System" or self.player is None:
+                return
+            timings = self.chunk_word_timings.get(self.chunk_index)
+            if not timings or self.chunk_index != self._highlight_chunk_index:
+                return  # nothing valid to chain from; the next _syncWordHighlightNow call resyncs
+            next_idx = self._highlight_word_index + 1
+            if next_idx >= len(timings):
+                return  # last word of this chunk is already showing; chunk-transition resyncs fresh
+            # Clamped to the PREVIOUS word's own start (never earlier) — the lead is meant to
+            # move a transition slightly ahead of its own word's audio, not spill backward into
+            # the still-playing previous word, which for two closely-spaced words could
+            # otherwise flip their displayed order.
+            floor = timings[next_idx - 1]["start"] if next_idx > 0 else 0.0
+            target_time = max(floor, timings[next_idx]["start"] - self.HIGHLIGHT_LEAD_TIME)
+            current_time = self.player.currentTime()
+            # player.rate() is never changed anywhere in this app (speed is baked into the
+            # rendered WAV at synthesis time instead) — dividing by it here is a correctness
+            # safety net, not something currently exercised.
+            rate = self.player.rate() or 1.0
+            delay = max(0.0, (target_time - current_time) / rate)
+            expected_token = self.playback_token
+            expected_chunk = self.chunk_index
+            timer = AppKit.NSTimer.timerWithTimeInterval_repeats_block_(
+                delay, False,
+                lambda t: self._fireWordHighlightTimer(next_idx, expected_token, expected_chunk))
+            # NSRunLoopCommonModes, same reasoning as _startProgressTimer — a default-mode-only
+            # timer freezes during a live window resize, which here would silently push a word's
+            # highlight moment past its real start time.
+            AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(timer, AppKit.NSRunLoopCommonModes)
+            self._highlight_timer = timer
+        except Exception:
+            # Same silent-swallow risk as _syncWordHighlightNow — this can be called from a
+            # timer callback (via _fireWordHighlightTimer's reschedule), where an uncaught
+            # exception would otherwise vanish with no trace.
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+
+    @objc.python_method
+    def _fireWordHighlightTimer(self, idx, expected_token, expected_chunk):
+        self._highlight_timer = None
+        # Defensive redundancy, not the primary guard — _stopProgressTimer already invalidates
+        # any pending timer at every real stop/pause/seek point, so this should never actually
+        # fire stale. Kept anyway, using the same playback_token idiom already used elsewhere.
+        if self.playback_token is not expected_token or self.chunk_index != expected_chunk or self.player is None:
+            return
+        timings = self.chunk_word_timings.get(self.chunk_index)
+        if not timings or idx >= len(timings):
+            return
+        self._highlight_word_index = idx
+        try:
+            word = timings[idx]
+            global_range = self._findWordGlobalRange(word["text"])
+            if global_range is not None:
+                self._applyWordHighlight(global_range, self.config.get("highlight_style", "highlight"))
+            else:
+                print(f"Word highlight: no match for {word['text']!r}", file=sys.stderr, flush=True)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+        # Unconditional reschedule, even after an exception — one bad word shouldn't permanently
+        # kill highlighting for the rest of the chunk.
+        self._scheduleNextWordTimer()
+
+    @objc.python_method
+    def _approxChunkStartOffset(self, index):
+        # +1 per boundary for the single space chunk_text() joins pieces with — approximate
+        # (original whitespace between sentences may have been different), used only as a
+        # forward-search starting point, never as the final answer.
+        return sum(len(self.all_chunks[i]) + 1 for i in range(index))
+
+    @objc.python_method
+    def _findWordGlobalRange(self, word_text):
+        full_text = self.text_view.string()
+        idx = full_text.find(word_text, self._highlight_search_cursor)
+        if idx == -1:
+            # Cursor drifted past the real occurrence (chunk-boundary approximation was off
+            # more than expected) — fall back to a fresh search from the very start rather
+            # than silently leaving the highlight stuck on the previous word.
+            idx = full_text.find(word_text)
+        if idx != -1:
+            self._highlight_search_cursor = idx + len(word_text)
+            return (idx, len(word_text))
+        # sanitize_for_speech (text_prep.py) rewrites some punctuation before the text ever
+        # reaches the synthesizer — a colon/semicolon becomes a comma, "(" becomes ", ", ")"
+        # becomes "," — so a captured word like "there," never appears verbatim in the
+        # DISPLAYED text, which still has the original "there:". That made the exact match
+        # above fail and silently skip the word entirely. Falls back to the word's alphanumeric
+        # core (stripping whatever punctuation the synthesizer's copy ended up with) matched at
+        # a real word boundary in the original text, so the word still gets found and
+        # highlighted — just without whatever trailing/leading punctuation differed.
+        core = word_text.strip(string.punctuation)
+        if not core:
+            return None
+        pattern = re.compile(r"\b" + re.escape(core) + r"\b")
+        match = pattern.search(full_text, self._highlight_search_cursor)
+        if match is None:
+            match = pattern.search(full_text)
+        if match is None:
+            return None
+        self._highlight_search_cursor = match.end()
+        return (match.start(), len(core))
+
+    @objc.python_method
+    def _glyphRectForRange(self, loc, length):
+        lm = self.text_view.layoutManager()
+        tc = self.text_view.textContainer()
+        char_range = AppKit.NSMakeRange(loc, length)
+        # PyObjC returns a (result, out_param) TUPLE here, not a bare NSRange — the real ObjC
+        # signature's second argument is an NSRangePointer (NSRange*) out-param, and PyObjC
+        # surfaces "actualCharacterRange" as a second return value rather than accepting None
+        # and returning just the primary range. Confirmed directly: passing the whole tuple
+        # into boundingRectForGlyphRange_inTextContainer_ raised "depythonifying 'unsigned
+        # long long', got 'Foundation.NSRange'" — it silently killed every highlight update
+        # since the exception was swallowed inside the progress timer's block callback.
+        glyph_range, _actual_char_range = lm.glyphRangeForCharacterRange_actualCharacterRange_(char_range, None)
+        # A word that happens to fall exactly at a line-wrap point (most commonly one with a
+        # hyphen, which text layout treats as a valid break opportunity — no artificial
+        # hyphenation needed) can have its glyph range split across two lines. Confirmed via a
+        # real screenshot: highlighting "word-skipping" split across a wrap turned into two
+        # entire lines covered by one pill. boundingRectForGlyphRange_inTextContainer_ on the
+        # FULL range is the cause — for a range that continues onto another line, Cocoa's own
+        # bounding rect for the first line's portion extends to the line's right margin (same
+        # behavior as a multi-line text SELECTION highlight, which is exactly what this looks
+        # like), not to where the word's own glyphs actually end.
+        # lineFragmentRectForGlyphAtIndex_effectiveRange_'s effectiveRange is the glyph range
+        # that occupies the ENTIRE first line — intersecting glyph_range against it narrows to
+        # just the glyphs of THIS word that actually sit on that line, and getting the bounding
+        # rect for THAT narrowed range (not the line's own full-width fragment rect) gives a
+        # tight rect around just those glyphs, e.g. just "word-", not the whole line.
+        _first_line_rect, line_glyph_range = lm.lineFragmentRectForGlyphAtIndex_effectiveRange_(
+            glyph_range.location, None)
+        line_end = line_glyph_range.location + line_glyph_range.length
+        clipped_end = min(glyph_range.location + glyph_range.length, line_end)
+        clipped_range = AppKit.NSMakeRange(glyph_range.location, clipped_end - glyph_range.location)
+        rect = lm.boundingRectForGlyphRange_inTextContainer_(clipped_range, tc)
+        origin = self.text_view.textContainerOrigin()
+        return NSMakeRect(rect.origin.x + origin.x, rect.origin.y + origin.y, rect.size.width, rect.size.height)
+
+    @objc.python_method
+    def _ensureHighlightOverlay(self):
+        if self._highlight_overlay is None:
+            layer = Quartz.CALayer.layer()
+            layer.setHidden_(True)
+            # Parented to the scroll view's clip view, NOT text_view's own layer — a layer-backed
+            # NSView always composites its sublayers on top of its own drawn content, so a
+            # sublayer of text_view's layer can never sit behind its glyphs no matter what
+            # zPosition it's given. The clip view is text_view's real superview and sits behind
+            # it in the actual view hierarchy, so inserting a sibling sublayer below text_view's
+            # own layer there puts the pill genuinely behind the letters — text_view already
+            # draws no background (setDrawsBackground_(False)), which is what makes it visible.
+            self.scroll_view.contentView().layer().insertSublayer_below_(layer, self.text_view.layer())
+            self._highlight_overlay = layer
+        return self._highlight_overlay
+
+    @objc.python_method
+    def _applyWordHighlight(self, global_range, style):
+        loc, length = global_range
+        rect = self._glyphRectForRange(loc, length)
+        if style == "highlight":
+            self._revertPrevTextAttributes()
+            overlay = self._ensureHighlightOverlay()
+            shape = self.config.get("highlight_shape", "pill")
+            color_hex = self.config.get("highlight_color", self.DEFAULT_HIGHLIGHT_COLOR)
+            nscolor = self._hexToColor(color_hex)
+            # A small amount of horizontal padding — zero (an earlier attempt) was overcorrected,
+            # sitting air-tight against the word with no breathing room; the ORIGINAL 4.0 was
+            # the opposite problem (visibly bleeding past a word's own trailing punctuation into
+            # the following space). 2.0 is a middle ground: a few pixels of margin without
+            # reaching into the next word.
+            pad_h, pad_v = 2.0, 2.0
+            # The overlay is no longer a descendant of text_view (see _ensureHighlightOverlay),
+            # so its rect needs converting into the clip view's coordinate space.
+            conv_rect = self.text_view.convertRect_toView_(rect, self.scroll_view.contentView())
+            new_frame = NSMakeRect(conv_rect.origin.x - pad_h, conv_rect.origin.y - pad_v,
+                                    conv_rect.size.width + pad_h * 2, conv_rect.size.height + pad_v * 2)
+            animated = self.config.get("highlight_animation", "slide") == "slide"
+            AppKit.CATransaction.begin()
+            if animated:
+                AppKit.CATransaction.setAnimationDuration_(0.18)
+            else:
+                AppKit.CATransaction.setDisableActions_(True)
+            overlay.setBackgroundColor_(nscolor.colorWithAlphaComponent_(0.55).CGColor())
+            overlay.setCornerRadius_(4.0 if shape == "rounded" else new_frame.size.height / 2.0)
+            overlay.setFrame_(new_frame)
+            overlay.setHidden_(False)
+            AppKit.CATransaction.commit()
+        else:
+            self._hideHighlightOverlay()
+            self._applyTextStyleHighlight(loc, length, style)
+
+    @objc.python_method
+    def _revertRangeAttributes(self, storage, loc, length):
+        # Just the attribute changes — no beginEditing/endEditing of its own. Callers wrap
+        # this in their own edit transaction so a combined revert-then-apply (see
+        # _applyTextStyleHighlight) happens as ONE atomic edit instead of two separate ones.
+        if loc + length > storage.length():
+            return
+        rng = AppKit.NSMakeRange(loc, length)
+        # self._body_font (cached once at construction), NOT self.text_view.font() — the latter
+        # reflects the font at the current selection/insertion point, which sits wherever it was
+        # last left (e.g. position 0) and never moves during hands-off playback. Once the word
+        # under that point got bolded, .font() started returning bold for every subsequent call
+        # too — so "reverting" a word was actually re-applying bold instead of clearing it,
+        # which is why words stayed bold permanently once highlighted.
+        storage.addAttribute_value_range_(AppKit.NSFontAttributeName, self._body_font, rng)
+        storage.addAttribute_value_range_(AppKit.NSForegroundColorAttributeName, AppKit.NSColor.textColor(), rng)
+        storage.removeAttribute_range_(AppKit.NSUnderlineStyleAttributeName, rng)
+        storage.removeAttribute_range_(AppKit.NSUnderlineColorAttributeName, rng)
+        storage.removeAttribute_range_(AppKit.NSStrokeWidthAttributeName, rng)
+        storage.removeAttribute_range_(AppKit.NSStrokeColorAttributeName, rng)
+
+    @objc.python_method
+    def _applyTextStyleHighlight(self, loc, length, style):
+        thickness = self.config.get("highlight_underline_thickness", "single")
+        color_hex = self.config.get("highlight_color", self.DEFAULT_HIGHLIGHT_COLOR)
+        nscolor = self._hexToColor(color_hex)
+        storage = self.text_view.textStorage()
+        if loc + length > storage.length():
+            return
+        prev = self._highlight_prev_range
+        self._highlight_prev_range = None
+        # Revert the PREVIOUS word and apply the NEW word's styling as one atomic edit rather
+        # than two separate beginEditing/endEditing transactions — avoids a second edit landing
+        # in between and observing a half-updated state, since this runs as often as every 30ms.
+        storage.beginEditing()
+        if prev is not None:
+            self._revertRangeAttributes(storage, prev[0], prev[1])
+        rng = AppKit.NSMakeRange(loc, length)
+        if style == "bold":
+            # A true bold font (NSFont.boldSystemFontOfSize_) has WIDER glyph advances than
+            # regular weight for the same characters — confirmed directly (74.7pt vs 80.7pt for
+            # the same 11-letter word at 14pt) — so swapping fonts as each word gets highlighted
+            # shifted that word, and reflowed everything after it on the line, every single
+            # time. A negative NSStrokeWidthAttributeName is Cocoa's own "faux bold" technique:
+            # it fills AND strokes the glyph outline using the SAME (regular) font's metrics, so
+            # nothing reflows — confirmed the rendered width is pixel-identical to plain text.
+            storage.addAttribute_value_range_(AppKit.NSStrokeWidthAttributeName, self.HIGHLIGHT_BOLD_STROKE_WIDTH, rng)
+            storage.addAttribute_value_range_(AppKit.NSStrokeColorAttributeName, nscolor, rng)
+            storage.addAttribute_value_range_(AppKit.NSForegroundColorAttributeName, nscolor, rng)
+        elif style == "underline":
+            underline_style = AppKit.NSUnderlineStyleThick if thickness == "thick" else AppKit.NSUnderlineStyleSingle
+            storage.addAttribute_value_range_(AppKit.NSUnderlineStyleAttributeName, underline_style, rng)
+            storage.addAttribute_value_range_(AppKit.NSUnderlineColorAttributeName, nscolor, rng)
+            storage.addAttribute_value_range_(AppKit.NSForegroundColorAttributeName, nscolor, rng)
+        elif style == "color":
+            storage.addAttribute_value_range_(AppKit.NSForegroundColorAttributeName, nscolor, rng)
+        storage.endEditing()
+        self._highlight_prev_range = (loc, length)
+
+    @objc.python_method
+    def _revertPrevTextAttributes(self):
+        # Standalone revert (its own begin/end transaction) — used by the "highlight" style's
+        # CALayer-overlay path and by _clearWordHighlight, neither of which pairs it with a
+        # simultaneous new-range apply the way _applyTextStyleHighlight does, so there's no
+        # second edit landing right behind it to race against.
+        if self._highlight_prev_range is None:
+            return
+        loc, length = self._highlight_prev_range
+        self._highlight_prev_range = None
+        storage = self.text_view.textStorage()
+        storage.beginEditing()
+        self._revertRangeAttributes(storage, loc, length)
+        storage.endEditing()
+        self.text_view.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def _hideHighlightOverlay(self):
+        if self._highlight_overlay is not None:
+            self._highlight_overlay.setHidden_(True)
+
+    @objc.python_method
+    def _clearWordHighlight(self):
+        self._invalidateHighlightTimer()
+        self._highlight_word_index = -1
+        self._highlight_chunk_index = None
+        self._highlight_search_cursor = 0
+        self._hideHighlightOverlay()
+        self._revertPrevTextAttributes()
 
     @objc.python_method
     def _scrubberDragged(self, fraction):
+        # Freeze the highlight for the duration of the drag — audio keeps playing in the
+        # background during a scrub (this never touches self.player), so left running the timer
+        # chain would keep advancing the highlight against the real position while the scrubber
+        # thumb shows the dragged one. _scrubberReleased -> _seekToVirtualTime -> a landing in
+        # _beginChunkPlayback resyncs once the real seek actually lands.
+        self._invalidateHighlightTimer()
         self.is_scrubbing = True
         total = self._totalEstimatedDuration() if self.all_chunks else 0.0
         current = fraction * total
@@ -2848,8 +5544,12 @@ class AppDelegate(NSObject):
         self.is_scrubbing = False
         if not self.all_chunks:
             return
+        # A scrub/click on the timeline while playback was already stopped or paused should
+        # land at the new position without starting it; only scrubbing WHILE actively playing
+        # should keep playing after.
+        should_play = self.player is not None and self.player.isPlaying()
         total = self._totalEstimatedDuration()
-        self._seekToVirtualTime(fraction * total)
+        self._seekToVirtualTime(fraction * total, should_play=should_play)
 
     @objc.python_method
     def _syncPlaybackUI(self):
@@ -2951,6 +5651,9 @@ class AppDelegate(NSObject):
             except Exception:
                 traceback.print_exc(file=sys.stderr)
             self._rec_preview_player = None
+        if self._rec_script_fade_observer is not None:
+            AppKit.NSNotificationCenter.defaultCenter().removeObserver_(self._rec_script_fade_observer)
+            self._rec_script_fade_observer = None
         if self.overlay is None:
             return
         overlay = self.overlay
