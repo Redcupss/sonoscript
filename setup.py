@@ -1,8 +1,17 @@
 import glob
 import os
+import sys
 import sysconfig
 
 from setuptools import setup
+
+# py2app's modulegraph walks the import graph AND recursively descends each module's own AST
+# to find nested imports — for a dependency this deep (transformers/mlx_audio have very long
+# import chains plus large, deeply-nested source files), the two recursions compound and blow
+# Python's default limit of 1000 partway through the scan (RecursionError inside
+# modulegraph's own ast.NodeVisitor, not in any of this project's code). Bumped well above
+# what a real build has been observed to need.
+sys.setrecursionlimit(10000)
 
 APP = ["main.py"]
 

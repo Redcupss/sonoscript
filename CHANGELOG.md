@@ -4,6 +4,57 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.10.0] (build 35) — 2026-08-01
+
+### Added
+- **Live word-highlighting during playback**, System voice for now: the word currently being
+  spoken is tracked and highlighted in real time as it plays. Word timing is captured during
+  the same offline render that already produces the WAV bytes — not a separate muted
+  synthesizer pass, which was the original plan but was directly measured to drift out of
+  sync with the real audible pass by up to ~400ms per word. Each word's own highlight is
+  scheduled individually against its exact captured start time (event-driven), rather than
+  polled on a fixed interval, so a word's highlight moment can never fall through the cracks
+  between two polls no matter how short that word is. A word whose text gets rewritten by the
+  TTS sanitizer before reaching the synthesizer (a colon or parenthesis becomes a comma) still
+  matches and highlights correctly via a punctuation-tolerant fallback. The highlight fires
+  120ms ahead of the word's actual audio onset — closer to how a reader's eyes move ahead of
+  what's currently being spoken than an exact-sync timestamp would feel.
+- **Personalization settings**: choose the highlight style (Highlight, Bold, Underline, Text
+  Color, or Off), shape (Rounded or Pill), color, and word-to-word animation (Snap or Slide),
+  with a live preview.
+- **Volume control** on the playback bar.
+- **Permanent save-location**: promote any Recordings entry to a permanent folder via
+  right-click, with the folder itself chosen in Settings > File Location. Deleting a
+  recording now asks for confirmation first, and each entry's metadata sidecar is hidden from
+  Finder (dot-prefixed) so the folder reads as a clean list of recordings.
+- **Recordings screen**: History and Saved are now one screen with an animated sliding pill
+  tab selector, instead of two separate screens.
+
+### Fixed
+- A highlighted word could stay visually bold permanently instead of clearing once the next
+  word started — traced to `NSTextView.font()` reflecting the font at the current
+  selection/insertion point rather than being a stable reference to the view's base font;
+  once any word was bolded, every later "revert to normal" call was silently re-applying bold
+  instead of clearing it.
+- The highlight pill rendered in front of the text instead of behind it. A layer-backed
+  view's sublayers always composite on top of that view's own drawn content, so the overlay
+  had to move to a real ancestor elsewhere in the view hierarchy instead of being parented to
+  the text view's own layer.
+- A word landing exactly at a line-wrap point (most often one with a hyphen, which text
+  layout treats as a valid break point) could highlight two entire lines at once instead of
+  just that word.
+- Bold highlighting visibly reflowed surrounding text as the highlighted word changed — a
+  true bold font has measurably wider glyphs than regular weight at the same size. Replaced
+  with a stroke-width-based faux bold that keeps the exact same layout width.
+- Per-provider voice memory (remembering the last voice picked for System vs. Chatterbox vs.
+  Sesame independently) could silently reset to that provider's first voice: any lookup miss
+  was being persisted as if it were the real remembered choice, permanently overwriting it.
+- Using the position scrubber started playback even if it had been stopped beforehand —
+  scrubbing/skipping now only resumes playback if it was already playing.
+
+### Changed
+- The Italic highlight style was removed; visual quality wasn't good enough to keep.
+
 ## [1.9.0] (build 34) — 2026-07-30
 
 ### Added

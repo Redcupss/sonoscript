@@ -48,8 +48,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.9.0"
-APP_BUILD = "34"
+APP_VERSION = "1.10.0"
+APP_BUILD = "35"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())

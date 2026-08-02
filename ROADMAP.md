@@ -11,7 +11,21 @@ below gets picked.
 
 ## Planned
 
-Nothing queued yet.
+- **Extend word-highlight to cloned voices** (Chatterbox, Sesame) via forced
+  alignment. The live word-highlighting engine (1.10.0) only works for
+  System voice right now, since it relies on `AVSpeechSynthesizer`'s own
+  word-boundary callbacks during synthesis — Chatterbox and Sesame have no
+  equivalent, so this needs a real forced-alignment step (aligning the
+  generated audio back to the source text) instead. Since Chatterbox is the
+  default provider, the highlight feature currently has no effect for most
+  actual use until this lands.
+- **Drag-and-drop import** into the Recordings screen's Saved tab, from
+  Finder. Deprioritized when the rest of the permanent save-location
+  feature (1.10.0) shipped; the promote-from-History and File Location
+  pieces landed without it.
+- **Check `PulsingLabel`** for the same resize-frame-lock bug that was
+  found and fixed in `ShimmerBorderView` — never actually investigated,
+  just flagged as worth checking given the two widgets are similar.
 
 ## Ideas / maybe
 
