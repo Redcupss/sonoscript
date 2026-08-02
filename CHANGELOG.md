@@ -4,7 +4,7 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
-## [1.10.0] (build 35) — 2026-08-01
+## [1.11.0] (build 36) — 2026-08-01
 
 ### Added
 - **Live word-highlighting during playback**, System voice for now: the word currently being
@@ -54,6 +54,60 @@ build number increments once per release regardless of version bump.
 
 ### Changed
 - The Italic highlight style was removed; visual quality wasn't good enough to keep.
+
+## [1.10.0] (build 35) — 2026-07-30
+
+### Added
+- **Sesame voice cloning is fully usable now**, completing the tier gated behind the license
+  key in 1.9.0: real cloned speech generation for the three built-in voices (Sadie, Manny,
+  Ben — Ben is the developer's own reference clip, labeled that way everywhere rather than a
+  real name); a recording flow ("Create your own..." in the voice menu) that walks through
+  reading a fixed script with a live level meter, validates the take (too short, silent,
+  clipped), and lets you listen back and name it before saving; and a dedicated Manage Voices
+  screen (from the wordmark menu whenever Sesame is active) to rename or delete any custom
+  voice, with a two-step confirm before deleting.
+- **"Generating..." now shows real animated progress** — a looping shimmer sweep across the
+  status text and along the text card's border — instead of a static message with no
+  indication anything is happening.
+- Backend for a "recent generations" cache: a completed generation is saved automatically
+  once playback reaches its natural end (an interrupted take never surfaces). No browsing UI
+  yet — that shipped in 1.11.0 as the Recordings screen.
+
+### Changed
+- Voice/menu dropdowns (System's voice list, ElevenLabs' library, any long list): the
+  selected row now gets its own persistent highlight, visible even at rest — previously the
+  only difference was slightly brighter text, easy to miss and identical to a hovered row.
+  Reopening a dropdown also now centers on the current selection instead of always
+  scrolling back to the top.
+- Sesame's main-screen label changed from "Cloned voices" to "Premium offline voices"; the
+  welcome screen's key-entry placeholder changed from "Sesame license key" to "SonoScript
+  license key".
+- **Kokoro removed entirely.** It was fully replaced by Chatterbox back in 1.8.0, but its
+  ~121MB model/dictionary bundle and Kokoro-only dependencies were still being packaged with
+  every build. The one-time config migration (any install still holding an old "Kokoro"
+  provider value switches to Chatterbox automatically) stays in place.
+- Closing the app window no longer quits the app — only Quit does, matching standard Mac
+  behavior, and letting an in-progress background save actually finish instead of being cut
+  off.
+
+### Fixed
+- The status label could stay red after an error even once the error condition had cleared.
+- Saving a recorded voice could fail silently — the error message was rendering behind the
+  still-open recording card. A successful save now also shows a brief confirmation instead
+  of just closing without any feedback.
+- The recording flow blocked closing the whole flow (backdrop-click/Esc) even after the
+  microphone had already stopped recording — now only blocks while a real mic stream is
+  actually open.
+- Two bugs in the recording flow's own Cancel/Save cleanup could leave the flow stuck open
+  if closing the mic stream or the preview player raised an error.
+- Renaming a voice in Manage Voices could fail silently — the code tried to attach data
+  directly to a native macOS text field, which isn't allowed for a plain (non-custom)
+  control in this app's framework, the same class of bug already documented elsewhere in
+  this codebase.
+- Long documents (many chunks) could crash mid-read with "no Stream(gpu, 2) in current
+  thread" — every chunk used to spawn its own new thread into the local voice engine,
+  eventually exceeding a per-thread resource limit; now one persistent worker thread
+  handles every chunk instead.
 
 ## [1.9.0] (build 34) — 2026-07-30
 
