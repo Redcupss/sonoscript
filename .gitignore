@@ -5,3 +5,6 @@ dist/
 __pycache__/
 *.pyc
 .DS_Store
+# Downloaded on demand (see sesame_download.py) — 2GB+ of model weights, already distributed
+# as a GitHub Release asset. Never belongs in git history.
+sesame_assets/

@@ -81,6 +81,33 @@ def _pause_out_symbols(text):
 # "  " line — two bare spaces — sitting between two truly empty ones).
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
 _ENDS_WITH_TERMINAL_PUNCT_RE = re.compile(r"[.!?:;]\s*$")
+_ENDS_WITH_PAUSE_PUNCT_RE = re.compile(r"[.!?:;,]\s*$")
+# A poem's line break and a title glued directly onto its paragraph (no blank line between
+# them, so _PARAGRAPH_SPLIT_RE never sees a boundary there at all) both reach this point as a
+# bare "\n" with no textual meaning the model recognizes — it either garbles the line join or
+# (matching this app's already-documented Sesame/Chatterbox instability) hallucinates outright
+# on it, confirmed against real poetry test input. But a line break can ALSO be a plain
+# word-wrapped sentence, split purely by the source document's line width, not a real pause —
+# confirmed separately against a real pasted book excerpt where treating every line break as a
+# pause chopped ordinary sentences in half. The distinguishing signal used here is the same
+# one a human reader uses: a wrapped sentence continues onto a lowercase word; a poem line or
+# an unpunctuated title starts a fresh, capitalized thought with nothing carrying it forward.
+_STARTS_NEW_THOUGHT_RE = re.compile(r'^["\'“‘(]*[A-Z]')
+
+
+def _pause_out_line_breaks(paragraph):
+    lines = [ln.strip() for ln in paragraph.split("\n") if ln.strip()]
+    if not lines:
+        return ""
+    pieces = [lines[0]]
+    for line in lines[1:]:
+        prev = pieces[-1]
+        if _ENDS_WITH_PAUSE_PUNCT_RE.search(prev) or not _STARTS_NEW_THOUGHT_RE.match(line):
+            pieces[-1] = f"{prev} {line}"
+        else:
+            pieces[-1] = f"{prev},"
+            pieces.append(line)
+    return " ".join(pieces)
 
 
 def normalize_paragraph_breaks(text):
@@ -94,6 +121,7 @@ def normalize_paragraph_breaks(text):
     already have one — makes each one its own proper sentence/chunk boundary, without asking
     the user to reformat anything themselves."""
     paragraphs = [p.strip() for p in _PARAGRAPH_SPLIT_RE.split(text) if p.strip()]
+    paragraphs = [_pause_out_line_breaks(p) for p in paragraphs]
     fixed = [p if _ENDS_WITH_TERMINAL_PUNCT_RE.search(p) else p + "." for p in paragraphs]
     return " ".join(fixed)
 

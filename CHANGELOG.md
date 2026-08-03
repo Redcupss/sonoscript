@@ -4,6 +4,51 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.11.2] (build 38) — 2026-08-03
+
+### Fixed
+- **Poetry and other unpunctuated line breaks garbling or hallucinating Sesame output**, and
+  taking far longer than expected to generate. Root cause: `normalize_paragraph_breaks` only
+  ever recognized a blank-line gap as a paragraph break — a poem's line breaks (or a title
+  glued directly onto its paragraph with no blank line between them) reached the model as
+  literal, un-mapped `\n` characters. Confirmed directly: real generation on a test poem
+  fragmented into 5-6 separate internal segments and took 12-19s, versus one clean pass in
+  3-8s once fixed — reproduced twice, including once with a corrected reference-voice
+  transcript. Fixed by treating a bare line break as a soft pause (comma) when the next line
+  starts a new capitalized thought, while leaving a plain word-wrapped sentence (next line
+  starts lowercase — a document's own line-wrap artifact, not a real break) untouched, exactly
+  as before.
+- **Sesame's generation quality check had no upper bound.** It already retried a too-slow
+  (runaway) generation, but a too-fast, truncated/garbled one passed silently on the first
+  attempt — confirmed directly: one generation at 49.4 chars/sec (more than double the
+  established 15.2-20.5 chars/sec good range) sailed through with a Whisper transcription that
+  didn't match the input at all. Added a matching upper bound so both failure directions retry.
+
+### Added
+- **Auto-scroll during playback.** The document now scrolls to keep the current reading
+  position in view as playback advances — proactively, before it reaches the bottom of the
+  visible area, rather than only after. Word-level precision for System voice; chunk-level for
+  Chatterbox/Sesame, which don't have word timing yet.
+
+## [1.11.1] (build 37) — 2026-08-03
+
+### Fixed
+- **Sesame playback cutting off the last syllable of a clip.** Confirmed via word-level Whisper
+  transcription that the underlying generated/saved audio was already complete — the loss was
+  happening in playback, not generation. Root cause is a known AVAudioPlayer/CoreAudio quirk
+  where the very tail of a short buffer can get clipped during output flush, independent of
+  what's actually in the file. Fixed by padding 300ms of trailing silence onto the buffer handed
+  to the player (not the saved file on disk — History/Saved content is untouched) immediately
+  before playback begins.
+- **"SonoScript is damaged and can't be opened"** on first launch for anyone downloading via a
+  browser. Root cause: the build script copies additional files (the `mlx` package, some
+  dist-info) into the app bundle *after* py2app's own automatic ad-hoc code-signing pass, which
+  silently invalidated the signature's sealed-resource manifest — confirmed directly via
+  `spctl -a -vv` reporting "a sealed resource is missing or invalid." A broken signature is
+  treated more harshly by Gatekeeper than no signature at all, producing the "damaged" dialog
+  (no Settings override) instead of the milder "unidentified developer" dialog. Fixed by
+  re-signing the app as the very last build step, after every post-py2app bundle change.
+
 ## [1.11.0] (build 36) — 2026-08-01
 
 ### Added

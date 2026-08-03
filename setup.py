@@ -149,3 +149,18 @@ if os.path.isdir(_mlx_src) and not os.path.exists(_mlx_dest):
             os.path.basename(m))
         shutil.copytree(m, dest, symlinks=False)
         print(f"Copied mlx dist-info: {m} -> {dest}")
+
+# py2app applies its own ad-hoc code signature during setup() above, but everything in this
+# file after that point (deleting the bogus parselmouth.py, copying the mlx tree + dist-info
+# in verbatim) modifies the bundle's contents afterward — which invalidates that signature's
+# sealed-resource manifest (confirmed directly: `spctl -a -vv` on a build from before this fix
+# reported "a sealed resource is missing or invalid"). A signature that's present but broken is
+# treated WORSE than no signature at all — Gatekeeper shows "is damaged and can't be opened,
+# move to Trash" with no Settings-based override, instead of the milder "unidentified
+# developer" dialog with an Open Anyway button, which is what any ad-hoc-signed (even
+# non-notarized) app gets. Re-signing here, after every bundle mutation above, means the seal
+# actually matches what ships.
+import subprocess
+_app_path = os.path.join("dist", "SonoScript.app")
+subprocess.run(["codesign", "--force", "--deep", "--sign", "-", _app_path], check=True)
+print(f"Re-signed (ad-hoc) after post-setup bundle changes: {_app_path}")

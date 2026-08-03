@@ -32,7 +32,7 @@ from Foundation import (
 )
 
 from chunking import chunk_text, CHUNK_TARGET_CHARS, chatterbox_chunk_target
-from config import load_config, save_config, sesame_voices_path
+from config import SESAME_ASSETS_DIR, load_config, save_config, sesame_voices_path
 import history
 import saved
 from text_prep import sanitize_for_speech, normalize_paragraph_breaks
@@ -48,11 +48,41 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.11.2"
 APP_BUILD = "36"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+# Belt-and-suspenders alongside SSL_CONTEXT above: SSL_CONTEXT only covers urlopen() calls this
+# app makes directly. Third-party libraries (confirmed directly: huggingface_hub, via httpx,
+# when transformers' AutoTokenizer falls back to a network lookup) build their OWN SSL context
+# via the stdlib ssl module directly, which doesn't know about SSL_CONTEXT at all — but does
+# respect these two env vars, so setting them process-wide covers every such case at once
+# instead of needing to patch each library's own networking code individually.
+# A plain assignment, NOT setdefault(): confirmed directly, via a diagnostic print in a real
+# packaged build, that py2app's own bootstrap already sets SSL_CERT_FILE/SSL_CERT_DIR to a
+# bogus, nonexistent placeholder (Contents/Resources/openssl.ca/no-such-file) before this line
+# ever runs — setdefault() saw a value already present and silently kept that broken one instead
+# of certifi's real bundle, which is exactly why this fix looked correct but never actually took
+# effect in the shipped app.
+os.environ["SSL_CERT_FILE"] = certifi.where()
+os.environ["SSL_CERT_DIR"] = os.path.dirname(certifi.where())
+# Sesame's model code loads a LLaMA3 tokenizer and an audio codec ("Mimi") separately, each by
+# HuggingFace repo id, independent of the CSM model weights themselves (see the long comment in
+# _sesameEngine). These MUST be set here, at module load — before literally anything else in
+# this file runs — not lazily inside _sesameEngine() right before importing mlx_audio: confirmed
+# directly that huggingface_hub bakes some of these into its own module-level constants at
+# IMPORT time (so setting them any later than a module's first import has zero effect for the
+# rest of the process), while ANOTHER of its own code paths (hf_hub_download, used by the Mimi
+# codec specifically) has its own independent default that isn't fully governed by the env var
+# at all under some call shapes — trying to chase each individual code path's own exact timing/
+# precedence quirk inside _sesameEngine() proved unreliable across two separate rebuild-and-
+# retest rounds. Setting these unconditionally, this early, removes the ordering question
+# entirely: nothing in this whole process can import huggingface_hub before this line runs.
+os.environ["HF_HOME"] = os.path.join(SESAME_ASSETS_DIR, "hf_cache")
+os.environ["HF_HUB_CACHE"] = os.path.join(SESAME_ASSETS_DIR, "hf_cache", "hub")
+os.environ["TRANSFORMERS_CACHE"] = os.path.join(SESAME_ASSETS_DIR, "hf_cache", "hub")
+os.environ["HF_HUB_OFFLINE"] = "1"
 PLACEHOLDER_TEXT = "Paste text here (⌘V)..."
 SHADOW_OPACITY = 0.6  # About/Update card drop shadow
 
@@ -142,6 +172,14 @@ SESAME_VOICES = [
 # spread than Chatterbox showed even before its own instability was found. Thresholds are
 # provisional (based on a small sample) pending more real-world usage data.
 SESAME_MIN_CHARS_PER_SEC = 11.5
+# The check used to be floor-only — catches runaway/bloated generation (too SLOW) but nothing
+# stopped a too-FAST, truncated/garbled generation from passing on its very first attempt.
+# Confirmed as a real, separate gap (not the same bug as the floor guards against): a clean,
+# well-formed input still produced one generation at 49.4 chars/sec — more than double the
+# 15.2-20.5 range above — whose Whisper transcription didn't match the input text at all.
+# Headroom above 20.5 chosen to match the floor's own proportional margin below 15.2 (roughly
+# 24% in both directions).
+SESAME_MAX_CHARS_PER_SEC = 26.0
 SESAME_MIN_CHARS_FOR_CHECK = 50
 # A real, isolated-process 16-trial batch measured this failure mode at a ~44% per-attempt
 # rate (confirmed a known, unfixed CSM base-model bug — see _generateSesameAudio) — at the
@@ -1254,7 +1292,34 @@ class AppDelegate(NSObject):
         self.continue_btn.layer().setBorderWidth_(1.0)
         self._updateContinueState()
 
-        extras = [icon_bg, title, tagline, caption, self.key_field_box, self.continue_btn]
+        # Shown in continue_btn's exact slot only while sesame_assets (the ~1.6GB CSM model +
+        # stock voices) are being downloaded after a valid Sesame key is entered — see
+        # _validateKeyWorker/sesameDownloadProgressMain_. Same slot-swap idea as
+        # system_info_label replacing key_field for keyless providers: one state visible at a
+        # time in the same spot, not a separate area of the screen to make room for.
+        self.sesame_download_box = AppKit.NSView.alloc().initWithFrame_(
+            NSMakeRect(mx - field_w / 2.0, my - 175, field_w, 38))
+        self.sesame_download_box.setWantsLayer_(True)
+        # Genuinely opaque, NOT the white(alpha) helper — white() is white-at-alpha, so even
+        # white(0.04) is a barely-there tint that let continue_btn's own text show straight
+        # through it once brought to front. colorWithWhite_alpha_(_, 1.0) is fully opaque at
+        # this same dark brightness, actually hiding what's behind it.
+        self.sesame_download_box.layer().setBackgroundColor_(
+            AppKit.NSColor.colorWithWhite_alpha_(0.08, 1.0).CGColor())
+        self.sesame_download_box.layer().setCornerRadius_(9.0)
+        self.sesame_download_box.layer().setMasksToBounds_(True)  # clips the bottom progress bar to the rounded corners
+        self.sesame_download_box.setHidden_(True)
+        self.sesame_download_label = make_label(
+            "Downloading Sesame voices…", 11, 0.7, align=AppKit.NSTextAlignmentCenter)
+        self.sesame_download_label.setFrame_(NSMakeRect(0, 12, field_w, 14))  # vertically centered in the 38pt box
+        self.sesame_download_box.addSubview_(self.sesame_download_label)
+        # A thin accent strip along the bottom edge, not a full-height bar — same track/fill
+        # widget as the mic level meter, just much shorter.
+        self.sesame_download_bar = LevelMeterView.alloc().initWithFrame_(NSMakeRect(0, 0, field_w, 3))
+        self.sesame_download_bar.configure()
+        self.sesame_download_box.addSubview_(self.sesame_download_bar)
+
+        extras = [icon_bg, title, tagline, caption, self.key_field_box, self.continue_btn, self.sesame_download_box]
         if can_cancel:
             # same look as before (font/colors/hover untouched) — just moved from the top-left
             # corner to directly under Continue
@@ -1367,7 +1432,7 @@ class AppDelegate(NSObject):
         if self.provider == "Chatterbox":
             return "A higher-quality offline voice, built into the app.\nFree, no account needed, no downloads required."
         if self.provider == "Sesame":
-            return "Clone your own voice — offline, private to this Mac.\nPaste the license key from your purchase."
+            return "Clone your own voice — offline, private to this Mac.\nPaste your license key (first time downloads ~1.6GB)."
         return ("Connect a text-to-speech provider to get started.\n"
                 "Paste an API key from your provider's account page.")
 
@@ -1562,6 +1627,11 @@ class AppDelegate(NSObject):
         if not key:
             return
         self.continue_btn.setEnabled_(False)
+        # Sesame's worker can take a while (a fresh ~1.6GB asset download, see below) — without
+        # also disabling the field, Enter still fires saveApiKey_ again mid-download (the
+        # field's own action, independent of continue_btn), spinning up a second worker that
+        # downloads into the same temp files as the first.
+        self.key_field.setEnabled_(False)
         threading.Thread(target=self._validateKeyWorker, args=(key, self.provider), daemon=True).start()
 
     @objc.python_method
@@ -1579,6 +1649,28 @@ class AppDelegate(NSObject):
                     self.performSelectorOnMainThread_withObject_waitUntilDone_(
                         "keyValidationFailedMain:", str(e), False)
                     return
+                import sesame_download
+                if not sesame_download.sesame_assets_ready():
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "sesameDownloadStartingMain:", None, False)
+                    # Marshaling every 1MB chunk to the main thread would be ~1600 dispatches
+                    # for the full download — cheap individually, but pointless that often;
+                    # only crossing a whole percentage point actually changes what's on screen.
+                    last_reported = -1
+
+                    def on_progress(downloaded, total):
+                        nonlocal last_reported
+                        pct = int(downloaded * 100 / total) if total else 0
+                        if pct != last_reported:
+                            last_reported = pct
+                            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                                "sesameDownloadProgressMain:", {"downloaded": downloaded, "total": total}, False)
+                    try:
+                        sesame_download.download_sesame_assets(progress_cb=on_progress)
+                    except sesame_download.DownloadError as e:
+                        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                            "sesameDownloadFailedMain:", str(e), False)
+                        return
             # "Other": no known shape to validate against; accept as entered
         except urllib.error.HTTPError as e:
             msg = (
@@ -1595,9 +1687,53 @@ class AppDelegate(NSObject):
 
     def keyValidationFailedMain_(self, message):
         try:
+            self.key_field.setEnabled_(True)
+            self.continue_btn.setEnabled_(True)
             self.key_field.setStringValue_("")  # clear the rejected key
             self.key_field.setPlaceholderString_("")  # don't let it show through the error text
             self._updateContinueState()
+            self._flashInlineError(self.key_error_label, str(message))
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
+    def sesameDownloadStartingMain_(self, _):
+        try:
+            self.sesame_download_label.setStringValue_("Downloading Sesame voices…")
+            self.sesame_download_bar.setLevel_(0.0)
+            self.sesame_download_box.setHidden_(False)
+            # setHidden_ alone was confirmed (via direct testing) to not reliably take visual
+            # effect for continue_btn in this window — re-adding an already-present subview
+            # moves it to the front of the z-order, which AppKit DOES respect here regardless.
+            # sesame_download_box has its own opaque background (see construction above), so
+            # bringing it to front fully covers continue_btn — both visually and for hit-testing,
+            # since the frontmost view at a given point wins mouse clicks — without depending on
+            # continue_btn's hidden flag actually working.
+            self.sesame_download_box.superview().addSubview_(self.sesame_download_box)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
+    def sesameDownloadProgressMain_(self, payload):
+        try:
+            downloaded = float(payload["downloaded"])
+            total = float(payload["total"]) or 1.0
+            gb = lambda n: f"{n / (1024 ** 3):.2f} GB"
+            self.sesame_download_label.setStringValue_(
+                f"Downloading Sesame voices — {gb(downloaded)} / {gb(total)}")
+            self.sesame_download_bar.setLevel_(downloaded / total)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
+    def sesameDownloadFailedMain_(self, message):
+        try:
+            self.sesame_download_box.setHidden_(True)
+            self.continue_btn.superview().addSubview_(self.continue_btn)  # bring back to front — see sesameDownloadStartingMain_
+            self.key_field.setEnabled_(True)
+            self.continue_btn.setEnabled_(True)
+            # Unlike keyValidationFailedMain_, the key itself was valid — only the download
+            # failed (network hiccup, etc.) — clearing a perfectly good key here just to force
+            # retyping it would be actively unhelpful, so it's left in place. Continue re-runs
+            # saveApiKey_ from scratch, which re-validates (fast, local) then retries the
+            # download, since sesame_assets_ready() still reads false.
             self._flashInlineError(self.key_error_label, str(message))
         except Exception:
             traceback.print_exc(file=sys.stderr)
@@ -2435,14 +2571,22 @@ class AppDelegate(NSObject):
         return buf.getvalue()
 
     @objc.python_method
+    def _sesameAssetsBase(self):
+        # sesame_assets/ (the CSM model + its 5 stock voice clips, ~1.6GB) is too large to
+        # bundle in the app itself, so it's downloaded on demand the first time a valid
+        # Sesame key is entered (see sesame_download.py) — that download location takes
+        # priority since it's where a real distributed build actually gets its assets from.
+        # The bundled Resources path is kept as a fallback for dev convenience / in case a
+        # future build ever bundles it directly. Returns None if neither has anything yet,
+        # which the two callers below both already handle (live-repo-id / missing-file).
+        if os.path.isdir(SESAME_ASSETS_DIR):
+            return SESAME_ASSETS_DIR
+        bundled = self._resourcePath("sesame_assets")
+        return bundled if os.path.isdir(bundled) else None
+
+    @objc.python_method
     def _sesameEngine(self):
-        # Same lazy-load-with-lock shape as _chatterboxEngine. NOTE: sesame_assets/ isn't
-        # bundled yet — this is still dev-mode-only wiring, deliberately using whatever's
-        # already in this machine's own huggingface cache (network access allowed here,
-        # unlike the frozen/offline app) rather than a bundled snapshot path. Replace the
-        # fallback branch with a real bundled-snapshot resolution (matching
-        # _chatterboxEngine exactly) once sesame_assets/ is actually packaged — bundle the
-        # 8bit snapshot specifically (see csm-1b-8bit below), not the fp one.
+        # Same lazy-load-with-lock shape as _chatterboxEngine.
         #
         # 8bit, not the full-precision csm-1b: confirmed directly, 8 isolated-process trials
         # each — fp had a 38% "runaway generation" rate (audio 2-4x too long, garbled) and
@@ -2459,15 +2603,62 @@ class AppDelegate(NSObject):
             return self._sesame_engine
         with self._sesame_lock:
             if self._sesame_engine is None:
+                base = self._sesameAssetsBase()
+                # Unlike Chatterbox, Sesame's own model code (mlx_audio/tts/models/sesame/
+                # sesame.py) separately loads a LLaMA3 tokenizer by REPO ID
+                # ("unsloth/Llama-3.2-1B"), not a local path — passing load_model() a local
+                # snapshot dir (below) has no effect on that second, independent lookup, so it
+                # always goes through transformers' AutoTokenizer.from_pretrained(), which
+                # checks the standard HF cache directories before ever considering the network.
+                # Pointing those directories at our downloaded/bundled sesame_assets (which
+                # includes this tokenizer's own cache entry — see sesame_download.py) makes that
+                # lookup resolve locally instead. Confirmed directly: without this, a user whose
+                # personal ~/.cache/huggingface doesn't happen to already have this tokenizer
+                # (i.e. everyone except this dev machine, which had it cached from earlier,
+                # unrelated work) hits a real network call — which then fails outright in the
+                # packaged app, since httpx's own SSL context creation can't find the system
+                # certificate store there either. HF_HUB_OFFLINE is set too, as a hard backstop —
+                # per _chatterboxEngine's own comment, the env var alone isn't a reliable
+                # guarantee, but combined with an actual local cache hit here, there's no
+                # fallback path left for it to need to guarantee anything about.
+                #
+                # MUST happen before the `import mlx_audio.tts.utils` below, not after: that
+                # import pulls in huggingface_hub as a side effect, and huggingface_hub reads
+                # these exact env vars into its OWN module-level constants at import time (see
+                # its constants.py) — once imported, later os.environ changes have zero effect
+                # for the rest of the process. Confirmed directly: this exact ordering mistake
+                # (env vars set after the import) silently no-ops the whole fix below, while
+                # looking identical to a working fix in a standalone test script that happened
+                # to set them first.
+                if base:
+                    hf_cache_dir = os.path.join(base, "hf_cache")
+                    os.environ["HF_HOME"] = hf_cache_dir
+                    os.environ["HF_HUB_CACHE"] = os.path.join(hf_cache_dir, "hub")
+                    os.environ["TRANSFORMERS_CACHE"] = os.path.join(hf_cache_dir, "hub")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
                 from mlx_audio.tts.utils import load_model
-                hub_dir = self._resourcePath(
-                    "sesame_assets", "hf_cache", "hub",
-                    "models--mlx-community--csm-1b-8bit", "snapshots")
-                if os.path.isdir(hub_dir):
+                hub_dir = os.path.join(
+                    base, "hf_cache", "hub", "models--mlx-community--csm-1b-8bit", "snapshots") if base else None
+                if hub_dir and os.path.isdir(hub_dir) and os.listdir(hub_dir):
                     snapshot_dir = os.path.join(hub_dir, os.listdir(hub_dir)[0])
                 else:
+                    # No downloaded/bundled snapshot found — this machine's own dev-time HF
+                    # cache (if any) or a live network fetch. Only ever reached in dev mode or
+                    # if a licensed user somehow reaches Sesame generation without having gone
+                    # through the download flow in _validateKeyWorker, which shouldn't happen.
                     snapshot_dir = "mlx-community/csm-1b-8bit"
-                self._sesame_engine = load_model(snapshot_dir)
+                # model_type explicitly forced to "sesame", not inferred: mlx_audio normally
+                # guesses the architecture from a hint embedded in the model's *name string*
+                # (e.g. "csm" in "mlx-community/csm-1b-8bit" hints at the sesame architecture)
+                # — a raw local snapshot path (a hash-named directory) carries no such hint, so
+                # it falls through to the model's own config.json, whose "model_type" field is
+                # "sam" (an upstream naming quirk, not something wrong with the download) and
+                # isn't a registered architecture, raising "Model type sam not supported".
+                # Confirmed directly: this only ever surfaced once a local snapshot path was
+                # actually reachable for the first time (via the download feature below) — the
+                # live-repo-id fallback string above always happened to carry the "csm" hint by
+                # accident, masking this same bug in every case tested before now.
+                self._sesame_engine = load_model(snapshot_dir, model_type="sesame")
         return self._sesame_engine
 
     @objc.python_method
@@ -2498,12 +2689,22 @@ class AppDelegate(NSObject):
         for attempt in range(SESAME_MAX_RETRIES + 1):
             results = list(engine.generate(
                 text=text, ref_audio=ref_audio, ref_text=ref_text, max_audio_length_ms=max_ms))
+            # A genuinely empty result (the model emitted zero audio frames — confirmed directly
+            # to happen even on ordinary short text, not just long runaway-prone chunks, since
+            # this is CSM's own base-model instability, same root cause as the runaway case
+            # below) used to reach np.concatenate([]) and crash with "need at least one array to
+            # concatenate" instead of retrying — the length-gated check below only ever
+            # protected long text, leaving short text with zero retry protection at all.
+            if not results:
+                if attempt == SESAME_MAX_RETRIES:
+                    raise RuntimeError("Sesame produced no audio for this text after retrying.")
+                continue
             audio = np.concatenate([np.array(r.audio) for r in results])
             sample_rate = results[0].sample_rate
             if len(text) < SESAME_MIN_CHARS_FOR_CHECK or attempt == SESAME_MAX_RETRIES:
                 return audio, sample_rate
             chars_per_sec = len(text) / (len(audio) / sample_rate)
-            if chars_per_sec >= SESAME_MIN_CHARS_PER_SEC:
+            if SESAME_MIN_CHARS_PER_SEC <= chars_per_sec <= SESAME_MAX_CHARS_PER_SEC:
                 return audio, sample_rate
         return audio, sample_rate  # unreachable — loop always returns
 
@@ -2513,12 +2714,16 @@ class AppDelegate(NSObject):
         engine = self._sesameEngine()
         catalog = self._sesameVoiceCatalog()
         voice = next((v for v in catalog if v["id"] == voice_identifier), catalog[0])
-        # Built-ins (Sadie/Manny/Ben) are bundled and keyed by "ref_audio"; a user-created
-        # custom voice lives outside the app bundle (see sesame_voices_path) and is keyed by
-        # "audio_file" instead — see the data model in _maybeFinalizeSesameClone-equivalent
-        # commit path (useRecordingClicked_).
-        ref_audio = (self._resourcePath("sesame_assets", "voices", voice["ref_audio"]) if "ref_audio" in voice
-                     else sesame_voices_path(voice["audio_file"]))
+        # Built-ins (Sadie/Manny/Ben/Alex/Jordan) are keyed by "ref_audio" and live wherever
+        # _sesameAssetsBase() finds them (downloaded on-demand, see sesame_download.py, or
+        # bundled — see that method's own comment); a user-created custom voice lives outside
+        # either of those (see sesame_voices_path) and is keyed by "audio_file" instead — see
+        # the data model in _maybeFinalizeSesameClone-equivalent commit path (useRecordingClicked_).
+        if "ref_audio" in voice:
+            base = self._sesameAssetsBase() or self._resourcePath("sesame_assets")
+            ref_audio = os.path.join(base, "voices", voice["ref_audio"])
+        else:
+            ref_audio = sesame_voices_path(voice["audio_file"])
 
         audio, sample_rate = self._generateSesameAudio(engine, text, ref_audio, voice["ref_text"])
 
@@ -4812,6 +5017,8 @@ class AppDelegate(NSObject):
             # Covers the System voice path (AVSpeechSynthesizer, no urllib involved) — without
             # this, an unexpected failure there would just kill the background thread silently,
             # leaving the UI stuck showing "Generating..." forever with no way out but Stop.
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
             result = {"token": token, "role": role, "index": index, "offset": offset, "audio": None,
                       "should_play": should_play, "error": f"Couldn't generate speech: {e}"}
         self.performSelectorOnMainThread_withObject_waitUntilDone_("chunkResultMain:", result, False)
@@ -4859,8 +5066,35 @@ class AppDelegate(NSObject):
             self.chunk_audio_cache[result["index"]] = result["audio"]
 
     @objc.python_method
+    def _padWithTrailingSilence(self, audio_bytes, pad_ms=300):
+        try:
+            with wave.open(io.BytesIO(audio_bytes), "rb") as w:
+                nchannels, sampwidth, framerate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+                frames = w.readframes(w.getnframes())
+        except (wave.Error, EOFError):
+            return audio_bytes
+        silence_frames = int(framerate * pad_ms / 1000)
+        silence = b"\x00" * (silence_frames * nchannels * sampwidth)
+        buf = io.BytesIO()
+        out = wave.open(buf, "wb")
+        out.setnchannels(nchannels)
+        out.setsampwidth(sampwidth)
+        out.setframerate(framerate)
+        out.writeframes(frames + silence)
+        out.close()
+        return buf.getvalue()
+
+    @objc.python_method
     def _beginChunkPlayback(self, audio_bytes, start_offset=0.0, should_play=True):
-        player, err = AVFoundation.AVAudioPlayer.alloc().initWithData_error_(bytes(audio_bytes), None)
+        # AVAudioPlayer has been observed clipping the very last ~100-200ms of short clips —
+        # a buffer/output-flush timing quirk in CoreAudio itself, confirmed NOT a generation
+        # bug (Whisper word-timestamps showed the saved WAV's actual audio content is already
+        # complete). Padding trailing silence onto the buffer we hand the player means any tail
+        # clipping eats silence instead of the last syllable. Only the player's copy is padded —
+        # chunk_audio_cache below keeps the original, unpadded bytes so Save/History content
+        # stays exact.
+        playback_bytes = self._padWithTrailingSilence(audio_bytes)
+        player, err = AVFoundation.AVAudioPlayer.alloc().initWithData_error_(bytes(playback_bytes), None)
         if player is None:
             self.showError_("Could not decode the generated audio.")
             self._resetPlaybackState()
@@ -4884,6 +5118,10 @@ class AppDelegate(NSObject):
         self._syncPlaybackUI()
         if should_play:
             self._startProgressTimer()
+            # Chunk-level follow, covers every provider (Chatterbox/Sesame have no word-level
+            # timing yet — see _scrollToKeepPlaybackVisible). System voice gets refined further,
+            # word by word, inside _applyWordHighlight below.
+            self._scrollToKeepPlaybackVisible(self._approxChunkStartOffset(self.chunk_index))
         self._syncWordHighlightNow()
         if self.config.get("provider", "ElevenLabs") == "ElevenLabs":
             threading.Thread(target=self._fetchElVoicesWorker, daemon=True).start()  # refresh usage
@@ -5384,6 +5622,45 @@ class AppDelegate(NSObject):
         return NSMakeRect(rect.origin.x + origin.x, rect.origin.y + origin.y, rect.size.width, rect.size.height)
 
     @objc.python_method
+    def _scrollToKeepPlaybackVisible(self, char_index):
+        """Keeps whatever's currently being read scrolled into view, proactively — before it
+        reaches the bottom edge, not only once it's already scrolled past it (confirmed
+        needed via real testing: a document longer than one screen otherwise silently falls
+        behind and has to be scrolled manually). Driven from a single character position: the
+        highlighted word for System voice, or a chunk's start for Chatterbox/Sesame, which
+        have no word-level timing yet (see ROADMAP's word-highlight-for-cloned-voices entry).
+        _glyphRectForRange and NSClipView's documentVisibleRect are already both expressed in
+        text_view's own (flipped) coordinate space, so no conversion is needed between them
+        here — unlike _applyWordHighlight's overlay rect, which has to convert into the clip
+        view's space because the overlay layer is a sibling of text_view, not a child of it."""
+        storage = self.text_view.textStorage()
+        length = storage.length()
+        if length == 0:
+            return
+        char_index = max(0, min(char_index, length - 1))
+        rect = self._glyphRectForRange(char_index, 1)
+        clip = self.scroll_view.contentView()
+        visible = clip.documentVisibleRect()
+        # A quarter-screen margin off the bottom edge is the "before it reaches the last
+        # lines" lead — scrolling starts while the current line still has room to breathe,
+        # not right as it's about to clip off the bottom.
+        margin = visible.size.height * 0.25
+        already_visible = (rect.origin.y >= visible.origin.y and
+                            rect.origin.y + rect.size.height <= visible.origin.y + visible.size.height - margin)
+        if already_visible:
+            return
+        # Lands the target line roughly a third of the way down the viewport rather than
+        # glued to the very top edge — reads more like a natural reading position than a
+        # jarring "line pinned to the top" snap.
+        new_y = max(0.0, rect.origin.y - visible.size.height * 0.3)
+        max_y = max(0.0, self.text_view.frame().size.height - visible.size.height)
+        new_y = min(new_y, max_y)
+        AppKit.NSAnimationContext.beginGrouping()
+        AppKit.NSAnimationContext.currentContext().setDuration_(0.35)
+        clip.animator().setBoundsOrigin_(NSMakePoint(visible.origin.x, new_y))
+        AppKit.NSAnimationContext.endGrouping()
+
+    @objc.python_method
     def _ensureHighlightOverlay(self):
         if self._highlight_overlay is None:
             layer = Quartz.CALayer.layer()
@@ -5403,6 +5680,7 @@ class AppDelegate(NSObject):
     def _applyWordHighlight(self, global_range, style):
         loc, length = global_range
         rect = self._glyphRectForRange(loc, length)
+        self._scrollToKeepPlaybackVisible(loc)
         if style == "highlight":
             self._revertPrevTextAttributes()
             overlay = self._ensureHighlightOverlay()
