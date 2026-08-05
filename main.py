@@ -50,8 +50,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.12.1"
-APP_BUILD = "43"
+APP_VERSION = "1.12.3"
+APP_BUILD = "45"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -123,7 +123,17 @@ CHATTERBOX_SPEED_REAL = {v: k for k, v in CHATTERBOX_SPEED_DISPLAY.items()}
 # be meaningful — a very short chunk's fixed generation overhead would trip this on its own.
 CHATTERBOX_MIN_CHARS_PER_SEC = 11.5
 CHATTERBOX_MIN_CHARS_FOR_CHECK = 50
-CHATTERBOX_MAX_RETRIES = 2
+# Same reasoning as SESAME_MAX_RETRIES below, now measured directly for this model too: an
+# isolated 8-trial batch on a real chunk that repeatedly failed in production (same text,
+# same voice, same settings) passed only 2/8 attempts — a ~75% per-attempt failure rate, and
+# strikingly bimodal, not a smooth quality gradient: every failure scored CER=1.000 (total,
+# unrelated-to-the-source garbage — matching the "autoregressive collapse" pattern documented
+# elsewhere for this model family), every pass scored under 0.14. At the old MAX_RETRIES=2 (3
+# attempts total), that 75% rate gives roughly a 42% chance EVERY attempt fails and a
+# completely garbled chunk plays anyway. 4 (5 attempts total, matching Sesame's own budget)
+# brings that down to roughly 24% — a real, measured improvement, not a full fix; this specific
+# voice+content combination can still exhaust every attempt, same honest caveat as Sesame's.
+CHATTERBOX_MAX_RETRIES = 4
 
 # Sesame's 3 built-in voices — cloned from real, single continuous reference recordings (never
 # spliced fragments, confirmed by earlier testing to hurt clone quality). Unlike Chatterbox,
@@ -2592,15 +2602,26 @@ class AppDelegate(NSObject):
         # CLI-oriented wrapper that writes files to disk) keeps this fully in-memory, matching
         # how every other provider here returns audio bytes without touching disk.
         #
-        # max_new_tokens must scale with text length, same reasoning as Sesame's max_ms below
-        # — found directly while testing the verification retry loop: the library's own fixed
-        # default (1000) silently truncated a real, ordinary ~670-char chunk (well within this
-        # app's normal CHUNK_TARGET_CHARS=600/CHUNK_MAX_CHARS=900 range) after only its first
-        # sentence, on every retry identically, since it isn't random instability but a hard
-        # cap being hit — confirmed directly: the same text and voice produced a full, clean
-        # 32s generation once given real headroom. 15 tokens/char is deliberately generous
-        # (the confirmed-working case used well under this ratio) rather than tightly tuned.
-        max_new_tokens = max(1000, len(text) * 15)
+        # The generation-length parameter for THIS model (mlx-community Chatterbox TURBO) is
+        # named max_tokens, defaulting to 800 — NOT max_new_tokens, which is the older,
+        # non-turbo chatterbox model's parameter name. Passing max_new_tokens= here was a real,
+        # confirmed no-op the whole time it shipped: ChatterboxTurboTTS.generate() has no such
+        # parameter, so it silently landed in **kwargs and was never read (that code path only
+        # gets used when stream=True, which this call never sets) — every chunk was actually
+        # generated under the untouched 800-token default regardless of length, confirmed
+        # directly via two isolated test chunks of different lengths (499 vs 579 chars) that
+        # both produced an identical "800/800" token count and an identical 32.2s of audio,
+        # with the longer one cut off mid-sentence as a result. split_pattern=None (below)
+        # means the WHOLE chunk goes through as one ungapped generation with no fallback
+        # re-segmentation, so this cap applies to the chunk's entire content at once, not
+        # per-sentence. 4 tokens/char follows the library's own internal comment on its
+        # sentence-splitting heuristic (~8 speech tokens per text token, ~4 chars per text
+        # token) rather than reusing the old model's 15-tokens/char figure, which was
+        # calibrated for a different model's token semantics and never actually exercised here.
+        # Headroom check: GPT2's positional embedding table caps the whole sequence (voice
+        # conditioning + text + speech tokens) at 8196 positions; even this app's largest
+        # possible chunk (CHUNK_MAX_CHARS=900) stays well under that with real margin to spare.
+        max_tokens = max(800, len(text) * 4)
         #
         # Literal double/smart quotes are a confirmed, deterministic bug in this exact model
         # build (mlx-community Chatterbox Turbo, upstream issue #433) — any literal quote
@@ -2620,7 +2641,7 @@ class AppDelegate(NSObject):
         for attempt in range(max_retries + 1):
             results = list(engine.generate(
                 text=text, ref_audio=ref_audio, split_pattern=None, temperature=0.05,
-                max_new_tokens=max_new_tokens))
+                max_tokens=max_tokens))
             audio = np.concatenate([np.array(r.audio) for r in results])
             sample_rate = results[0].sample_rate
             is_last = attempt == max_retries
