@@ -8,3 +8,6 @@ __pycache__/
 # Downloaded on demand (see sesame_download.py) — 2GB+ of model weights, already distributed
 # as a GitHub Release asset. Never belongs in git history.
 sesame_assets/
+# The real GitHub token for bug_report.py — never commit this to the public repo. See
+# bug_report_token.py's own header comment for how to create one.
+bug_report_token.py

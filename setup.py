@@ -37,6 +37,17 @@ LOCAL_TTS_PACKAGES = [
     # process that shaped every other block.
     "mlx_lm", "mlx_audio", "huggingface_hub", "transformers", "tokenizers",
     "safetensors", "sentencepiece", "scipy",
+    # Content-verification pass (see speech_verify.py) — transcribes generated speech back and
+    # compares it against the input text, since neither Sesame nor Chatterbox can be trusted
+    # to reliably say the right thing on its own. mlx_whisper is a regular package (has
+    # __init__.py), not a namespace package like mlx, so it needs no special copytree handling.
+    # jiwer (character-error-rate scoring) pulls in rapidfuzz (a compiled C++ extension) and
+    # click as its own only two dependencies — both listed explicitly for the same
+    # dist-info-alongside-package reasoning as everything else in this list.
+    "mlx_whisper", "jiwer", "rapidfuzz", "click",
+    # Not something speech_verify.py itself needs — mlx_whisper's own import chain pulls this
+    # in unconditionally (see the "excludes" list's own comment for the full story).
+    "numba",
     # sounddevice's bundled PortAudio binary (libportaudio.dylib) lives in a data directory,
     # same shape as _soundfile_data above — dlopen() can't load a library from inside the
     # zipped python312.zip, it needs a real file on the real filesystem. mlx_audio.tts.generate
@@ -98,7 +109,7 @@ OPTIONS = {
     # from a real directory, which correctly finds both its .py submodules AND core's compiled
     # extension (core.cpython-312-darwin.so, found via CPython's standard ABI-tagged-suffix
     # extension search — no special stub or renaming needed once py2app stops interfering).
-    # torch/matplotlib/sympy/babel/numba: transformers and mlx_audio support several possible
+    # torch/matplotlib/sympy/babel: transformers and mlx_audio support several possible
     # backends/optional features SonoScript never uses (this app only ever runs the MLX
     # backend) — modulegraph's static scan can't tell "imported inside a branch we never
     # execute" from "always executed," so it bundles the full dependency regardless. Confirmed
@@ -107,8 +118,17 @@ OPTIONS = {
     # generation including pitch/speed-adjusted voices, which is the one path that legitimately
     # needs scipy — deliberately NOT excluded — so this isn't "exclude everything heavy") that
     # the app works identically without them bundled. ~650MB combined.
-    "excludes": ["mlx", "torch", "matplotlib", "sympy", "babel", "numba"],
-    "resources": ["chatterbox_assets"],
+    # numba was excluded here too until mlx_whisper (see speech_verify.py) became a real
+    # dependency — its transcribe.py unconditionally imports .timing, which imports numba at
+    # module load regardless of whether word-level timestamps are ever requested (this app
+    # never asks for them). Confirmed directly: excluding it crashed the frozen app on launch
+    # with "ModuleNotFoundError: No module named 'numba'" inside mlx_whisper's own import
+    # chain — unlike the others in this list, numba is now a genuine, load-bearing need.
+    "excludes": ["mlx", "torch", "matplotlib", "sympy", "babel"],
+    # whisper_assets: the verification model (~137MB, small enough to bundle directly rather
+    # than needing a Sesame-style download-on-demand flow) — see speech_verify.py's own
+    # comment for why this can't be fetched lazily from HuggingFace at runtime instead.
+    "resources": ["chatterbox_assets", "whisper_assets"],
     "iconfile": "icon.icns",
 }
 

@@ -4,6 +4,125 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.12.1] (build 43) — 2026-08-04
+
+Two real, reported bugs, both about the same thing: opening Settings mid-session and coming
+back. Root-caused with a live diagnostic trace (temporary print statements through the actual
+generation pipeline, not guesses) before touching any code, then verified fixed the same way.
+
+### Fixed
+- **Opening Settings while a chunk was generating made it look like generation had silently
+  stopped.** It hadn't — traced directly and confirmed the background worker thread, job queue,
+  and generation pipeline are completely unaffected by which screen is showing. The real bug:
+  `showMainScreen()` rebuilds a brand-new status label every time you return from Settings (same
+  as it already does for the text view), and nothing re-announces "Generating..." on that new
+  label if a job was already in flight before you left — so the label just comes back blank,
+  even though the exact same job finishes normally moments later. Now tracks the last status
+  text set and re-applies it after the rebuild.
+- **Returning from Settings during playback made the read-along highlight jump around
+  erratically.** `showMainScreen()` was clearing its saved timer reference with a bare
+  reassignment instead of actually cancelling the real, still-scheduled `NSTimer` behind it — an
+  `NSTimer` on the run loop stays alive independent of any Python reference to it. That orphaned
+  timer kept firing in the background, on its own schedule, right alongside the fresh one
+  `showMainScreen()` arms afterward — two independent chains fighting over the same shared
+  state. Now properly invalidates the old timer before rebuilding.
+
+## [1.12.0] (build 42) — 2026-08-04
+
+### Added
+- **Read-along word highlighting for Chatterbox and Sesame.** Previously only System voice
+  could highlight the word currently being spoken as it played — Chatterbox and Sesame had no
+  equivalent, since they generate audio up front rather than firing a live word-boundary
+  callback the way System's AVSpeechSynthesizer does. Built on top of 1.11.4's content
+  verification: every generated clip already gets transcribed back locally with word-level
+  timestamps (originally just to check what was said); those timestamps are now mapped back
+  onto the actual source text via word-level edit-distance alignment (`jiwer`, already a
+  dependency for the CER check), and fed into the exact same event-driven highlight-timer
+  system System voice already used, unchanged. Chatterbox's speed control (time-stretch, since
+  it has no native rate parameter) rescales the timing to match; Sesame needs no rescale, since
+  its speed is locked to 1.0x for unrelated reasons. Auto-scroll gets the same benefit
+  automatically, since it was already driven off the same highlighted-word position. Falls
+  back cleanly to the previous chunk-level behavior (no per-word highlight, chunk-level
+  auto-scroll only) whenever the alignment isn't usable for a given chunk — a badly garbled
+  attempt, or a rare case where normalization changes a word count — rather than showing a
+  highlight that's more often wrong than right. Verified directly against real Chatterbox
+  playback: the highlight tracked forward through real words in the correct order as the audio
+  actually played, not just "doesn't crash."
+
+## [1.11.5] (build 41) — 2026-08-04
+
+Follow-up to 1.11.4's verification system, after a real regression report: a long,
+multi-chunk Chatterbox story stalled repeatedly and went silent for the rest of the
+recording. Diagnosed with real timing data and word-level audio analysis, not guesses —
+two distinct, real issues, both addressed here.
+
+### Fixed
+- **Playback could fall behind generation and stall.** The app only ever prepared one chunk
+  ahead, and only started once the current chunk began playing — fine when generation was
+  fast, but the verification+retry system added in 1.11.4 can now legitimately take longer
+  to resolve a hard chunk than that chunk takes to play. Prefetching now keeps up to 3 chunks
+  queued ahead, and a chunk finishing generation immediately continues the chain instead of
+  waiting for the next playback-start event — reclaiming idle worker time instead of wasting
+  it. Confirmed via a precise timeline simulation using real measured generation times from
+  the reported story: this meaningfully helps documents with a mix of easy and hard chunks,
+  which is the common case. Honest caveat: for a chunk that's consistently, severely hard
+  (confirmed separately to be a genuine model limitation, not random variance), no amount of
+  earlier prefetching fully closes the gap — that needs the underlying generation problem
+  solved, not just better scheduling.
+- **Verification could miss a clip with the right words but a dead zone in the middle.**
+  Confirmed directly: a real generated clip had a 25-second silent gap between two correctly
+  recognized words. A transcript alone doesn't carry timing, so this could pass or
+  under-penalize checks that only compare the words. Word-level timestamps are now checked
+  for any internal gap longer than 4 seconds — well past any natural spoken pause — and
+  treated as a failure worth retrying, the same as a straightforwardly wrong transcript.
+
+## [1.11.4] (build 40) — 2026-08-04
+
+The biggest reliability push so far. Neither Sesame nor Chatterbox can be trusted to
+reliably say the right thing — both now get their output checked, not just timed.
+
+### Added
+- **Content verification for Sesame and Chatterbox** (`speech_verify.py`): every generated
+  clip is transcribed back locally (bundled Whisper model, no network call) and compared
+  against what it was supposed to say. A clip that doesn't match closely enough is
+  regenerated automatically (varying attempts, same pass bar every time — an asymmetric
+  "retries held to a stricter standard" bar was a real bug two other projects wrapping this
+  same Chatterbox model shipped and had to fix, deliberately avoided here). If nothing passes
+  within the retry cap, the least-bad attempt is kept and used rather than silently failing or
+  blocking generation — this app already refuses to guess a fallback the user didn't ask for,
+  and this is the same principle applied here. Design is based directly on two real,
+  independently-maintained forks of the exact Chatterbox model this app uses, which already
+  solved this same problem in production — several choices here exist specifically to avoid
+  bugs those forks shipped and later fixed (stale retry seeds, pre-generating candidates
+  before checking any of them, letting untrimmed silence trick the checker into inventing
+  fake text). Applies only to the two on-device engines — cloud providers already handle
+  their own quality control, and System voice can't hallucinate in the first place.
+- Short text (under 5 words) gets one extra retry attempt automatically — a confirmed,
+  unresolved weak spot for Chatterbox specifically (single words/short phrases reliably
+  producing gibberish), and independently the hardest case for the new verification too.
+
+### Fixed
+- **Chatterbox silently truncating ordinary chunks.** Found directly while testing the
+  verification retry loop: the library's own fixed default (1000 tokens) cut off a real,
+  normal ~670-character chunk — well within this app's everyday chunk-size range — after only
+  its first sentence, identically on every retry, since it wasn't random instability but a
+  hard cap being hit. Now scales with text length, the same fix already applied to Sesame's
+  own length cap.
+- A literal quotation mark in the text made Chatterbox produce a random ~1.2 second
+  non-speech "sigh" sound (a confirmed, unfixed upstream bug in this exact model build) —
+  now stripped before generation, independent of the verification step above.
+
+## [1.11.3] (build 39) — 2026-08-03
+
+### Added
+- **"Report a Problem"** (Settings > Support): a tester can send a diagnostic report in-app,
+  no email client involved. Walks through a few guided questions, shows a review screen with
+  the exact composed report before anything is sent, then submits it as a GitHub issue in a
+  dedicated private repo — never the public source repo. Includes this session's
+  provider/voice usage and generation timing, but deliberately never the raw text someone was
+  reading, only its length. Verified end-to-end against the real API, not just read through:
+  a real test submission created and was confirmed as an actual issue before shipping.
+
 ## [1.11.2] (build 38) — 2026-08-03
 
 ### Fixed

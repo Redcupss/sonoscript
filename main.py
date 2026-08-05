@@ -31,6 +31,8 @@ from Foundation import (
     NSRunLoop, NSDate, NSDefaultRunLoopMode,
 )
 
+import bug_report
+import speech_verify
 from chunking import chunk_text, CHUNK_TARGET_CHARS, chatterbox_chunk_target
 from config import SESAME_ASSETS_DIR, load_config, save_config, sesame_voices_path
 import history
@@ -48,8 +50,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.11.2"
-APP_BUILD = "36"
+APP_VERSION = "1.12.1"
+APP_BUILD = "43"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -189,6 +191,17 @@ SESAME_MIN_CHARS_FOR_CHECK = 50
 # the extra worst-case wait now that max_audio_length_ms caps how long each failed attempt
 # takes, instead of running all the way to the library's old 90-second default first.
 SESAME_MAX_RETRIES = 4
+
+# How many chunks to keep queued ahead of the one currently playing. Was implicitly 1 (prefetch
+# only ever queued a single chunk, once, when the current one started playing) until the
+# content-verification retry loop (see speech_verify.py) made that budget too tight — confirmed
+# directly on a real story where 4 of 5 chunks needed their full retry allowance, and
+# generation time for those chunks EXCEEDED their own playback duration, so the single-chunk
+# buffer ran dry mid-document and playback audibly stalled. 3 gives real slack for a couple of
+# hard chunks in a row to be absorbed by whatever time easier neighboring chunks freed up,
+# without eagerly generating an entire long document up front (wasted work if playback never
+# gets there, same reasoning against unlimited retries elsewhere in this file).
+PREFETCH_LOOKAHEAD_CHUNKS = 3
 
 CREATE_VOICE_SENTINEL = "__sesame_create_your_own__"
 RECORD_SAMPLE_RATE = 44100
@@ -337,6 +350,15 @@ class AppDelegate(NSObject):
         self._manage_voice_fields = {}  # voice_id -> its NSTextField in the Manage Voices card, for rename commits
         self._rec_return_to = None  # callable to reopen instead of dismissing to the main screen, or None
         self._rec_selected_script = None  # one of RECORD_SCRIPT_PRESETS, chosen on _showStyleChoiceCard
+        # Bug-report diagnostic log (see bug_report.py) — one entry per _requestTTS call this
+        # session, across every provider. Deliberately holds no raw text, only its length (see
+        # bug_report.py's own header for why). In-memory only, never written to disk, cleared
+        # on relaunch — a report only ever reflects the current session, matching the
+        # disclaimer shown before a tester sends one.
+        self.session_report_log = []
+        self._report_fields = {}
+        self._report_field_refs = {}
+        self._report_draft = None
         self._rec_script_fade_observer = None
         # Settings > Data & Storage pending state — what the user is currently configuring,
         # separate from what's actually stored in history.py until storageConfirmClicked_
@@ -357,6 +379,7 @@ class AppDelegate(NSObject):
         self.avg_chars_per_sec = None  # running speech-rate estimate, refined as real durations come in
         self.chunk_index = 0
         self.next_chunk_audio = None
+        self._prefetch_frontier = 0  # highest chunk index a prefetch job has been queued for
         self.chunk_audio_cache = {}  # index -> already-generated audio bytes, so scrubbing back
                                       # to a chunk you've already heard replays it exactly
                                       # (same bytes, same real duration) instead of a fresh,
@@ -1839,7 +1862,16 @@ class AppDelegate(NSObject):
         self._highlight_chunk_index = None
         self._highlight_search_cursor = 0
         self._highlight_prev_range = None
-        self._highlight_timer = None
+        # A bare reassignment here (rather than _invalidateHighlightTimer()) leaves whatever
+        # real NSTimer this pointed to still scheduled on the run loop — an NSTimer added via
+        # addTimer_forMode_ is retained by the run loop itself, independent of this Python
+        # attribute, so dropping the reference orphans it rather than cancelling it. Confirmed
+        # directly as the cause of a real reported bug: return from Settings mid-playback and
+        # the highlight starts jumping erratically — that orphaned timer keeps firing on its own
+        # schedule after _syncWordHighlightNow (below) has already armed a second, independent
+        # chain, both unconditionally rescheduling themselves off the same shared state and
+        # stepping on each other.
+        self._invalidateHighlightTimer()
         self.text_view.setTextContainerInset_(NSMakeSize(10, 10))
         self.text_view.setVerticallyResizable_(True)
         self.text_view.setHorizontallyResizable_(False)
@@ -1953,6 +1985,10 @@ class AppDelegate(NSObject):
         self.current_screen = "main"
         self.swap_screen(v)
         self._syncPlaybackUI()
+        # Re-announces whatever status was showing before this rebuild (e.g. "Generating...")
+        # on the brand-new status_label above — see setStatus's own comment for why this is
+        # needed at all: nothing else re-fires that call just because the view came back.
+        self.setStatus(getattr(self, "_status_text", ""))
         self.updateCharCount()
         # Handles a Settings/History/etc round-trip that rebuilds text_view mid-playback (e.g.
         # changing highlight style while something is already playing) — its own guard clauses
@@ -1982,6 +2018,19 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def setStatus(self, text):
+        # Tracked independently of status_label itself — showMainScreen() rebuilds a brand-new
+        # status_label (same as text_view/scroll_view) whenever returning from Settings/History/
+        # etc, which otherwise silently drops whatever was showing. A background generation job
+        # already in flight (kicked off before that screen switch) has no OTHER trigger that
+        # would ever re-call setStatus() on the new label — nothing re-announces "Generating..."
+        # just because the view came back, since the call that originally set it already
+        # happened once, in the past. Confirmed directly: without this, opening Settings while a
+        # chunk is generating and returning before it finishes makes the app look like nothing
+        # is happening at all, even though the exact same background job is still running fine —
+        # a real, confirmed pipeline continuity issue (verified via a diagnostic trace: dispatch/
+        # chunkResultMain_/beginChunkPlayback all fire normally with Settings open the whole
+        # time), just with no visible sign of it after the round-trip.
+        self._status_text = text
         # A previous error may have left textColor red via _flashInlineError, which never
         # restores it on its own — every real status update must reclaim the label's normal
         # look, not just whichever one happens to say "Generating...".
@@ -2145,6 +2194,7 @@ class AppDelegate(NSObject):
         if not self.all_chunks:
             return
         self.chunk_audio_cache = {}
+        self._prefetch_frontier = self.chunk_index
         # Preserve the CURRENTLY PLAYING chunk's own word timings — despite this function's own
         # comment above ("the chunk currently playing keeps playing as-is"), wiping the whole
         # dict unconditionally also wiped that chunk's entry, silently killing word-highlighting
@@ -2370,6 +2420,7 @@ class AppDelegate(NSObject):
         self.all_chunks = chunks
         self.chunk_durations = [None] * len(chunks)
         self.avg_chars_per_sec = None
+        self._prefetch_frontier = 0
         self._seekToVirtualTime(0.0)
 
     @objc.python_method
@@ -2415,11 +2466,12 @@ class AppDelegate(NSObject):
         utterance.setRate_(max(min_rate, min(max_rate, base_rate * speed)))
 
         collected = {"pcm": bytearray(), "sample_rate": None, "channels": None, "done": False}
-        # Word timing for live highlighting during playback (see _SpeechTimingDelegate) — only
-        # meaningful for System voice; Chatterbox/Sesame/ElevenLabs have no equivalent yet
-        # (that's forced alignment, separate work). Recorded as the exact cumulative sample
-        # count already written to collected["pcm"] at the moment each word's range callback
-        # fires — real audio-frame position, not a wall-clock guess from a separate pass.
+        # Word timing for live highlighting during playback (see _SpeechTimingDelegate) —
+        # System voice's own real-time source; Chatterbox/Sesame get theirs from ASR word-
+        # alignment instead (see speech_verify._align_words), since they have no live callback
+        # to listen to. Recorded as the exact cumulative sample count already written to
+        # collected["pcm"] at the moment each word's range callback fires — real audio-frame
+        # position, not a wall-clock guess from a separate pass.
         word_timings = []
 
         def on_range(loc, length):
@@ -2461,20 +2513,11 @@ class AppDelegate(NSObject):
         deadline = time.time() + 30
         while not collected["done"] and time.time() < deadline:
             rl.runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.05))
-        # Enforce a minimum gap between consecutive words' start times — two independent async
-        # callback streams (willSpeakRangeOfSpeechString_ and the buffer-delivery callback) feed
-        # this data, and if two words ever land on the same or near-same captured start, the
-        # earlier one becomes mathematically unselectable (or visible for ~0 seconds) no matter
-        # how the highlight is later scheduled against this list.
-        for i in range(1, len(word_timings)):
-            min_start = word_timings[i - 1]["start"] + self.HIGHLIGHT_MIN_WORD_WINDOW
-            if word_timings[i]["start"] < min_start:
-                word_timings[i]["start"] = min_start
         # Side-channel, not a return-value change — _requestTTS's return type (just WAV bytes)
         # stays identical for every provider; _chunkWorker reads this immediately afterward, on
         # the same single persistent TTS worker thread that called this, so there's no
         # concurrent-access risk despite it being an instance attribute.
-        self._last_word_timings = word_timings
+        self._last_word_timings = self._enforceMinWordWindow(word_timings)
 
         if not collected["pcm"] or not collected["sample_rate"]:
             raise RuntimeError("The system voice produced no audio.")
@@ -2487,6 +2530,21 @@ class AppDelegate(NSObject):
         w.writeframes(bytes(collected["pcm"]))
         w.close()
         return buf.getvalue()
+
+    @objc.python_method
+    def _enforceMinWordWindow(self, word_timings):
+        # Shared by every provider's word-timing source (System's live callbacks, Chatterbox/
+        # Sesame's ASR alignment) — two consecutive words landing on the same or near-same
+        # start makes the earlier one mathematically unselectable (or visible for ~0 seconds)
+        # no matter how the highlight is later scheduled against this list, regardless of
+        # which mechanism produced the timing in the first place.
+        if not word_timings:
+            return word_timings
+        for i in range(1, len(word_timings)):
+            min_start = word_timings[i - 1]["start"] + self.HIGHLIGHT_MIN_WORD_WINDOW
+            if word_timings[i]["start"] < min_start:
+                word_timings[i]["start"] = min_start
+        return word_timings
 
     @objc.python_method
     def _resourcePath(self, *parts):
@@ -2533,17 +2591,57 @@ class AppDelegate(NSObject):
         # Calling the model's own .generate() generator directly (not generate_audio(), the
         # CLI-oriented wrapper that writes files to disk) keeps this fully in-memory, matching
         # how every other provider here returns audio bytes without touching disk.
-        for attempt in range(CHATTERBOX_MAX_RETRIES + 1):
+        #
+        # max_new_tokens must scale with text length, same reasoning as Sesame's max_ms below
+        # — found directly while testing the verification retry loop: the library's own fixed
+        # default (1000) silently truncated a real, ordinary ~670-char chunk (well within this
+        # app's normal CHUNK_TARGET_CHARS=600/CHUNK_MAX_CHARS=900 range) after only its first
+        # sentence, on every retry identically, since it isn't random instability but a hard
+        # cap being hit — confirmed directly: the same text and voice produced a full, clean
+        # 32s generation once given real headroom. 15 tokens/char is deliberately generous
+        # (the confirmed-working case used well under this ratio) rather than tightly tuned.
+        max_new_tokens = max(1000, len(text) * 15)
+        #
+        # Literal double/smart quotes are a confirmed, deterministic bug in this exact model
+        # build (mlx-community Chatterbox Turbo, upstream issue #433) — any literal quote
+        # character produces a ~1.2s non-speech "sigh" sound, unrelated to voice or content.
+        # Free, independent fix, cheaper to prevent here than to catch via verification below.
+        text = text.translate(str.maketrans("", "", "\"“”"))
+
+        # Short inputs are a confirmed, unresolved weak spot for this model (single words/
+        # short phrases reliably producing gibberish, upstream issue #97) — and independently
+        # the hardest case for the verification below too, since Whisper's own transcription
+        # is least reliable on very short audio. One extra attempt gives the retry loop more
+        # chances on exactly the input shape most likely to need it.
+        is_short = len(text.split()) < speech_verify.SHORT_INPUT_WORD_COUNT
+        max_retries = CHATTERBOX_MAX_RETRIES + (1 if is_short else 0)
+
+        best = None  # (audio, sample_rate, cer, word_timings) — lowest-CER attempt, for the fallback
+        for attempt in range(max_retries + 1):
             results = list(engine.generate(
-                text=text, ref_audio=ref_audio, split_pattern=None, temperature=0.05))
+                text=text, ref_audio=ref_audio, split_pattern=None, temperature=0.05,
+                max_new_tokens=max_new_tokens))
             audio = np.concatenate([np.array(r.audio) for r in results])
             sample_rate = results[0].sample_rate
-            if len(text) < CHATTERBOX_MIN_CHARS_FOR_CHECK or attempt == CHATTERBOX_MAX_RETRIES:
-                return audio, sample_rate
-            chars_per_sec = len(text) / (len(audio) / sample_rate)
-            if chars_per_sec >= CHATTERBOX_MIN_CHARS_PER_SEC:
-                return audio, sample_rate
-        return audio, sample_rate  # unreachable — loop always returns
+            is_last = attempt == max_retries
+
+            # Two independent, cheap-first signals kept side by side, not one replacing the
+            # other — timing (the original heuristic, catches bloated/runaway generation) and
+            # content (new — catches a normal-paced clip that just says the wrong thing,
+            # which timing alone structurally can't see). Confirmed as the right shape by real
+            # shipped forks of this exact model: the hardened one runs both checks in parallel
+            # rather than dropping the duration check once ASR verification was added.
+            timing_ok = True
+            if len(text) >= CHATTERBOX_MIN_CHARS_FOR_CHECK:
+                chars_per_sec = len(text) / (len(audio) / sample_rate)
+                timing_ok = chars_per_sec >= CHATTERBOX_MIN_CHARS_PER_SEC
+
+            result = speech_verify.verify(audio, sample_rate, text)
+            if best is None or result.cer < best[2]:
+                best = (audio, sample_rate, result.cer, result.word_timings)
+            if (timing_ok and result.passed) or is_last:
+                return best[0], best[1], best[3]
+        return best[0], best[1], best[3]  # unreachable — loop always returns
 
     @objc.python_method
     def _requestChatterboxTTS(self, text, voice_identifier, speed):
@@ -2552,13 +2650,22 @@ class AppDelegate(NSObject):
         voice = next((v for v in CHATTERBOX_VOICES if v["id"] == voice_identifier), CHATTERBOX_VOICES[0])
         ref_audio = self._resourcePath("chatterbox_assets", "voices", voice["ref_audio"]) if voice["ref_audio"] else None
 
-        audio, sample_rate = self._generateChatterboxAudio(engine, text, ref_audio)
+        audio, sample_rate, word_timings = self._generateChatterboxAudio(engine, text, ref_audio)
 
         # Chatterbox has no native speed parameter (unlike every other provider here) — see
         # time_stretch's own docstring for why this specific technique was picked.
         if speed != 1.0:
             from pitch_shift import time_stretch
             audio = time_stretch(audio, sample_rate, speed)
+            # word_timings above was computed against the PRE-stretch audio's timeline —
+            # time_stretch changes playback duration by dividing by speed (e.g. 1.25x plays
+            # in 1/1.25 the time), so every captured start must be rescaled the same way or
+            # the highlight would drift further out of sync with the actual audio as the
+            # chunk goes on, worse the longer the chunk.
+            if word_timings:
+                word_timings = [{**w, "start": w["start"] / speed} for w in word_timings]
+
+        self._last_word_timings = self._enforceMinWordWindow(word_timings)
 
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
         buf = io.BytesIO()
@@ -2686,9 +2793,15 @@ class AppDelegate(NSObject):
         # first-chunk generation ran past two minutes before this got caught. min(90_000, ...)
         # guarantees this can never regress past the library's own original ceiling either way.
         max_ms = min(90_000, max(20_000, len(text) * 200))
-        for attempt in range(SESAME_MAX_RETRIES + 1):
+        # See _generateChatterboxAudio's matching comment — same reasoning, same model family.
+        is_short = len(text.split()) < speech_verify.SHORT_INPUT_WORD_COUNT
+        max_retries = SESAME_MAX_RETRIES + (1 if is_short else 0)
+
+        best = None  # (audio, sample_rate, cer, word_timings) — lowest-CER attempt, for the fallback
+        for attempt in range(max_retries + 1):
             results = list(engine.generate(
                 text=text, ref_audio=ref_audio, ref_text=ref_text, max_audio_length_ms=max_ms))
+            is_last = attempt == max_retries
             # A genuinely empty result (the model emitted zero audio frames — confirmed directly
             # to happen even on ordinary short text, not just long runaway-prone chunks, since
             # this is CSM's own base-model instability, same root cause as the runaway case
@@ -2696,17 +2809,27 @@ class AppDelegate(NSObject):
             # concatenate" instead of retrying — the length-gated check below only ever
             # protected long text, leaving short text with zero retry protection at all.
             if not results:
-                if attempt == SESAME_MAX_RETRIES:
+                if is_last:
+                    if best is not None:
+                        return best[0], best[1], best[3]
                     raise RuntimeError("Sesame produced no audio for this text after retrying.")
                 continue
             audio = np.concatenate([np.array(r.audio) for r in results])
             sample_rate = results[0].sample_rate
-            if len(text) < SESAME_MIN_CHARS_FOR_CHECK or attempt == SESAME_MAX_RETRIES:
-                return audio, sample_rate
-            chars_per_sec = len(text) / (len(audio) / sample_rate)
-            if SESAME_MIN_CHARS_PER_SEC <= chars_per_sec <= SESAME_MAX_CHARS_PER_SEC:
-                return audio, sample_rate
-        return audio, sample_rate  # unreachable — loop always returns
+
+            # Two independent, cheap-first signals kept side by side — see
+            # _generateChatterboxAudio's matching comment for why neither replaces the other.
+            timing_ok = True
+            if len(text) >= SESAME_MIN_CHARS_FOR_CHECK:
+                chars_per_sec = len(text) / (len(audio) / sample_rate)
+                timing_ok = SESAME_MIN_CHARS_PER_SEC <= chars_per_sec <= SESAME_MAX_CHARS_PER_SEC
+
+            result = speech_verify.verify(audio, sample_rate, text)
+            if best is None or result.cer < best[2]:
+                best = (audio, sample_rate, result.cer, result.word_timings)
+            if (timing_ok and result.passed) or is_last:
+                return best[0], best[1], best[3]
+        return best[0], best[1], best[3]  # unreachable — loop always returns
 
     @objc.python_method
     def _requestSesameTTS(self, text, voice_identifier, speed):
@@ -2725,13 +2848,15 @@ class AppDelegate(NSObject):
         else:
             ref_audio = sesame_voices_path(voice["audio_file"])
 
-        audio, sample_rate = self._generateSesameAudio(engine, text, ref_audio, voice["ref_text"])
+        audio, sample_rate, word_timings = self._generateSesameAudio(engine, text, ref_audio, voice["ref_text"])
 
         # Unlike Chatterbox, the same time-stretch treatment does not hold up on Sesame's
         # output — confirmed directly at 0.8x ("she didn't even know how to talk"). The speed
         # control is locked to 1.0x for this provider (see _populateSpeedMenu) as the real
         # fix; ignoring `speed` here too is a deliberate backstop in case a leftover non-1.0x
-        # value from another provider is still sitting in config when this runs.
+        # value from another provider is still sitting in config when this runs. No rescale
+        # needed for word_timings below either, for the same reason.
+        self._last_word_timings = self._enforceMinWordWindow(word_timings)
 
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
         buf = io.BytesIO()
@@ -3946,6 +4071,7 @@ class AppDelegate(NSObject):
         self.chunk_durations = [None]
         self.chunk_index = 0
         self.next_chunk_audio = None
+        self._prefetch_frontier = 0
         self.chunk_audio_cache = {}
         self.chunk_word_timings = {}
         self.avg_chars_per_sec = None
@@ -4142,6 +4268,7 @@ class AppDelegate(NSObject):
         self.chunk_durations = [None]
         self.chunk_index = 0
         self.next_chunk_audio = None
+        self._prefetch_frontier = 0
         self.chunk_audio_cache = {}
         self.chunk_word_timings = {}
         self.avg_chars_per_sec = None
@@ -4155,7 +4282,7 @@ class AppDelegate(NSObject):
     # ----- settings -----
     SETTINGS_SECTIONS = [
         ("personalization", "Personalization"), ("storage", "Storage"),
-        ("voices", "Voices"), ("location", "File Location"),
+        ("voices", "Voices"), ("location", "File Location"), ("support", "Support"),
     ]
     STORAGE_COUNT_OPTIONS = [5, 10, 20, 50, 100]
     STORAGE_SIZE_OPTIONS = [50 * 1024 * 1024, 100 * 1024 * 1024, 250 * 1024 * 1024, 500 * 1024 * 1024]
@@ -4330,6 +4457,8 @@ class AppDelegate(NSObject):
             self._buildPersonalizationSection(content)
         elif section == "location":
             self._buildLocationSection(content)
+        elif section == "support":
+            self._buildSupportSection(content)
         else:
             self._buildStorageSection(content)
         v.addSubview_(content)
@@ -4937,6 +5066,55 @@ class AppDelegate(NSObject):
         scroll.reflectScrolledClipView_(clip)
         self._installScrollReclamp(scroll, container, NATURAL_H)
 
+    @objc.python_method
+    def _buildSupportSection(self, content):
+        cb = content.bounds()
+        w = cb.size.width
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(cb)
+        scroll.setBorderType_(AppKit.NSNoBorder)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        content.addSubview_(scroll)
+
+        title_h, desc_h, btn_h = 20.0, 50.0, 30.0
+        NATURAL_H = 4 + title_h + 8 + desc_h + 16 + btn_h + 4
+        container = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, NATURAL_H))
+
+        cursor = NATURAL_H - 4
+        cursor -= title_h
+        title_y = cursor
+        cursor -= 8
+        cursor -= desc_h
+        desc_y = cursor
+        cursor -= 16
+        btn_y = cursor - btn_h
+
+        title_label = make_label("Support", 15, 0.75, AppKit.NSFontWeightSemibold)
+        title_label.setFrame_(NSMakeRect(0, title_y, 260, title_h))
+        container.addSubview_(title_label)
+
+        desc = make_label(
+            "Running into a problem? Send a diagnostic report — this session's provider/voice "
+            "usage and timing, your answers below, and basic system info. You'll see exactly "
+            "what's being sent before it goes anywhere.", 12.5, 0.5)
+        desc.cell().setWraps_(True)
+        desc.setFrame_(NSMakeRect(0, desc_y, w, desc_h))
+        container.addSubview_(desc)
+
+        btn_font = AppKit.NSFont.systemFontOfSize_weight_(12, AppKit.NSFontWeightMedium)
+        btn = text_button("Report a Problem…", NSMakeRect(0, btn_y, 170, btn_h),
+                           "reportProblemClicked:", self, btn_font, 0.04, 0.14, 9.0, white(0.55))
+        btn.layer().setBorderWidth_(1.0)
+        btn.layer().setBorderColor_(white(0.1).CGColor())
+        container.addSubview_(btn)
+
+        scroll.setDocumentView_(container)
+        clip = scroll.contentView()
+        clip.scrollToPoint_(NSMakePoint(0, max(0.0, NATURAL_H - cb.size.height)))
+        scroll.reflectScrolledClipView_(clip)
+        self._installScrollReclamp(scroll, container, NATURAL_H)
+
     def locationChooseFolderClicked_(self, sender):
         panel = AppKit.NSOpenPanel.openPanel()
         panel.setCanChooseFiles_(False)
@@ -4997,7 +5175,23 @@ class AppDelegate(NSObject):
                 self._tts_job_queue.task_done()
 
     @objc.python_method
+    def _logReportEntry(self, text, started_at, error):
+        # Deliberately no raw text, only its length — see bug_report.py's own header for why.
+        self.session_report_log.append({
+            "timestamp": time.strftime("%H:%M:%S"),
+            "provider": self.config.get("provider", "?"),
+            "voice": self.config.get("voice_id", "?"),
+            "chars": len(text),
+            "duration": time.monotonic() - started_at,
+            "error": error,
+        })
+        # A long session (a whole book chapter) could otherwise grow this without bound —
+        # nothing needs more than the last couple hours of context to debug a single report.
+        del self.session_report_log[:-200]
+
+    @objc.python_method
     def _chunkWorker(self, text, token, role, index, offset, should_play=True):
+        started_at = time.monotonic()
         try:
             audio = self._requestTTS(text)
             # Set only for System voice (see _requestSystemTTS); None for every other
@@ -5007,12 +5201,15 @@ class AppDelegate(NSObject):
             self._last_word_timings = None
             result = {"token": token, "role": role, "index": index, "offset": offset, "audio": audio,
                       "word_timings": word_timings, "should_play": should_play, "error": None}
+            self._logReportEntry(text, started_at, None)
         except urllib.error.HTTPError as e:
             result = {"token": token, "role": role, "index": index, "offset": offset, "audio": None,
                       "should_play": should_play, "error": f"TTS request failed (HTTP {e.code})."}
+            self._logReportEntry(text, started_at, result["error"])
         except urllib.error.URLError as e:
             result = {"token": token, "role": role, "index": index, "offset": offset, "audio": None,
                       "should_play": should_play, "error": f"Could not reach provider: {e.reason}"}
+            self._logReportEntry(text, started_at, result["error"])
         except Exception as e:
             # Covers the System voice path (AVSpeechSynthesizer, no urllib involved) — without
             # this, an unexpected failure there would just kill the background thread silently,
@@ -5021,6 +5218,7 @@ class AppDelegate(NSObject):
             sys.stderr.flush()
             result = {"token": token, "role": role, "index": index, "offset": offset, "audio": None,
                       "should_play": should_play, "error": f"Couldn't generate speech: {e}"}
+            self._logReportEntry(text, started_at, result["error"])
         self.performSelectorOnMainThread_withObject_waitUntilDone_("chunkResultMain:", result, False)
 
     def chunkResultMain_(self, result):
@@ -5062,8 +5260,17 @@ class AppDelegate(NSObject):
             self.waiting_for_next = False
             self._beginChunkPlayback(result["audio"])
         else:
-            self.next_chunk_audio = result["audio"]
             self.chunk_audio_cache[result["index"]] = result["audio"]
+            # next_chunk_audio must only ever hold the IMMEDIATE next chunk specifically —
+            # audioPlayerDidFinishPlaying_successfully_ hands it straight to _beginChunkPlayback
+            # without checking its index. With deeper lookahead (see PREFETCH_LOOKAHEAD_CHUNKS),
+            # a result landing here can now be chunk_index+2 or +3, not just +1 — setting this
+            # unconditionally would silently overwrite it with the wrong chunk's audio.
+            if result["index"] == self.chunk_index + 1:
+                self.next_chunk_audio = result["audio"]
+            # Keep the chain going — a chunk finishing generation is exactly the moment the
+            # worker thread would otherwise sit idle until the next chunk starts playing.
+            self._extendPrefetchFrontier()
 
     @objc.python_method
     def _padWithTrailingSilence(self, audio_bytes, pad_ms=300):
@@ -5118,9 +5325,9 @@ class AppDelegate(NSObject):
         self._syncPlaybackUI()
         if should_play:
             self._startProgressTimer()
-            # Chunk-level follow, covers every provider (Chatterbox/Sesame have no word-level
-            # timing yet — see _scrollToKeepPlaybackVisible). System voice gets refined further,
-            # word by word, inside _applyWordHighlight below.
+            # Chunk-level follow as the immediate landing scroll — refined further, word by
+            # word, inside _applyWordHighlight below whenever this chunk has usable word
+            # timing (see _scrollToKeepPlaybackVisible's own docstring).
             self._scrollToKeepPlaybackVisible(self._approxChunkStartOffset(self.chunk_index))
         self._syncWordHighlightNow()
         if self.config.get("provider", "ElevenLabs") == "ElevenLabs":
@@ -5130,16 +5337,31 @@ class AppDelegate(NSObject):
     @objc.python_method
     def _prefetchNextChunk(self):
         next_index = self.chunk_index + 1
-        if next_index >= len(self.all_chunks):
-            return
-        cached = self.chunk_audio_cache.get(next_index)
-        if cached is not None:
-            self.next_chunk_audio = cached
-            return
-        # should_play is irrelevant for "prefetch" (chunkResultMain_'s prefetch branch just
-        # caches the audio, never calls _beginChunkPlayback) — True only to match the tuple
-        # shape every job on this queue is unpacked with.
-        self._tts_job_queue.put((self.all_chunks[next_index], self.playback_token, "prefetch", next_index, 0.0, True))
+        if next_index < len(self.all_chunks):
+            cached = self.chunk_audio_cache.get(next_index)
+            if cached is not None:
+                self.next_chunk_audio = cached
+        self._extendPrefetchFrontier()
+
+    @objc.python_method
+    def _extendPrefetchFrontier(self):
+        # Keeps up to PREFETCH_LOOKAHEAD_CHUNKS chunks ahead of the current one queued for
+        # generation, not just the immediate next one — see that constant's own comment for
+        # why a single-chunk buffer stopped being enough once verification retries could make
+        # a chunk take longer to generate than it takes to PLAY. Called both from here (when a
+        # chunk starts playing) and from chunkResultMain_ (whenever a prefetch result lands),
+        # so the worker thread keeps working ahead instead of sitting idle between those two
+        # events — which is exactly the idle time that's now needed as buffer margin.
+        # should_play is irrelevant for "prefetch" jobs (chunkResultMain_'s prefetch branch
+        # just caches the audio, never calls _beginChunkPlayback) — True only to match the
+        # tuple shape every job on this queue is unpacked with.
+        target = min(self.chunk_index + PREFETCH_LOOKAHEAD_CHUNKS, len(self.all_chunks) - 1)
+        while self._prefetch_frontier < target:
+            next_index = self._prefetch_frontier + 1
+            if next_index not in self.chunk_audio_cache:
+                self._tts_job_queue.put(
+                    (self.all_chunks[next_index], self.playback_token, "prefetch", next_index, 0.0, True))
+            self._prefetch_frontier = next_index
 
     @objc.python_method
     def _resetPlaybackState(self):
@@ -5150,6 +5372,7 @@ class AppDelegate(NSObject):
         self.avg_chars_per_sec = None
         self.chunk_index = 0
         self.next_chunk_audio = None
+        self._prefetch_frontier = 0
         self.chunk_audio_cache = {}
         self.chunk_word_timings = {}
         self.session_text = None
@@ -5414,9 +5637,13 @@ class AppDelegate(NSObject):
         self._invalidateHighlightTimer()
         try:
             style = self.config.get("highlight_style", "highlight")
-            if style == "none" or self.config.get("provider") != "System" or self.player is None:
+            if style == "none" or self.player is None:
                 self._clearWordHighlight()
                 return
+            # Data-driven, not provider-gated: System always has timings from its live
+            # callback; Chatterbox/Sesame have them whenever ASR alignment found a usable
+            # mapping (see speech_verify._align_words) and otherwise fall through to "no
+            # timings" below exactly like a cloud provider that's never had any highlight data.
             timings = self.chunk_word_timings.get(self.chunk_index)
             if not timings:
                 self._clearWordHighlight()
@@ -5483,7 +5710,7 @@ class AppDelegate(NSObject):
         self._invalidateHighlightTimer()
         try:
             style = self.config.get("highlight_style", "highlight")
-            if style == "none" or self.config.get("provider") != "System" or self.player is None:
+            if style == "none" or self.player is None:
                 return
             timings = self.chunk_word_timings.get(self.chunk_index)
             if not timings or self.chunk_index != self._highlight_chunk_index:
@@ -5627,9 +5854,9 @@ class AppDelegate(NSObject):
         reaches the bottom edge, not only once it's already scrolled past it (confirmed
         needed via real testing: a document longer than one screen otherwise silently falls
         behind and has to be scrolled manually). Driven from a single character position: the
-        highlighted word for System voice, or a chunk's start for Chatterbox/Sesame, which
-        have no word-level timing yet (see ROADMAP's word-highlight-for-cloned-voices entry).
-        _glyphRectForRange and NSClipView's documentVisibleRect are already both expressed in
+        highlighted word whenever word-level timing is available (System always; Chatterbox/
+        Sesame whenever ASR alignment found a usable mapping for that chunk), or a chunk's
+        start otherwise. _glyphRectForRange and NSClipView's documentVisibleRect are already both expressed in
         text_view's own (flipped) coordinate space, so no conversion is needed between them
         here — unlike _applyWordHighlight's overlay rect, which has to convert into the clip
         view's space because the overlay layer is a sibling of text_view, not a child of it."""
@@ -5973,6 +6200,178 @@ class AppDelegate(NSObject):
         card.layer().setShadowRadius_(34.0)
         card.layer().setShadowOffset_(NSMakeSize(0, -14))
         return card
+
+    # ----- report a problem -----
+    REPORT_FIELDS = [
+        ("activity", "What were you trying to do?", "e.g. read a poem, an article, a book chapter"),
+        ("problem", "What went wrong?", "e.g. audio sounded garbled, took too long, app froze"),
+        ("when", "When did this happen?", "e.g. just now, about 10 minutes ago"),
+        ("notes", "Anything else? (optional)", ""),
+        ("contact", "Name or email, so we can follow up (optional)", ""),
+    ]
+
+    def reportProblemClicked_(self, sender):
+        self._report_fields = {}
+        self._showReportCard("form")
+
+    @objc.python_method
+    def _showReportCard(self, stage, error_message=None):
+        if stage == "form":
+            row_h, label_h, gap = 46.0, 14.0, 6.0
+            title_h = 24.0
+            rows_h = len(self.REPORT_FIELDS) * row_h
+            btn_h = 34.0
+            card_w = 320.0
+            NATURAL_H = 20 + title_h + 10 + rows_h + 14 + btn_h + 20
+            card = self._makeCard(card_w, NATURAL_H)
+            title = make_label("Report a Problem", 15, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+            title.setFrame_(NSMakeRect(0, NATURAL_H - 20 - title_h, card_w, title_h))
+            card.addSubview_(title)
+
+            cursor = NATURAL_H - 20 - title_h - 10
+            saved = getattr(self, "_report_fields", {}) or {}
+            field_refs = {}
+            for key, label_text, placeholder in self.REPORT_FIELDS:
+                label = make_label(label_text, 11, 0.5)
+                label.setFrame_(NSMakeRect(20, cursor - label_h, card_w - 40, label_h))
+                card.addSubview_(label)
+                field = AppKit.NSTextField.alloc().initWithFrame_(NSMakeRect(20, cursor - label_h - gap - 24, card_w - 40, 24))
+                field.setFont_(AppKit.NSFont.systemFontOfSize_(12.5))
+                if placeholder:
+                    field.setPlaceholderString_(placeholder)
+                if key in saved:
+                    field.setStringValue_(saved[key])
+                card.addSubview_(field)
+                field_refs[key] = field
+                cursor -= row_h
+            self._report_field_refs = field_refs
+
+            cancel_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+            cancel = text_button("Cancel", NSMakeRect(20, 20, (card_w - 52) / 2, btn_h), "reportCancelClicked:", self,
+                                 cancel_font, 0.08, 0.16, 9.0, white(0.85))
+            cont = cta_button("Continue", NSMakeRect(20 + (card_w - 52) / 2 + 12, 20, (card_w - 52) / 2, btn_h),
+                              "reportContinueClicked:", self)
+            card.addSubview_(cancel)
+            card.addSubview_(cont)
+        elif stage == "review":
+            card_w = 320.0
+            title_h, notice_h, box_h, btn_h = 24.0, 34.0, 160.0, 34.0
+            NATURAL_H = 20 + title_h + 10 + notice_h + 10 + box_h + 14 + btn_h + 20
+            card = self._makeCard(card_w, NATURAL_H)
+            title = make_label("Review Your Report", 15, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+            title.setFrame_(NSMakeRect(0, NATURAL_H - 20 - title_h, card_w, title_h))
+            notice = make_label(
+                "This is exactly what will be sent — nothing goes out until you tap Send Report.",
+                11, 0.5, align=AppKit.NSTextAlignmentCenter)
+            notice.cell().setWraps_(True)
+            notice.setFrame_(NSMakeRect(20, NATURAL_H - 20 - title_h - 10 - notice_h, card_w - 40, notice_h))
+
+            box_y = NATURAL_H - 20 - title_h - 10 - notice_h - 10 - box_h
+            box = AppKit.NSView.alloc().initWithFrame_(NSMakeRect(20, box_y, card_w - 40, box_h))
+            box.setWantsLayer_(True)
+            box.layer().setBackgroundColor_(white(0.05).CGColor())
+            box.layer().setBorderColor_(white(0.08).CGColor())
+            box.layer().setBorderWidth_(1.0)
+            box.layer().setCornerRadius_(9.0)
+            nscroll = AppKit.NSScrollView.alloc().initWithFrame_(NSMakeRect(6, 6, card_w - 40 - 12, box_h - 12))
+            nscroll.setBorderType_(AppKit.NSNoBorder)
+            nscroll.setHasVerticalScroller_(True)
+            nscroll.setDrawsBackground_(False)
+            body_tv = AppKit.NSTextView.alloc().initWithFrame_(nscroll.bounds())
+            body_tv.setEditable_(False)
+            body_tv.setDrawsBackground_(False)
+            body_tv.setFont_(AppKit.NSFont.systemFontOfSize_(10.5))
+            body_tv.setTextColor_(white(0.7))
+            title_text, body_text = self._report_draft
+            body_tv.setString_(f"{title_text}\n\n{body_text}")
+            nscroll.setDocumentView_(body_tv)
+            box.addSubview_(nscroll)
+
+            back_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+            back = text_button("Back", NSMakeRect(20, 20, (card_w - 52) / 2, btn_h), "reportBackClicked:", self,
+                               back_font, 0.08, 0.16, 9.0, white(0.85))
+            send = cta_button("Send Report", NSMakeRect(20 + (card_w - 52) / 2 + 12, 20, (card_w - 52) / 2, btn_h),
+                              "reportSendClicked:", self)
+            for s in (title, notice, box, back, send):
+                card.addSubview_(s)
+        elif stage == "sending":
+            card = self._makeCard(280, 120)
+            spinner = AppKit.NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(280 / 2 - 13, 66, 26, 26))
+            spinner.setStyle_(AppKit.NSProgressIndicatorStyleSpinning)
+            spinner.startAnimation_(None)
+            lbl = make_label("Sending report...", 13, 0.75, align=AppKit.NSTextAlignmentCenter)
+            lbl.setFrame_(NSMakeRect(0, 32, 280, 18))
+            card.addSubview_(spinner)
+            card.addSubview_(lbl)
+        elif stage == "sent":
+            card = self._makeCard(280, 170)
+            icon = AppKit.NSImageView.alloc().initWithFrame_(NSMakeRect(280 / 2 - 17, 116, 34, 34))
+            img = symbol_image("checkmark.circle.fill", 26)
+            if img:
+                icon.setImage_(img)
+                icon.setContentTintColor_(white(0.9))
+            title = make_label("Report Sent", 14, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+            title.setFrame_(NSMakeRect(0, 90, 280, 18))
+            sub = make_label("Thank you — this really helps.", 12, 0.5, align=AppKit.NSTextAlignmentCenter)
+            sub.setFrame_(NSMakeRect(0, 70, 280, 16))
+            ok_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+            ok = text_button("Done", NSMakeRect(20, 20, 240, 34), "reportCancelClicked:", self, ok_font, 0.08, 0.16, 9.0, white(0.85))
+            for s in (icon, title, sub, ok):
+                card.addSubview_(s)
+        else:  # failed
+            card = self._makeCard(300, 190)
+            icon = AppKit.NSImageView.alloc().initWithFrame_(NSMakeRect(300 / 2 - 17, 136, 34, 34))
+            img = symbol_image("exclamationmark.triangle.fill", 26)
+            if img:
+                icon.setImage_(img)
+                icon.setContentTintColor_(white(0.9))
+            title = make_label("Couldn't Send Report", 14, 0.92, AppKit.NSFontWeightSemibold, AppKit.NSTextAlignmentCenter)
+            title.setFrame_(NSMakeRect(0, 110, 300, 18))
+            sub = make_label(error_message or "Something went wrong.", 11.5, 0.5, align=AppKit.NSTextAlignmentCenter)
+            sub.cell().setWraps_(True)
+            sub.setFrame_(NSMakeRect(20, 80, 260, 30))
+            back_font = AppKit.NSFont.systemFontOfSize_weight_(12.5, AppKit.NSFontWeightMedium)
+            back = text_button("Back", NSMakeRect(20, 40, 126, 34), "reportBackClicked:", self,
+                               back_font, 0.08, 0.16, 9.0, white(0.85))
+            retry = cta_button("Try Again", NSMakeRect(154, 40, 126, 34), "reportSendClicked:", self)
+            for s in (icon, title, sub, back, retry):
+                card.addSubview_(s)
+        self._presentOverlay(card)
+
+    def reportContinueClicked_(self, sender):
+        self._report_fields = {key: field.stringValue() for key, field in self._report_field_refs.items()}
+        # Auto-filled from live app state rather than asked as a guided question — the tester
+        # already told us this by picking a voice, no need to make them retype it.
+        self._report_fields["provider_voice"] = f"{self.config.get('provider', '?')} / {self.config.get('voice_id', '?')}"
+        self._report_draft = bug_report.build_report(
+            self._report_fields, self.session_report_log, APP_VERSION, APP_BUILD)
+        self._showReportCard("review")
+
+    def reportBackClicked_(self, sender):
+        self._showReportCard("form")
+
+    def reportCancelClicked_(self, sender):
+        self.dismissOverlay()
+
+    def reportSendClicked_(self, sender):
+        self._showReportCard("sending")
+        threading.Thread(target=self._reportSendWorker, daemon=True).start()
+
+    @objc.python_method
+    def _reportSendWorker(self):
+        title, body = self._report_draft
+        try:
+            bug_report.submit_report(title, body)
+        except bug_report.ReportError as e:
+            self.performSelectorOnMainThread_withObject_waitUntilDone_("reportFailedMain:", str(e), False)
+            return
+        self.performSelectorOnMainThread_withObject_waitUntilDone_("reportSentMain:", "", False)
+
+    def reportSentMain_(self, _):
+        self._showReportCard("sent")
+
+    def reportFailedMain_(self, message):
+        self._showReportCard("failed", error_message=str(message))
 
     # ----- about -----
     def showAbout_(self, sender):
