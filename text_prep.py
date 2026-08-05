@@ -6,6 +6,12 @@ import re
 # genuine decimals ("3.12"), which read fine as-is and must NOT be touched, so the left side
 # is required to start with a letter, not a digit.
 _FILENAME_DOT_RE = re.compile(r"\b([A-Za-z_][\w-]*)\.([A-Za-z]{1,6})\b")
+# "a.m"/"p.m" (from "a.m."/"p.m.") match the exact same one-letter-dot-one-letter shape as a
+# filename — confirmed directly in a real generated recording's transcript, Whisper heard
+# "4:37 a.m." respoken as "four... at dot M" after this turned it into "a dot m.". Excluded by
+# name rather than trying to generalize the regex, since these are the only common English
+# abbreviations that collide with the filename pattern at this length.
+_TIME_ABBREVIATIONS = {"a.m", "p.m"}
 
 # Words with an internal capital (not ALL-CAPS, which most engines already spell out
 # correctly as an acronym) can get an inconsistent or paused pronunciation — the phonemizer
@@ -131,7 +137,9 @@ def sanitize_for_speech(text):
     the text — these are phonemizer/prosody quirks, not something any one backend handles
     differently, so fixing it once here covers all of them."""
     text = _CONFUSABLE_RE.sub(lambda m: CONFUSABLE_LETTERS[m.group(0)], text)
-    text = _FILENAME_DOT_RE.sub(lambda m: f"{m.group(1)} dot {m.group(2)}", text)
+    text = _FILENAME_DOT_RE.sub(
+        lambda m: m.group(0) if m.group(0).lower() in _TIME_ABBREVIATIONS else f"{m.group(1)} dot {m.group(2)}",
+        text)
     text = _OVERRIDE_RE.sub(lambda m: PRONUNCIATION_OVERRIDES[m.group(0)], text)
     text = _pause_out_symbols(text)
     return text

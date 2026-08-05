@@ -257,6 +257,17 @@ def verify(audio, sample_rate, expected_text):
     for prev_w, next_w in zip(words, words[1:]):
         if (next_w.get("start", 0) - prev_w.get("end", 0)) > MAX_INTERNAL_GAP_SECONDS:
             return VerifyResult(False, 1.0, transcript, word_timings)
+    # A gap AFTER the last word has no "next word" for the loop above to ever compare
+    # against, so a clip that trails off into several seconds of dead air right before its own
+    # natural end passed undetected — confirmed directly against a real generated clip with a
+    # genuine 6.3s silent tail: correct words throughout, good CER, and this was the only
+    # signal that would have caught it. `trimmed` (not the original untrimmed `audio`) is the
+    # right reference length here — _trim_silence only cuts a leading/trailing span with no
+    # loud content at all, so if a real tail this long survives that trim, something quiet but
+    # non-silent (a breath, a hum) is anchoring the trim point past the real last word, which
+    # is exactly the case worth failing.
+    if words and (len(trimmed) / sample_rate - words[-1].get("end", 0)) > MAX_INTERNAL_GAP_SECONDS:
+        return VerifyResult(False, 1.0, transcript, word_timings)
 
     ref = normalize(expected_text)
     hyp = normalize(transcript)
