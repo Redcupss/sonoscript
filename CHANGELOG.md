@@ -429,7 +429,7 @@ reliably say the right thing — both now get their output checked, not just tim
 
 ### Added
 - Dropdown rows now fade out approaching whichever edge still has more
-  hidden content (same idea as Claude's own chat scroll), gone entirely at
+  hidden content (same idea as many chat-app scroll views), gone entirely at
   the actual top/bottom of the list — shrinking smoothly to nothing as you
   approach the true edge rather than snapping off. Only shows up on
   dropdowns long enough to scroll (the 28-voice Kokoro list, long
@@ -454,7 +454,7 @@ reliably say the right thing — both now get their output checked, not just tim
   part of the fade — reading as an empty gap rather than a name. A
   complete row that simply fades via opacity reads correctly at both ends.
 - Fade zone deepened (48pt -> 72pt) so more of the dropdown is visibly
-  involved in the dissolve, closer to the strength of Claude's own chat
+  involved in the dissolve, closer to the strength of a typical chat-app
   scroll shadow rather than a single-row hint.
 
 ### Fixed (during development, before landing)
