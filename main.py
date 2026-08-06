@@ -974,8 +974,8 @@ class AppDelegate(NSObject):
             clip.scrollToPoint_(NSMakePoint(0, target_origin_y))
             scroll.reflectScrolledClipView_(clip)
 
-            # Edge fade signals "more rows this way" the same way Claude's own chat scroll
-            # does — rows visibly fade out approaching whichever edge still has hidden content,
+            # Edge fade signals "more rows this way" the same way many chat-app scroll views
+            # do — rows visibly fade out approaching whichever edge still has hidden content,
             # gone entirely at whichever edge is the actual end of the list. This has to be a
             # real alpha MASK on the scroll view's own layer, not a colored gradient drawn on
             # top of it: the panel's background is a live translucent blur (NSVisualEffectView),
