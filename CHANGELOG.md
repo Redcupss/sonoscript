@@ -16,37 +16,31 @@ build number increments once per release regardless of version bump.
   if this doesn't hold up, the next step is trying a less-quantized Chatterbox variant instead of
   another re-recording.
 
-Also chased a user report of the app "getting stuck on the home screen trying to generate" —
-live-reproduced two fresh (non-cached) generations end to end with full log/UI instrumentation
-and both completed and played back normally. Could not force a repro. Likely the same
-no-CPU/no-error hang noted as unresolved in 1.12.2, now just more visible if the new Manny clip
-happens to need more retries.
+Also chased a reported generation stall — live-reproduced two fresh (non-cached) generations end
+to end with full log/UI instrumentation and both completed and played back normally. Could not
+force a repro. Likely the same no-CPU/no-error hang noted as unresolved in 1.12.2, now just more
+visible if the new Manny clip happens to need more retries.
 
 ## [1.12.2] (build 44) — 2026-08-04
 
-Prompted by a real report relayed secondhand ("Manny doesn't work at all in Chatterbox," "his
-voice changed halfway through in Sesame") — reproduced directly with the friend's actual text
-rather than guessed at, including transcribing her real Sesame recording with the app's own
-bundled Whisper model to see exactly what went wrong. Four real, distinct issues found; three
-fully fixed, one substantially mitigated but honestly not eliminated.
+Investigated a Chatterbox/Sesame reliability report using real generated audio and Whisper
+transcription for ground truth rather than guessing at the cause. Four real, distinct issues
+found; three fully fixed, one substantially mitigated but honestly not eliminated.
 
 ### Fixed
 - **"4:37 a.m." became "4:37 a dot m."** `text_prep.py`'s filename-detection regex (built to
   turn "example.file" into "example dot file") was matching "a.m."/"p.m." too — a single letter,
-  a dot, another single letter is exactly the same shape as a short file extension. Confirmed
-  directly in the friend's real recording: Whisper transcribed the result as "four... at dot M."
-  Now excludes these two specific abbreviations by name rather than trying to generalize the
-  regex further.
+  a dot, another single letter is exactly the same shape as a short file extension. Now excludes
+  these two specific abbreviations by name rather than trying to generalize the regex further.
 - **A silent gap after the last word of a chunk could pass verification undetected.** The
   internal-gap check added in 1.11.5 only ever compared consecutive *recognized words* against
   each other — it had no way to notice dead air sitting *after* the last word, before the
-  chunk's own audio actually ends. Confirmed directly: the friend's real recording has a genuine
-  6.3-second silent gap between "afterward." and "And" — precisely where she described a pause —
-  and it's exactly this blind spot, since there's no word after "afterward." within that chunk
-  for the old check to compare against. Now also compares the last recognized word's end time
-  against the audio's own trimmed length.
+  chunk's own audio actually ends. Confirmed directly against a real generated clip with a
+  multi-second silent gap after its last recognized word, and it's exactly this blind spot,
+  since there's no following word for the old check to compare against. Now also compares the
+  last recognized word's end time against the audio's own trimmed length.
 - **Chatterbox was silently capped at ~32 seconds of audio per chunk, no matter what.** The real
-  bug behind "doesn't work at all": `main.py` was calling `engine.generate(..., max_new_tokens=)`
+  bug behind the truncation: `main.py` was calling `engine.generate(..., max_new_tokens=)`
   — but that's the parameter name for the older, non-Turbo Chatterbox model. The Turbo model
   this app actually loads uses `max_tokens` instead, defaults to 800, and has no
   `max_new_tokens` parameter at all — so the app's own length-scaling logic (added in 1.11.4
@@ -59,7 +53,7 @@ fully fixed, one substantially mitigated but honestly not eliminated.
 ### Changed
 - **Chatterbox's retry budget raised from 3 attempts to 5** (`CHATTERBOX_MAX_RETRIES` 2→4,
   matching Sesame's existing budget). Measured directly, not assumed: an isolated 8-trial batch
-  on the friend's real content passed only 2 times — a ~75% per-attempt failure rate — and
+  on hard content passed only 2 times — a ~75% per-attempt failure rate — and
   strikingly bimodal, not a smooth quality gradient: every failure scored a complete,
   unrelated-to-the-source mismatch, every pass scored well under the threshold. That matches
   this model family's own documented "autoregressive collapse" pattern rather than ordinary
@@ -71,7 +65,7 @@ fully fixed, one substantially mitigated but honestly not eliminated.
   the already-documented foreign-word-pronunciation limitation.
 
 Also investigated a real, separate symptom — the app going fully unresponsive (0% CPU, no
-error, no crash) partway through the friend's story — but could not reproduce it across 20+
+error, no crash) partway through a long document — but could not reproduce it across 20+
 controlled test runs after the fixes above landed, including the exact sequence that first
 surfaced it. Left honestly unresolved rather than claimed fixed; it may have been a downstream
 consequence of the truncation bug interacting with something not yet understood, or a rarer
