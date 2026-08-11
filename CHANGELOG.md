@@ -4,6 +4,32 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.13.0] (build 48) — 2026-08-11
+
+### Added
+- **Browser extension (Chrome/Edge, not Safari yet)**: read any web page aloud using
+  SonoScript's own voice engine instead of the browser's built-in TTS. A local-only listener
+  hands the extension a fresh per-launch token over Chrome/Edge Native Messaging — the only way
+  to obtain it, verified end to end — rather than any open network-reachable auth. Automatic
+  whole-page content detection strips ads/navigation/photo captions the way Firefox's own
+  Reader View does (via Readability.js), with a manual "read selection" override for anything it
+  gets wrong. Full technical design in `browser_extension/DESIGN.md`.
+- **In-page floating playback toolbar** — play/pause/skip/scrubber/voice picker, modeled on
+  Edge's own Read Aloud bar, with SonoScript's own window no longer jumping to the front on
+  every read.
+- **Real "Liquid Glass" material on the toolbar**, via [liquidGL](https://github.com/naughtyduk/liquidGL)
+  (a real WebGL library, not a CSS approximation — an earlier `backdrop-filter` + SVG-filter
+  attempt was fully replaced after several rounds of fixes still couldn't handle scroll
+  correctly, a limitation in backdrop-filter itself, not a bug). Vendored and patched at
+  `browser_extension/liquidGL.js`: closed-Shadow-DOM element targeting, clean teardown on
+  repeated toolbar open/close, a bevelWidth fix for this bar's extreme aspect ratio, a
+  refraction-direction bug that made the effect bulge like a circle instead of tracking the
+  bar's actual rounded-rect shape, and a second blur patched directly into the fragment shader
+  so it applies before refraction/aberration rather than after. Toolbar text/icon color now
+  reads real luminance off the rendered glass (sampling liquidGL's own canvas) and picks between
+  a fixed dark-gray and near-white accordingly, so it stays legible over both light and dark
+  page content.
+
 ## [1.12.5] (build 47) — 2026-08-08
 
 ### Changed
