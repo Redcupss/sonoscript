@@ -53,6 +53,12 @@ from widgets import (
 APP_NAME = "SonoScript"
 APP_VERSION = "1.13.0"
 APP_BUILD = "48"
+# Set only when native_host.py cold-launches the app on the extension's behalf (see that file's
+# own _launch_in_background()) — `open -a SonoScript --args --browser-launch` forwards this into
+# sys.argv exactly like any other command-line launch. `open -g` (also used there) only stops
+# macOS/Launch Services from ACTIVATING the app; it can't reach into the app to stop it from
+# showing its own window, which is what checking this flag in build_window() actually does.
+BROWSER_LAUNCH = "--browser-launch" in sys.argv
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -663,14 +669,21 @@ class AppDelegate(NSObject):
         self.root.addSubview_(self.wordmark)
 
         self.screen_view = None
-        self.window.orderFront_(None)
-        # activateIgnoringOtherApps_ is what steals keyboard focus from whatever app you're
-        # actually using — skipped in the same dev-testing mode as the window position above,
-        # so a background test launch doesn't interrupt anything. makeKeyAndOrderFront_ (the
-        # normal path) both shows AND focuses the window; orderFront_ alone just shows it.
-        if not os.environ.get("SONOSCRIPT_DEV_QUIET"):
-            self.window.makeKeyAndOrderFront_(None)
-            AppKit.NSApp.activateIgnoringOtherApps_(True)
+        # BROWSER_LAUNCH skips orderFront_ entirely — the app was cold-started only to serve a
+        # browser-extension read request, and no window should appear at all, not even
+        # unfocused. That's stronger than SONOSCRIPT_DEV_QUIET below, which still shows the
+        # window (via orderFront_) and only skips the two calls that would additionally steal
+        # keyboard focus from whatever app the user is actually looking at.
+        if not BROWSER_LAUNCH:
+            self.window.orderFront_(None)
+            # activateIgnoringOtherApps_ is what steals keyboard focus from whatever app you're
+            # actually using — skipped in the same dev-testing mode as the window position
+            # above, so a background test launch doesn't interrupt anything.
+            # makeKeyAndOrderFront_ (the normal path) both shows AND focuses the window;
+            # orderFront_ alone just shows it.
+            if not os.environ.get("SONOSCRIPT_DEV_QUIET"):
+                self.window.makeKeyAndOrderFront_(None)
+                AppKit.NSApp.activateIgnoringOtherApps_(True)
 
     @objc.python_method
     def swap_screen(self, view):

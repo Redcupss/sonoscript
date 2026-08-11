@@ -16,14 +16,27 @@ selection aloud," SonoScript reads it. First real usage surfaced two real gaps i
   a channel ordinary web-page JavaScript is structurally incapable of reaching (not merely
   permission-gated; the API doesn't exist for page scripts at all). This closes off any
   malicious website trying to trigger playback or otherwise reach the local listener.
-- `native_host.py` is a dependency-free script whose only job is reading that token file and
-  handing it back over the native-messaging channel.
+- `native_host.py` is a dependency-free script that reads the token file and hands it back over
+  the native-messaging channel — and, if SonoScript isn't already running, launches it first and
+  waits.
 - Verified directly: unauthorized requests get rejected (403), authorized ones succeed and
   trigger real generation; the native host correctly implements the messaging protocol and
   returns the live, current token.
 
-**Known gap, not yet built**: SonoScript has to already be running. Nothing launches it
-automatically yet if it's closed.
+**Auto-launch, shipped.** SonoScript no longer has to already be running. `native_host.py` checks
+whether the local listener is actually accepting connections on its known port — not whether the
+token *file* exists, which is never deleted on quit and would otherwise make a stale file from a
+previous session look identical to a currently-running instance. If it isn't up, `open -g -a
+SonoScript --args --browser-launch` starts it and the host polls (with a bounded timeout) until
+the port comes alive, then reads the token. `open -g` only stops macOS from activating/focusing
+the newly launched app; it can't reach into the app to suppress its own window. That's what the
+`--browser-launch` argument does — `main.py` checks for it in `sys.argv` at startup
+(`BROWSER_LAUNCH`) and skips showing the main window entirely on that path, stronger than the
+existing `SONOSCRIPT_DEV_QUIET` env var (which still shows the window, just without stealing
+keyboard focus). Not yet tested against an actual packaged `.app` bundle launched this way end to
+end — the port-detection, launch-and-poll, and `sys.argv` flag logic are each verified directly
+(including against the real running app), but the full path through Launch Services and a frozen
+py2app bundle's argv handling hasn't been exercised outside code review.
 
 ## Content-detection strategy (revised after first real use)
 
