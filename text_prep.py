@@ -1,5 +1,17 @@
 import re
 
+# Web-extracted text regularly loses the space between two sentences at a block-element
+# boundary (Readability's/the DOM's own textContent just concatenates adjacent text nodes with
+# nothing between them) — confirmed directly against a real extracted article: "...command
+# centers.They were banks.Israeli fighter jets..." got read as "command center DOT they were
+# banks DOT isreal...", because a lowercase-letter-period-immediately-followed-by-a-capital-
+# letter is exactly the shape _FILENAME_DOT_RE below is designed to catch and mistook it for a
+# filename. Real file extensions are essentially always lowercase ("example.txt", not
+# "example.Txt") — that asymmetry is the reliable signal used here to tell the two apart: insert
+# the missing space (restoring a normal sentence break) whenever a lowercase letter is followed
+# immediately by a period and then an uppercase letter, before the filename regex ever runs, so
+# it no longer has a same-shaped, space-free match to misfire on.
+_MISSING_SENTENCE_SPACE_RE = re.compile(r"([a-z])\.([A-Z])")
 # A period with no surrounding whitespace almost never ends a sentence in normal prose —
 # real sentence-ending periods are followed by a space (or end of text). This is what
 # distinguishes "example.file" from "End of sentence. Next one." — but it also matches
@@ -65,11 +77,37 @@ _COLON_RE = re.compile(r"(?<!\d):(?!\d)")
 _SEMICOLON_RE = re.compile(r";")
 _PAREN_OPEN_RE = re.compile(r"\s*\(\s*")
 _PAREN_CLOSE_RE = re.compile(r"\s*\)")
+# An em dash reads as a natural pause in real speech (setting off a parenthetical or an abrupt
+# turn, the same job a comma or parenthesis does) — confirmed directly by ear against real
+# generated audio that neither Chatterbox nor Sesame pause on it at all without this: the model
+# just reads straight through as if the dash weren't there. Spaced on both sides first so an
+# unspaced em dash ("Utah—both dressed") doesn't fuse into "Utah, both" with no gap at all once
+# turned into a bare comma.
+#
+# Deliberately NOT widened to an en dash or a plain double hyphen, despite both being common
+# plain-text em-dash substitutes — tried that and reverted it after real testing turned up two
+# separate regressions: an en dash has its own distinct, standard job (a number range, "1997–
+# 2003") that isn't a pause at all and would get mispronounced as two separate numbers; a bare
+# "--" collides with ordinary technical text (CLI flags like "--verbose", JS/TS spread syntax
+# "...args", Markdown/YAML "---" delimiters), none of which this app has any way to tell apart
+# from a real dash substitute. Same reasoning for ellipsis below — only the real character.
+_EM_DASH_RE = re.compile(r"\s*—\s*")
+# An ellipsis marks a trailing-off pause, the same shape as a comma's — confirmed directly on
+# real dialogue-heavy text ("We didn't…it's a team sport") where Sesame turned this into
+# outright unrelated word insertions rather than any kind of pause.
+_ELLIPSIS_RE = re.compile(r"\s*…\s*")
 # A colon/semicolon/paren landing immediately before existing punctuation (a parenthetical
 # right at the end of a sentence, e.g. "...offerings (like this one)." ) would otherwise leave
 # a stray ", ." or ",," behind once turned into a comma — collapse that down to just the
 # punctuation that was already there.
 _REDUNDANT_PUNCT_RE = re.compile(r",\s*([.,!?;:])")
+# Same problem, reverse order: an em dash/ellipsis landing immediately AFTER a sentence's real
+# terminal punctuation (an attribution dash right after a closing quote's period, dialogue that
+# ends right where a converted-to-comma symbol used to be) leaves a stray ".," behind that the
+# rule above doesn't catch, since it only ever looks for comma-then-punctuation, not
+# punctuation-then-comma. Confirmed against real cases: a quote-attribution em dash right after
+# a period, and dialogue ending right at a closing quote mark.
+_REDUNDANT_PUNCT_RE_REVERSE = re.compile(r"([.!?])\s*,")
 
 
 def _pause_out_symbols(text):
@@ -77,7 +115,35 @@ def _pause_out_symbols(text):
     text = _PAREN_CLOSE_RE.sub(",", text)
     text = _COLON_RE.sub(",", text)
     text = _SEMICOLON_RE.sub(",", text)
-    return _REDUNDANT_PUNCT_RE.sub(r"\1", text)
+    text = _EM_DASH_RE.sub(", ", text)
+    text = _ELLIPSIS_RE.sub(", ", text)
+    text = _REDUNDANT_PUNCT_RE.sub(r"\1", text)
+    return _REDUNDANT_PUNCT_RE_REVERSE.sub(r"\1", text)
+
+
+# Chatterbox: a literal double/smart quote character is a confirmed, deterministic bug in this
+# exact model build (mlx-community Chatterbox Turbo, upstream issue #433) — it produces a ~1.2s
+# non-speech "sigh" sound, unrelated to voice or content. Sesame has no equivalent filed bug,
+# but confirmed directly by isolated testing (identical dialogue text, "Lehi, Utah" sentence
+# removed to rule it out as the cause) that the SAME shape of text — curly quotes plus an
+# ellipsis — reliably produces real word-level nonsense inserted into the sentence, not the
+# collapse-to-garbage pattern documented elsewhere for these models. Previously only applied to
+# Chatterbox (main.py had its own inline version of this exact fix); centralized here so Sesame
+# gets the same protection instead of silently lacking it. Straight/curly double quotes and the
+# curly OPENING single quote (‘) are unambiguously quote marks, safe to remove outright.
+_PROBLEM_QUOTES_RE = re.compile("[\"“”‘]")
+# The curly CLOSING single quote (’) does double duty as a real apostrophe in contractions
+# ("didn't") — unlike the marks above, deleting it outright turns "didn't" into "didnt",
+# "he'll" into "hell", "we're" into "were": different words, different pronunciation, not just
+# a missing squiggle. Normalizing to a plain straight apostrophe instead keeps the contraction
+# intact for every backend while still removing the exact curly-quote-shaped character
+# confirmed to trigger the Chatterbox/Sesame bugs above.
+_CURLY_APOSTROPHE_RE = re.compile("’")
+
+
+def strip_problem_quotes(text):
+    text = _CURLY_APOSTROPHE_RE.sub("'", text)
+    return _PROBLEM_QUOTES_RE.sub("", text)
 
 # A blank-line gap (one or more empty/whitespace-only lines) between two lines of text — a
 # real paragraph break, as opposed to a single mid-paragraph line wrap from word-wrapped or
@@ -137,6 +203,7 @@ def sanitize_for_speech(text):
     the text — these are phonemizer/prosody quirks, not something any one backend handles
     differently, so fixing it once here covers all of them."""
     text = _CONFUSABLE_RE.sub(lambda m: CONFUSABLE_LETTERS[m.group(0)], text)
+    text = _MISSING_SENTENCE_SPACE_RE.sub(r"\1. \2", text)
     text = _FILENAME_DOT_RE.sub(
         lambda m: m.group(0) if m.group(0).lower() in _TIME_ABBREVIATIONS else f"{m.group(1)} dot {m.group(2)}",
         text)

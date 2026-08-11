@@ -31,13 +31,14 @@ from Foundation import (
     NSRunLoop, NSDate, NSDefaultRunLoopMode,
 )
 
+import browser_bridge
 import bug_report
 import speech_verify
 from chunking import chunk_text, CHUNK_TARGET_CHARS, chatterbox_chunk_target
 from config import SESAME_ASSETS_DIR, load_config, save_config, sesame_voices_path
 import history
 import saved
-from text_prep import sanitize_for_speech, normalize_paragraph_breaks
+from text_prep import sanitize_for_speech, normalize_paragraph_breaks, strip_problem_quotes
 from ui_helpers import (
     white, fix_anchor, build_waveform_bars, make_label, symbol_image, format_playback_time,
     format_relative_time,
@@ -50,8 +51,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.12.3"
-APP_BUILD = "45"
+APP_VERSION = "1.12.5"
+APP_BUILD = "47"
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -97,11 +98,40 @@ KEYLESS_PROVIDERS = ("System", "Chatterbox")  # no API key needed — bundled/on
 # flows through the same key_field/_validateKeyWorker/_isConfigured path every other provider
 # uses; it's just verified offline (see license.py) instead of over the network.
 
+def _localTestVoices():
+    # Personal voices for local testing only, e.g. a friend's clip being tried out before
+    # deciding whether it's worth a real release — deliberately loaded from a dotfile OUTSIDE
+    # this repo/the py2app bundle (never a git-tracked path), so they can never end up shipped
+    # to a real install by accident, even if this loader function itself does (harmless: it's a
+    # no-op without the file). ref_audio here is an absolute path, not a bundled filename —
+    # _resourcePath's own os.path.join passes an absolute path through unchanged.
+    path = os.path.expanduser("~/.sonoscript_dev_voices.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            voices = json.load(f)
+        # CHATTERBOX_VOICES = [...] + _localTestVoices() runs at MODULE IMPORT TIME, before any
+        # UI exists — a malformed dotfile (not a list, or an entry missing the keys every other
+        # voice dict here has) must not turn into an unhandled TypeError/KeyError there, which
+        # would silently prevent the app from launching at all over a file nothing but this
+        # loader itself ever touches.
+        if not isinstance(voices, list):
+            return []
+        # "ref_audio" is required too, not just "id"/"label" — _requestChatterboxTTS indexes
+        # voice["ref_audio"] directly (every built-in entry above always has the key, even when
+        # the value is None for nova), so an entry missing it would pass this filter cleanly and
+        # then raise an unhandled KeyError the moment it's actually selected and used.
+        return [v for v in voices if isinstance(v, dict) and "id" in v and "label" in v and "ref_audio" in v]
+    except Exception:
+        return []
+
+
 CHATTERBOX_VOICES = [
     {"id": "nova", "label": "Nova (American, Female)", "ref_audio": None},
     {"id": "sadie", "label": "Sadie (American, Female)", "ref_audio": "sadie.wav"},
     {"id": "manny", "label": "Manny (American, Male)", "ref_audio": "manny.wav"},
-]
+] + _localTestVoices()
 SPEEDS = ["0.5x", "0.8x", "1.0x", "1.25x", "1.5x"]  # real multipliers actually applied
 
 # Chatterbox's natural speaking pace runs a little fast — a genuine 0.8x slowdown is what
@@ -123,6 +153,22 @@ CHATTERBOX_SPEED_REAL = {v: k for k, v in CHATTERBOX_SPEED_DISPLAY.items()}
 # be meaningful — a very short chunk's fixed generation overhead would trip this on its own.
 CHATTERBOX_MIN_CHARS_PER_SEC = 11.5
 CHATTERBOX_MIN_CHARS_FOR_CHECK = 50
+# Measured directly (see _generateChatterboxAudio's own comment on max_tokens): 800 tokens
+# produced 32.2s of audio, identically across two different real chunk lengths — 800/32.2 =
+# 24.84 speech tokens per second of audio.
+CHATTERBOX_SPEECH_TOKENS_PER_SECOND = 24.84
+# A real, measured baseline (not a guess): a normal Chatterbox chunk took ~6.5-7.5 real
+# wall-clock seconds end to end across independent samples during diagnostic testing. Used as
+# the grounding unit for the retry-budget deadlines in _generateChatterboxAudio/
+# _generateSesameAudio below, instead of picking floor/ceiling numbers with no real basis —
+# reused for Sesame too in the absence of a separate Sesame-specific measurement, as a
+# reasonable cross-provider estimate (both run on the same MLX stack on the same hardware).
+TTS_TYPICAL_GENERATION_SECONDS = 7.5
+# For a "seek" job specifically — the user is actively waiting on this one, watching a
+# spinner, not something that can quietly finish in the background — so it gets a generous,
+# flat ceiling (about 5 typical attempts' worth) rather than being scaled to buffer slack like
+# a prefetch job is, since there IS no buffer to protect here.
+TTS_SEEK_DEADLINE_SECONDS = TTS_TYPICAL_GENERATION_SECONDS * 5
 # Same reasoning as SESAME_MAX_RETRIES below, now measured directly for this model too: an
 # isolated 8-trial batch on a real chunk that repeatedly failed in production (same text,
 # same voice, same settings) passed only 2/8 attempts — a ~75% per-attempt failure rate, and
@@ -370,6 +416,10 @@ class AppDelegate(NSObject):
         self._report_field_refs = {}
         self._report_draft = None
         self._rec_script_fade_observer = None
+        # Set once browser_bridge.start() succeeds in applicationDidFinishLaunching_ — stays
+        # None if that bind failed (see the try/except there), so every broadcast call below is
+        # a safe no-op rather than needing its own guard against a missing bridge.
+        self._browser_bridge_server = None
         # Settings > Data & Storage pending state — what the user is currently configuring,
         # separate from what's actually stored in history.py until storageConfirmClicked_
         # applies it. Init'd from real config the first time showSettingsScreen runs.
@@ -389,6 +439,8 @@ class AppDelegate(NSObject):
         self.avg_chars_per_sec = None  # running speech-rate estimate, refined as real durations come in
         self.chunk_index = 0
         self.next_chunk_audio = None
+        self._pending_seek_offset = 0.0  # see _seekToVirtualTime/_broadcastPlaybackState
+        self._seek_generation_pending = False  # see _seekToVirtualTime/applyControlCommand_
         self._prefetch_frontier = 0  # highest chunk index a prefetch job has been queued for
         self.chunk_audio_cache = {}  # index -> already-generated audio bytes, so scrubbing back
                                       # to a chunk you've already heard replays it exactly
@@ -441,6 +493,16 @@ class AppDelegate(NSObject):
 
         # silent update check on launch
         threading.Thread(target=self._checkUpdateWorker, args=(True,), daemon=True).start()
+
+        # Local-only listener the browser extension hands selected text off to — see
+        # browser_bridge.py. Runs for the app's whole lifetime, same as the TTS worker thread.
+        # Binding can fail (e.g. another SonoScript instance already holds the port) — that
+        # must not take the whole app down on launch, just leave browser-read unavailable.
+        try:
+            self._browser_bridge_server = browser_bridge.start(
+                self._handleBrowserReadRequest, self._handleControlCommand)
+        except OSError:
+            traceback.print_exc(file=sys.stderr)
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, app):
         # Standard Mac app lifecycle: closing the window is not the same as quitting. Staying
@@ -1889,13 +1951,10 @@ class AppDelegate(NSObject):
         # allowsUndo defaults to NO for a plain (non-field-editor) NSTextView — without this,
         # Cmd-Z/Cmd-Shift-Z are silent no-ops no matter how the undo manager itself resolves.
         self.text_view.setAllowsUndo_(True)
-        # A programmatically-created NSTextView defaults spell-checking off. Continuous
-        # checking (the red squiggle) only, not automatic correction — this box is mostly
-        # pasted text from elsewhere, and silently rewriting someone's pasted words would be
-        # far worse than leaving an actual typo unflagged.
+        # A programmatically-created NSTextView defaults spell-checking off.
         self.text_view.setContinuousSpellCheckingEnabled_(True)
         self.text_view.setGrammarCheckingEnabled_(True)
-        self.text_view.setAutomaticSpellingCorrectionEnabled_(False)
+        self.text_view.setAutomaticSpellingCorrectionEnabled_(True)
         self.text_view.setDelegate_(self)
         self.text_view.focus_callback = self._cardFocusChanged
         scroll.setDocumentView_(self.text_view)
@@ -2060,6 +2119,7 @@ class AppDelegate(NSObject):
             ctx.setDuration_(0.35)
             self.status_label.animator().setAlphaValue_(1.0 if text else 0.0)
         AppKit.NSAnimationContext.runAnimationGroup_(anim)
+        self._broadcastPlaybackState()
 
     def setStatusMain_(self, text):
         self.setStatus(str(text))
@@ -2168,6 +2228,7 @@ class AppDelegate(NSObject):
                 return
             self._setVoiceId(chosen)
             self._invalidateUngeneratedChunks()
+            self._broadcastPlaybackState()
 
     @objc.python_method
     def _setVoiceId(self, voice_id, provider=None):
@@ -2401,6 +2462,7 @@ class AppDelegate(NSObject):
                 # for free — no separate "how long were we paused" bookkeeping needed.
                 self._syncWordHighlightNow()
             self._syncPlaybackUI()
+            self._broadcastPlaybackState()
             return
         text = str(self.text_view.string())
         if not text or not self._isConfigured():
@@ -2434,9 +2496,167 @@ class AppDelegate(NSObject):
         self._seekToVirtualTime(0.0)
 
     @objc.python_method
+    def _handleBrowserReadRequest(self, text):
+        # Called from browser_bridge's own background thread, never the main/UI thread — hop
+        # over before touching any AppKit object, same rule as every other background
+        # callback in this app (see _chunkWorker's matching call).
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "beginBrowserRead:", text, False)
+
+    def beginBrowserRead_(self, text):
+        if not self._isConfigured():
+            return
+        if self._rec_stream is not None:
+            # A browser-read request is about to play TTS through the speakers — must not let
+            # that bleed into a live mic capture, same contamination _startRecording already
+            # guards against in the opposite direction. dismissOverlay() below can't help here
+            # on its own: it deliberately no-ops while a recording stream is active (see its
+            # own comment), so the stream needs the same explicit teardown
+            # recordingCancelClicked_ already uses.
+            self._teardownActiveRecording()
+        # Deliberately does NOT bring the window/app to the front (no
+        # makeKeyAndOrderFront_/activateIgnoringOtherApps_) — the whole point of the toolbar is
+        # that SonoScript stays a background engine while reading from the browser; forcing
+        # focus away from the page the user is actually looking at defeats that. showMainScreen
+        # still runs so the app's own window (if the user opens it later) reflects the current
+        # session instead of whatever screen it was last left on.
+        self.showMainScreen()
+        self.dismissOverlay()
+        self.stopPlayback_(None)
+        self.text_view.setString_(text)
+        self.updateCharCount()
+        self.playPauseClicked_(None)
+
+    @objc.python_method
+    def _handleControlCommand(self, cmd):
+        # Called from browser_bridge's WebSocket-reader thread — same main-thread hop rule as
+        # _handleBrowserReadRequest above. Plain Python dicts already cross this exact bridge
+        # call successfully elsewhere in this app (see _startRecording's level/elapsed payload
+        # to recLevelMain:), so no extra marshalling is needed here.
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "applyControlCommand:", cmd, False)
+
+    def applyControlCommand_(self, cmd):
+        # Reached via performSelectorOnMainThread_withObject_waitUntilDone_ from a background
+        # WebSocket-reader thread's callback — same silent-swallow risk already documented on
+        # _scheduleNextWordTimer/_fireWordHighlightTimer (an uncaught exception here has nowhere
+        # else to surface), so it gets the same explicit guard those already use.
+        try:
+            action = cmd.get("cmd")
+            if action == "play":
+                if self._seek_generation_pending:
+                    # A seek/skip is already mid-regeneration and already carries should_play —
+                    # it'll start on its own the moment it lands (see chunkResultMain_'s "seek"
+                    # branch). self.player is None here for that same normal reason, not because
+                    # the session is idle — calling playPauseClicked_ in this window is exactly
+                    # what fell through to its fresh-restart-from-0 branch and cancelled the
+                    # seek/skip that was already in flight, snapping back to the beginning.
+                    pass
+                elif self.player is None or not self.player.isPlaying():
+                    self.playPauseClicked_(None)
+            elif action == "pause":
+                if self.player is not None and self.player.isPlaying():
+                    self.playPauseClicked_(None)
+            elif action == "skip_back":
+                self.skipBack_(None)
+            elif action == "skip_forward":
+                self.skipForward_(None)
+            elif action == "stop":
+                self.stopPlayback_(None)
+            elif action == "seek":
+                fraction = cmd.get("fraction")
+                if isinstance(fraction, (int, float)) and self.all_chunks:
+                    target = max(0.0, min(1.0, fraction)) * self._totalEstimatedDuration()
+                    was_playing = self.player is not None and self.player.isPlaying()
+                    self._seekToVirtualTime(target, should_play=was_playing)
+            elif action == "set_voice":
+                voice_id = cmd.get("voice_id")
+                if voice_id in self.voice_ids and voice_id != CREATE_VOICE_SENTINEL:
+                    self.voice_popup.selectItemAtIndex_(self.voice_ids.index(voice_id))
+                    self.voiceChanged_(None)
+            elif action == "get_voices":
+                self._broadcastVoiceList()
+            # "get_state" (or anything else/unrecognized) falls through to the unconditional
+            # broadcast below — every command gets a fresh state snapshot back regardless of
+            # whether it changed anything, so the toolbar can't drift out of sync with a
+            # dropped or out-of-order push.
+            self._broadcastPlaybackState()
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+
+    @objc.python_method
+    def _broadcastPlaybackState(self):
+        if self._browser_bridge_server is None:
+            return
+        playing = self.player is not None and self.player.isPlaying()
+        if self.all_chunks and self.player is not None:
+            elapsed = self._cumulativeDurationBefore(self.chunk_index) + self.player.currentTime()
+            total = self._totalEstimatedDuration()
+        elif self.all_chunks:
+            # No player yet, but a real session exists — almost always mid-seek/skip, waiting
+            # on the target chunk to finish generating. Report the intended landing position
+            # (see _seekToVirtualTime) instead of a bare 0.0, which is what made a toolbar look
+            # like it snapped back to the very beginning on every seek/skip that needed fresh
+            # generation, even though the actual target was never lost.
+            elapsed = self._cumulativeDurationBefore(self.chunk_index) + self._pending_seek_offset
+            total = self._totalEstimatedDuration()
+        else:
+            elapsed, total = 0.0, 0.0
+        current_word = None
+        timings = self.chunk_word_timings.get(self.chunk_index) if self.all_chunks else None
+        if timings and 0 <= self._highlight_word_index < len(timings):
+            current_word = timings[self._highlight_word_index]["text"]
+        self._browser_bridge_server.broadcast_state({
+            "type": "state",
+            "playing": playing,
+            "elapsed": elapsed,
+            "total": total,
+            "fraction": (elapsed / total) if total > 0 else 0.0,
+            "voice_id": self.config.get("voice_id"),
+            "provider": self.config.get("provider"),
+            "current_word": current_word,
+            # Same signal status_label's own pulsing text/ShimmerBorderView key off of (see
+            # setStatus) — mirrored here so the toolbar can show the same "actively working"
+            # cue instead of just going quiet while a chunk generates.
+            "generating": getattr(self, "_status_text", "") == "Generating...",
+        })
+
+    @objc.python_method
+    def _broadcastVoiceList(self):
+        if self._browser_bridge_server is None:
+            return
+        # self._voice_labels, not voice_popup.itemTitles() — voice_popup is FlatPopUpButton, a
+        # custom-drawn control (see PyObjC-control feedback elsewhere in this codebase), not a
+        # real NSPopUpButton, so it doesn't implement that selector. _populateVoiceMenu already
+        # caches exactly this list for the same reason (see showMainScreen's own restore path).
+        titles = list(self._voice_labels)
+        voices = [
+            {"id": vid, "label": titles[i] if i < len(titles) else vid}
+            for i, vid in enumerate(self.voice_ids) if vid != CREATE_VOICE_SENTINEL
+        ]
+        self._browser_bridge_server.broadcast_state({
+            "type": "voices",
+            "voices": voices,
+            "current_voice_id": self.config.get("voice_id"),
+        })
+
+    @objc.python_method
     def _requestTTS(self, text):
-        text = sanitize_for_speech(text)
         provider = self.config.get("provider", "ElevenLabs")
+        if provider in ("Chatterbox", "Sesame"):
+            # See text_prep.strip_problem_quotes' own comment for why: a confirmed Chatterbox
+            # upstream bug, and Sesame shows a different but equally real failure mode on the
+            # same class of text. Single call site rather than one inside each provider's own
+            # generate method, so a new call path can't end up silently missing it. MUST run
+            # before sanitize_for_speech, not after: a literal quote character sitting right
+            # between real terminal punctuation and an em-dash/ellipsis (e.g. dialogue with an
+            # attribution dash, `"Enough."—he said`) blocks sanitize_for_speech's own redundant-
+            # punctuation cleanup from matching (it only bridges whitespace, not a quote
+            # character) — stripping the quote here first removes that obstruction instead of
+            # leaving a stray ".," artifact behind.
+            text = strip_problem_quotes(text)
+        text = sanitize_for_speech(text)
         key = self.config.get("api_key", "")
         voice = self.config.get("voice_id", "")
         speed = float(self.config.get("speed", "0.8x").rstrip("x"))
@@ -2614,20 +2834,19 @@ class AppDelegate(NSObject):
         # with the longer one cut off mid-sentence as a result. split_pattern=None (below)
         # means the WHOLE chunk goes through as one ungapped generation with no fallback
         # re-segmentation, so this cap applies to the chunk's entire content at once, not
-        # per-sentence. 4 tokens/char follows the library's own internal comment on its
-        # sentence-splitting heuristic (~8 speech tokens per text token, ~4 chars per text
-        # token) rather than reusing the old model's 15-tokens/char figure, which was
-        # calibrated for a different model's token semantics and never actually exercised here.
-        # Headroom check: GPT2's positional embedding table caps the whole sequence (voice
-        # conditioning + text + speech tokens) at 8196 positions; even this app's largest
-        # possible chunk (CHUNK_MAX_CHARS=900) stays well under that with real margin to spare.
-        max_tokens = max(800, len(text) * 4)
-        #
-        # Literal double/smart quotes are a confirmed, deterministic bug in this exact model
-        # build (mlx-community Chatterbox Turbo, upstream issue #433) — any literal quote
-        # character produces a ~1.2s non-speech "sigh" sound, unrelated to voice or content.
-        # Free, independent fix, cheaper to prevent here than to catch via verification below.
-        text = text.translate(str.maketrans("", "", "\"“”"))
+        # per-sentence. Capped at the timing_ok accept boundary below (CHATTERBOX_MIN_CHARS_PER_SEC),
+        # not the old flat "4 tokens/char" (a text-token heuristic from the library's own docs,
+        # never actually resolved into a speech-tokens-per-char figure) — that old cap permitted
+        # audio paced at 6.2 chars/sec, ~1.85x more tokens than timing_ok could EVER accept
+        # (11.5 chars/sec), which is provably wasted generation (and a proportionally slower
+        # vocoder pass, and — worse — a full Whisper verification pass on a clip already
+        # guaranteed to fail) on every attempt that runs to the cap instead of finishing early.
+        # 5% margin above the exact boundary so a legitimately-paced clip doesn't get clipped
+        # right at the edge. Headroom check: GPT2's positional embedding table caps the whole
+        # sequence (voice conditioning + text + speech tokens) at 8196 positions; even this
+        # app's largest possible chunk (CHUNK_MAX_CHARS=900) stays well under that either way.
+        max_tokens = max(300, int(
+            len(text) / CHATTERBOX_MIN_CHARS_PER_SEC * CHATTERBOX_SPEECH_TOKENS_PER_SECOND * 1.05))
 
         # Short inputs are a confirmed, unresolved weak spot for this model (single words/
         # short phrases reliably producing gibberish, upstream issue #97) — and independently
@@ -2636,6 +2855,17 @@ class AppDelegate(NSObject):
         # chances on exactly the input shape most likely to need it.
         is_short = len(text.split()) < speech_verify.SHORT_INPUT_WORD_COUNT
         max_retries = CHATTERBOX_MAX_RETRIES + (1 if is_short else 0)
+        # Set by _chunkWorker right before this call — how much real time this specific job can
+        # spend retrying before it's costing more than it's worth (see _slackSecondsFor for
+        # prefetch jobs, TTS_SEEK_DEADLINE_SECONDS for seek jobs). Measured CUMULATIVELY from
+        # the top of this whole retry loop, not reset per attempt — a per-attempt reset would
+        # let 5-6 attempts each individually "under budget" still blow straight through the
+        # real deadline, which defeats the entire point of bounding it. Kept alongside the
+        # count-based max_retries as a backstop (not a replacement) — if this is ever None
+        # (nothing set a deadline) or the estimate is unexpectedly generous, the count cap
+        # still applies as it always has.
+        deadline_seconds = getattr(self, "_current_generation_deadline", None)
+        started_generating = time.monotonic()
 
         best = None  # (audio, sample_rate, cer, word_timings) — lowest-CER attempt, for the fallback
         for attempt in range(max_retries + 1):
@@ -2644,7 +2874,10 @@ class AppDelegate(NSObject):
                 max_tokens=max_tokens))
             audio = np.concatenate([np.array(r.audio) for r in results])
             sample_rate = results[0].sample_rate
-            is_last = attempt == max_retries
+            over_deadline = (
+                deadline_seconds is not None
+                and (time.monotonic() - started_generating) >= deadline_seconds)
+            is_last = attempt == max_retries or over_deadline
 
             # Two independent, cheap-first signals kept side by side, not one replacing the
             # other — timing (the original heuristic, catches bloated/runaway generation) and
@@ -2656,6 +2889,19 @@ class AppDelegate(NSObject):
             if len(text) >= CHATTERBOX_MIN_CHARS_FOR_CHECK:
                 chars_per_sec = len(text) / (len(audio) / sample_rate)
                 timing_ok = chars_per_sec >= CHATTERBOX_MIN_CHARS_PER_SEC
+
+            # A timing-failed attempt can never pass the combined accept check below no matter
+            # what it says — skip the expensive Whisper verification pass on it entirely rather
+            # than transcribing a clip that's already guaranteed to be discarded, unless this is
+            # the last attempt (something must be returned, so it needs a real assessment, not
+            # a skipped one). Deliberately does NOT substitute an unverified placeholder into
+            # `best` for the skipped attempts — `best` only ever holds a genuinely Whisper-
+            # verified result, so it stays guaranteed non-None by the time of the final,
+            # always-verified attempt, and the "lowest CER wins the worst-case fallback" logic
+            # below keeps comparing real, assessed content quality rather than a guess standing
+            # in against it on a tie.
+            if not timing_ok and not is_last:
+                continue
 
             result = speech_verify.verify(audio, sample_rate, text)
             if best is None or result.cer < best[2]:
@@ -2817,12 +3063,19 @@ class AppDelegate(NSObject):
         # See _generateChatterboxAudio's matching comment — same reasoning, same model family.
         is_short = len(text.split()) < speech_verify.SHORT_INPUT_WORD_COUNT
         max_retries = SESAME_MAX_RETRIES + (1 if is_short else 0)
+        # See _generateChatterboxAudio's matching comment — same deadline mechanism, same
+        # reasoning, cumulative across this whole retry loop rather than reset per attempt.
+        deadline_seconds = getattr(self, "_current_generation_deadline", None)
+        started_generating = time.monotonic()
 
         best = None  # (audio, sample_rate, cer, word_timings) — lowest-CER attempt, for the fallback
         for attempt in range(max_retries + 1):
             results = list(engine.generate(
                 text=text, ref_audio=ref_audio, ref_text=ref_text, max_audio_length_ms=max_ms))
-            is_last = attempt == max_retries
+            over_deadline = (
+                deadline_seconds is not None
+                and (time.monotonic() - started_generating) >= deadline_seconds)
+            is_last = attempt == max_retries or over_deadline
             # A genuinely empty result (the model emitted zero audio frames — confirmed directly
             # to happen even on ordinary short text, not just long runaway-prone chunks, since
             # this is CSM's own base-model instability, same root cause as the runaway case
@@ -2844,6 +3097,13 @@ class AppDelegate(NSObject):
             if len(text) >= SESAME_MIN_CHARS_FOR_CHECK:
                 chars_per_sec = len(text) / (len(audio) / sample_rate)
                 timing_ok = SESAME_MIN_CHARS_PER_SEC <= chars_per_sec <= SESAME_MAX_CHARS_PER_SEC
+
+            # See _generateChatterboxAudio's matching comment: a timing-failed non-final
+            # attempt can never pass the combined accept check regardless of content, so skip
+            # the expensive Whisper pass on it — `best` only ever holds a genuinely verified
+            # result this way, never an unverified placeholder that could win a CER tie.
+            if not timing_ok and not is_last:
+                continue
 
             result = speech_verify.verify(audio, sample_rate, text)
             if best is None or result.cer < best[2]:
@@ -3358,11 +3618,13 @@ class AppDelegate(NSObject):
     def rerecordClicked_(self, sender):
         self._showRecordingCaptureCard()
 
-    def recordingCancelClicked_(self, sender):
-        # Cancel must ALWAYS get the user out, no matter what — clear every reference before
-        # touching it, so a raised exception from stop()/close() can never leave a stale
-        # reference behind (which would keep dismissOverlay's own stream guard blocking exit)
-        # or skip the dismiss entirely.
+    @objc.python_method
+    def _teardownActiveRecording(self):
+        """Stops and clears an in-progress mic capture/preview, if any — the same cleanup
+        recordingCancelClicked_ and recordingCaptureBackClicked_ need, plus beginBrowserRead_
+        (which can't rely on dismissOverlay() alone: it deliberately no-ops while a recording
+        stream is active). Clears every reference before touching it, so a raised exception
+        from stop()/close() can never leave a stale reference behind or skip cleanup."""
         stream, self._rec_stream = self._rec_stream, None
         if stream is not None:
             try:
@@ -3377,6 +3639,10 @@ class AppDelegate(NSObject):
             except Exception:
                 traceback.print_exc(file=sys.stderr)
         self._rec_recording_active = False
+
+    def recordingCancelClicked_(self, sender):
+        # Cancel must ALWAYS get the user out, no matter what.
+        self._teardownActiveRecording()
         return_to, self._rec_return_to = self._rec_return_to, None
         if return_to is not None:
             return_to()
@@ -3389,20 +3655,7 @@ class AppDelegate(NSObject):
         # the whole flow — deliberately does NOT touch/consume _rec_return_to, since that's
         # still needed later (either if the user backs out further from style choice, or once
         # they actually save the voice).
-        stream, self._rec_stream = self._rec_stream, None
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                traceback.print_exc(file=sys.stderr)
-        player, self._rec_preview_player = self._rec_preview_player, None
-        if player is not None:
-            try:
-                player.stop()
-            except Exception:
-                traceback.print_exc(file=sys.stderr)
-        self._rec_recording_active = False
+        self._teardownActiveRecording()
         self._showStyleChoiceCard()
 
     def useRecordingClicked_(self, sender):
@@ -5181,14 +5434,14 @@ class AppDelegate(NSObject):
                     # as much as generating with it does.
                     job()
                 else:
-                    text, token, role, index, offset, should_play = job
+                    text, token, role, index, offset, should_play, deadline_seconds = job
                     # A superseded job (Stop, or a new Play/seek issued before this one was
                     # even pulled off the queue) is cheap to skip before spending real
                     # generation time on audio nobody will ever see — chunkResultMain_ still
                     # re-checks the token itself once a result comes back, so this is a pure
                     # efficiency win, not a correctness requirement.
                     if token is self.playback_token:
-                        self._chunkWorker(text, token, role, index, offset, should_play)
+                        self._chunkWorker(text, token, role, index, offset, should_play, deadline_seconds)
             except Exception:
                 traceback.print_exc(file=sys.stderr)
                 sys.stderr.flush()
@@ -5211,8 +5464,16 @@ class AppDelegate(NSObject):
         del self.session_report_log[:-200]
 
     @objc.python_method
-    def _chunkWorker(self, text, token, role, index, offset, should_play=True):
+    def _chunkWorker(self, text, token, role, index, offset, should_play=True, deadline_seconds=None):
         started_at = time.monotonic()
+        # Read several calls deep inside _requestTTS's dispatch, by _generateChatterboxAudio/
+        # _generateSesameAudio's own retry loops — an instance attribute rather than threading
+        # a new parameter through _requestTTS's full per-provider dispatch chain, which only
+        # two of its five providers even have a retry loop to use it for. Safe: this worker
+        # thread is the ONLY thread that ever calls into TTS generation (see _ttsWorkerLoop's
+        # own docstring), and nothing else runs between this assignment and the synchronous
+        # _requestTTS call below that reads it back.
+        self._current_generation_deadline = deadline_seconds
         try:
             audio = self._requestTTS(text)
             # Set only for System voice (see _requestSystemTTS); None for every other
@@ -5249,6 +5510,7 @@ class AppDelegate(NSObject):
         if result["token"] is not self.playback_token:
             return
         if result["error"]:
+            self._seek_generation_pending = False
             # We can't continue the read reliably without this chunk — surface the error and
             # end the session, rather than skip it (silently dropping part of what's being
             # read) or crash later on missing audio. If something is actively playing right
@@ -5274,6 +5536,7 @@ class AppDelegate(NSObject):
         # already keys off result["index"]/self.chunk_index into that same dict.
         self.chunk_word_timings[result["index"]] = result.get("word_timings")
         if result["role"] == "seek":
+            self._seek_generation_pending = False
             self.chunk_index = result["index"]
             self._beginChunkPlayback(
                 result["audio"], start_offset=result["offset"], should_play=result.get("should_play", True))
@@ -5327,6 +5590,7 @@ class AppDelegate(NSObject):
             self.showError_("Could not decode the generated audio.")
             self._resetPlaybackState()
             self._syncPlaybackUI()
+            self._broadcastPlaybackState()
             return
         self._recordChunkDuration(self.chunk_index, player.duration())
         self.chunk_audio_cache[self.chunk_index] = audio_bytes
@@ -5354,6 +5618,7 @@ class AppDelegate(NSObject):
         if self.config.get("provider", "ElevenLabs") == "ElevenLabs":
             threading.Thread(target=self._fetchElVoicesWorker, daemon=True).start()  # refresh usage
         self._prefetchNextChunk()
+        self._broadcastPlaybackState()
 
     @objc.python_method
     def _prefetchNextChunk(self):
@@ -5381,7 +5646,8 @@ class AppDelegate(NSObject):
             next_index = self._prefetch_frontier + 1
             if next_index not in self.chunk_audio_cache:
                 self._tts_job_queue.put(
-                    (self.all_chunks[next_index], self.playback_token, "prefetch", next_index, 0.0, True))
+                    (self.all_chunks[next_index], self.playback_token, "prefetch", next_index, 0.0, True,
+                     self._slackSecondsFor(next_index)))
             self._prefetch_frontier = next_index
 
     @objc.python_method
@@ -5393,6 +5659,8 @@ class AppDelegate(NSObject):
         self.avg_chars_per_sec = None
         self.chunk_index = 0
         self.next_chunk_audio = None
+        self._pending_seek_offset = 0.0
+        self._seek_generation_pending = False
         self._prefetch_frontier = 0
         self.chunk_audio_cache = {}
         self.chunk_word_timings = {}
@@ -5493,6 +5761,7 @@ class AppDelegate(NSObject):
         self._resetScrubberUI()
         self.setStatus("")
         self._syncPlaybackUI()
+        self._broadcastPlaybackState()
 
     def skipBack_(self, sender):
         if self.player is None or not self.all_chunks:
@@ -5522,6 +5791,28 @@ class AppDelegate(NSObject):
     @objc.python_method
     def _totalEstimatedDuration(self):
         return sum(self._estimateChunkDuration(i) for i in range(len(self.all_chunks)))
+
+    @objc.python_method
+    def _slackSecondsFor(self, target_index):
+        """How much real playback time exists before `target_index` actually needs to be ready
+        — the remaining time left in the chunk currently playing, plus every chunk strictly
+        between it and the target (reusing _cumulativeDurationBefore, the same real-or-
+        estimated durations the scrubber/_extendPrefetchFrontier already rely on everywhere
+        else). This is what a prefetch job's generation retry budget gets bounded by: retrying
+        past the point where the real buffer is already gone can only make a stall worse, never
+        better, since the buffer is spent either way by then.
+
+        Computed here, on the main thread, at enqueue time, and snapshotted into the job tuple
+        — the worker thread must never read this kind of live main-thread state directly.
+        """
+        elapsed_in_current = self.player.currentTime() if self.player is not None else 0.0
+        raw = (self._cumulativeDurationBefore(target_index)
+               - self._cumulativeDurationBefore(self.chunk_index) - elapsed_in_current)
+        # Floor, not a magic number pulled from nowhere — always allow at least two typical
+        # generation attempts' worth of real time (see TTS_TYPICAL_GENERATION_SECONDS), so a
+        # thin or momentarily-negative estimate can't strangle a job down to near-zero before
+        # it's even been tried once.
+        return max(TTS_TYPICAL_GENERATION_SECONDS * 2, raw)
 
     @objc.python_method
     def _recordChunkDuration(self, index, duration):
@@ -5566,6 +5857,23 @@ class AppDelegate(NSObject):
             self.player.stop()
         self.player = None
         self.chunk_index = target_index
+        # Same reset _invalidateUngeneratedChunks already does on a voice/speed change — without
+        # it, _extendPrefetchFrontier's while loop (triggered right below via
+        # _beginChunkPlayback -> _prefetchNextChunk on a cache hit, or via chunkResultMain_'s
+        # "seek" branch on a miss) backfills every index between the STALE pre-seek frontier and
+        # the new chunk_index+3 target, in FIFO order, ahead of the chunks actually coming up
+        # next — wasting real generation time on chunks already skipped past, at exactly the
+        # moment (right after a seek) the buffer is emptiest. Safe on backward seeks too: the
+        # frontier loop already skips any index already sitting in chunk_audio_cache.
+        self._prefetch_frontier = target_index
+        # Read by _broadcastPlaybackState while self.player is still None below (a real,
+        # normal state whenever the target chunk isn't cached yet and needs fresh generation —
+        # not just at the very start of a session) — without this, that broadcast fell back to
+        # a bare 0.0, which a connected toolbar rendered as the scrubber snapping back to the
+        # beginning on every seek/skip that needed regeneration, even though the seek itself
+        # was never actually lost (chunkResultMain_'s "seek" branch below still lands at the
+        # right offset once generation finishes).
+        self._pending_seek_offset = offset
         self.next_chunk_audio = None
         self.waiting_for_next = False
         self._stopProgressTimer()
@@ -5580,8 +5888,15 @@ class AppDelegate(NSObject):
             return
 
         self.setStatus("Generating...")
+        # Read by applyControlCommand_'s "play" handler — self.player is None here for a
+        # completely normal reason (this exact regeneration), not because the session is idle,
+        # so a "play" command arriving in this window must not fall through to
+        # playPauseClicked_'s fresh-restart-from-0 branch. Cleared once chunkResultMain_'s
+        # "seek" branch actually lands (or on error/stop, so it can never get stuck true).
+        self._seek_generation_pending = True
         self._tts_job_queue.put(
-            (self.all_chunks[target_index], self.playback_token, "seek", target_index, offset, should_play))
+            (self.all_chunks[target_index], self.playback_token, "seek", target_index, offset, should_play,
+             TTS_SEEK_DEADLINE_SECONDS))
 
     @objc.python_method
     def _startProgressTimer(self):
@@ -5790,6 +6105,10 @@ class AppDelegate(NSObject):
         except Exception:
             traceback.print_exc(file=sys.stderr)
             sys.stderr.flush()
+        # Unconditional, same reasoning as the reschedule below — a toolbar connected mid-chunk
+        # should see the current word regardless of whether the highlight application itself
+        # succeeded.
+        self._broadcastPlaybackState()
         # Unconditional reschedule, even after an exception — one bad word shouldn't permanently
         # kill highlighting for the rest of the chunk.
         self._scheduleNextWordTimer()
@@ -5824,7 +6143,14 @@ class AppDelegate(NSObject):
         core = word_text.strip(string.punctuation)
         if not core:
             return None
-        pattern = re.compile(r"\b" + re.escape(core) + r"\b")
+        # strip_problem_quotes (text_prep.py) normalizes a curly closing apostrophe to a
+        # straight one before this word ever reaches the synthesizer — so a word like "didn't"
+        # in `core` (straight ') needs to still match "didn't" in the DISPLAYED text (which
+        # keeps whatever apostrophe style the user actually typed/pasted, curly or straight).
+        # Matching either variant here closes that gap instead of missing every contraction
+        # written with a curly apostrophe.
+        core_pattern = re.escape(core).replace("'", "['’]")
+        pattern = re.compile(r"\b" + core_pattern + r"\b")
         match = pattern.search(full_text, self._highlight_search_cursor)
         if match is None:
             match = pattern.search(full_text)

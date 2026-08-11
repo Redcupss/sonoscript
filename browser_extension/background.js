@@ -1,0 +1,174 @@
+// SonoScript Read Aloud — background service worker.
+//
+// Two ways to trigger a read: select text and use "Read selection aloud" (an explicit manual
+// override, useful for anything automatic detection gets wrong), or right-click anywhere on the
+// page with nothing selected and use "Read this page aloud," which extracts just the real
+// content — skipping ads, navigation, and photo captions — the same way Firefox's own Reader
+// View does, via Mozilla's Readability.js (bundled here, unmodified, Apache-2.0 licensed).
+
+const NATIVE_HOST = "com.sonoscript.bridge";
+const BRIDGE_URL = "http://127.0.0.1:51823/read";
+const CONTROL_WS_URL = "ws://127.0.0.1:51823/control";
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.contextMenus.create({
+    id: "sonoscript-read-selection",
+    title: "Read selection aloud (SonoScript)",
+    contexts: ["selection"],
+  });
+  chrome.contextMenus.create({
+    id: "sonoscript-read-page",
+    title: "Read this page aloud (SonoScript)",
+    contexts: ["page"],
+  });
+});
+
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId === "sonoscript-read-selection" && info.selectionText) {
+    readAloud(info.selectionText, tab.id);
+    return;
+  }
+  if (info.menuItemId === "sonoscript-read-page") {
+    const text = await extractPageContent(tab.id);
+    if (!text) {
+      console.error(
+        "SonoScript: couldn't find readable content on this page — try selecting the " +
+        "specific text you want instead."
+      );
+      return;
+    }
+    readAloud(text, tab.id);
+  }
+});
+
+async function extractPageContent(tabId) {
+  // Loaded as a real file first (not inlined into the function below) so Readability.js's own
+  // ~2800 lines don't have to be duplicated into every call — this just defines the Readability
+  // constructor in the page's isolated-world scope for the tab, ready for the next call to use.
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["Readability.js"] });
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      // Readability mutates whatever document it's given (strips elements as it scores them) —
+      // operating on a clone means the actual visible page is never touched.
+      const clone = document.cloneNode(true);
+      // Confirmed directly against a real page (a Forbes article) that Readability alone still
+      // let a photo caption through: the site wraps it in a real <figure> tag, but with
+      // meaningless auto-generated CSS class names instead of a <figcaption> or any descriptive
+      // naming (common on modern React/Next.js-built sites) — Readability's heuristics have
+      // nothing to recognize it by. Stripping every <figure> outright before parsing removes it
+      // cleanly: images can't be read aloud anyway, and a caption/credit is supplementary, not
+      // core content. Verified this doesn't remove real article text on the same test page.
+      clone.querySelectorAll("figure").forEach((el) => el.remove());
+      const article = new Readability(clone).parse();
+      if (!article || !article.textContent || !article.textContent.trim()) {
+        return null;
+      }
+      let text = (article.title ? article.title + ". " : "") + article.textContent;
+
+      // Related-content/recirculation modules ("More From Forbes" and equivalents on other
+      // sites) are commonly embedded INSIDE the same container as the real article body —
+      // confirmed directly: Forbes nests it in the exact same "article-body" div as the real
+      // text, so no DOM-structural signal tells Readability the two apart. These always sit at
+      // the true end of the article, so truncating there is safe and effective — the same
+      // technique real scraping/reader-mode tools use for this exact, common situation.
+      const TRAILING_JUNK_MARKERS = [
+        "More From Forbes", "Related Articles", "You May Also Like", "Read Also",
+        "Recommended For You",
+      ];
+      // Measured against the ORIGINAL length, captured once before the loop — re-measuring
+      // against `text.length` after each truncation would keep shrinking the yardstick, so a
+      // second marker's position (still the same real distance from the true start) could drift
+      // past the 70% mark purely because an earlier truncation already shortened the string,
+      // wrongly chopping real content that was never actually near the end of the real article.
+      const originalLength = text.length;
+      for (const marker of TRAILING_JUNK_MARKERS) {
+        // lastIndexOf (not indexOf) targets the occurrence nearest the true end, and the 70%
+        // position check refuses to truncate at all unless it's actually out there — a real
+        // article that happens to use one of these exact phrases as an early subheading (not
+        // impossible) must not get most of its real content chopped off.
+        const idx = text.lastIndexOf(marker);
+        if (idx !== -1 && idx > originalLength * 0.7) text = text.slice(0, idx);
+      }
+
+      // A cookie/subscription-gate notice ("Continue Reading with a Forbes Subscription...")
+      // showed up mid-article in a real user test but did NOT reproduce in a fresh test
+      // session — likely conditional on cookie/paywall-metering state, not something present
+      // on every load. Since it can appear mid-article (unlike the trailing markers above,
+      // truncating isn't safe here — it would cut off real content that follows), strip the
+      // exact known phrase outright instead of guessing at its DOM wrapper.
+      text = text.replace(
+        /Continue Reading with a Forbes Subscription.*?Cookie Preferences link in our footer\./s,
+        ""
+      );
+
+      // Same class of problem, second real site: an NYT article's ad-slot + "you have been
+      // granted free access" gate notice landed mid-article, between the headline and the
+      // real body. Different exact wording than the Forbes case above — this is genuinely the
+      // second time a site-specific dynamically-injected message has slipped through, which is
+      // worth treating as a pattern rather than an isolated one-off: a real content-extraction
+      // library (e.g. Trafilatura, running server-side over the existing Python bridge instead
+      // of client-side here) would handle this class of site-specific junk generically instead
+      // of needing a new regex per site as they're discovered.
+      text = text.replace(
+        /Advertisement\s*SKIP ADVERTISEMENT.*?free to read/is,
+        ""
+      );
+
+      return text;
+    },
+  });
+  return result;
+}
+
+function readAloud(text, tabId) {
+  chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: "get_token" }, (response) => {
+    if (chrome.runtime.lastError || !response || !response.token) {
+      console.error(
+        "SonoScript: couldn't reach the native host — is it registered, and is SonoScript " +
+        "running?",
+        (response && response.error) || chrome.runtime.lastError
+      );
+      return;
+    }
+    const token = response.token;
+    fetch(BRIDGE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-SonoScript-Token": token,
+      },
+      body: JSON.stringify({ text }),
+    }).then((res) => {
+      // fetch() only REJECTS on a network-level failure (caught below) — it resolves normally
+      // for any HTTP status, including a rejection from the bridge itself (e.g. 403 on a stale
+      // token, 413 on oversized text), which would otherwise fail completely silently here.
+      if (!res.ok) {
+        console.error(`SonoScript: the local app rejected this request (HTTP ${res.status}).`);
+        return;
+      }
+      if (tabId !== undefined) showToolbar(tabId, token);
+    }).catch((err) => {
+      console.error("SonoScript: request to the local app failed — is it running?", err);
+    });
+  });
+}
+
+async function showToolbar(tabId, token) {
+  // Same two-step "load the file, then call a function it defines" pattern extractPageContent
+  // uses for Readability.js — keeps toolbar.js's own ~250 lines out of every call instead of
+  // re-injecting them inline each time.
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["liquidGL.js", "toolbar.js"] });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (t, wsUrl) => window.__sonoscriptInitToolbar(t, wsUrl),
+      args: [token, CONTROL_WS_URL],
+    });
+  } catch (err) {
+    // Not fatal — playback already started via the /read POST above, this only affects the
+    // in-page controls. Fails on restricted pages (chrome://, the Web Store, etc.) where
+    // content-script injection is blocked outright, same limitation extractPageContent has.
+    console.error("SonoScript: couldn't show the playback toolbar on this page.", err);
+  }
+}

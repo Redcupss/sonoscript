@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "SonoScript — Read Aloud",
+  "version": "0.1.0",
+  "description": "Select text on any page, right-click, and hear it read aloud by SonoScript.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxmii4kbseO9qGEXCVTX6OPrOXEQ2h8wdk0NKj2dz3DIRO8YrPt4v/uvxxoMcA64xUIxkV5tTNzcmzkvOx0//L0wZhlYSQ8uBhAY0SUN4RiEW5Gz2fYRpdN3b8lKeQEJ5eck6oyXN28ahU42JQlq9pWUyKq5Ug7yoiCbY6nCss/VnUtFtb1JlsVNXHS24IIEtngd2BVDulZCpZwzfvu7OdnJ/kBbtmMQqpTodYCvNLg3jLWoCKLBxJ3VWGCSbl9PgrOnT8Qry3BMiefCQojXlex2qijoGKuDxrQFW8lWqooFyr1Wjo9yycjiqnwIsOaWtQ4/bIGUk1Zy2Ld51Tz/sjwIDAQAB",
+  "permissions": ["contextMenus", "nativeMessaging", "scripting", "activeTab"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

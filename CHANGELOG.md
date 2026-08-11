@@ -4,6 +4,34 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.12.5] (build 47) — 2026-08-08
+
+### Changed
+- **Automatic spelling correction turned on** in the main text box (was deliberately off since
+  the box is mostly pasted text, and silently rewriting pasted words seemed worse than an
+  unflagged typo). Reversed by request. Worth knowing: this also applies to pasted text, not
+  just typed text, so an unusual word or name in something pasted in could get silently
+  "corrected" into something else — same tradeoff macOS's own text boxes make everywhere else.
+
+### Investigating
+- **Spell-check's red underline isn't appearing at all**, even though continuous spell-checking
+  is (and was already) explicitly enabled in code. Not yet root-caused — suspected but unconfirmed
+  interaction with this app's layer-backed text rendering (used throughout for its dark theme),
+  a known but obscure category of AppKit bug. Left open rather than guessed at.
+
+## [1.12.4] (build 46) — 2026-08-08
+
+### Fixed
+- **Voice recording silently captured no audio.** The built app's `Info.plist` never declared
+  `NSMicrophoneUsageDescription`, so macOS's TCC privacy framework never registered SonoScript
+  as a microphone-requesting app at all — no permission prompt ever appeared, and the app never
+  showed up under Settings > Privacy & Security > Microphone. `sounddevice`'s `InputStream`
+  still opened without raising an exception, but macOS silently withheld the actual hardware
+  feed from an unauthorized process, so every recording came back as pure silence and failed
+  validation's "we didn't pick up any sound" check instead of surfacing a real permission error.
+  Added the missing usage-description key so the OS properly prompts for (and can grant) mic
+  access on first use.
+
 ## [1.12.3] (build 45) — 2026-08-05
 
 ### Changed

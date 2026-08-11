@@ -1,0 +1,9 @@
+{
+  "name": "com.sonoscript.bridge",
+  "description": "Hands the SonoScript Read Aloud extension its current session token.",
+  "path": "__ABSOLUTE_PATH_TO_native_host.py__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://jolmpfmkkfngeolncggdghhmndjbjcng/"
+  ]
+}

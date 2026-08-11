@@ -87,6 +87,16 @@ OPTIONS = {
         "CFBundleName": "SonoScript",
         "CFBundleDisplayName": "SonoScript – Text to Speech",
         "CFBundleIdentifier": "com.gilrodmedia.sonoscript",
+        # Without this, macOS's TCC framework never registers the app as a microphone-requesting
+        # process at all — no permission prompt ever appears, the app never shows up under
+        # Settings > Privacy & Security > Microphone, and sounddevice's InputStream opens
+        # "successfully" (no exception) but silently delivers only silence, since the OS blocks
+        # the actual hardware feed for an unauthorized process. Confirmed directly: this is why
+        # a real recording attempt failed _validateRecording's silence check instead of erroring
+        # outright — there was nothing to catch, the mic access itself never properly happened.
+        "NSMicrophoneUsageDescription": "SonoScript uses your microphone to record a reference "
+            "clip when you create a custom cloned voice. Recordings stay on this Mac and are "
+            "never uploaded anywhere.",
     },
     "packages": LOCAL_TTS_PACKAGES,
     # Single-file modules (not directory packages) need "includes", not "packages" — same
@@ -128,7 +138,12 @@ OPTIONS = {
     # whisper_assets: the verification model (~137MB, small enough to bundle directly rather
     # than needing a Sesame-style download-on-demand flow) — see speech_verify.py's own
     # comment for why this can't be fetched lazily from HuggingFace at runtime instead.
-    "resources": ["chatterbox_assets", "whisper_assets"],
+    # browser_extension: without this, a real packaged build never had native_host.py,
+    # com.sonoscript.bridge.json, or install_native_host.sh anywhere on disk at all — only in
+    # the git checkout used to build it — so the extension's "read this page aloud" feature had
+    # no native host to hand back a token to, on any install done from a shipped .app rather
+    # than a dev checkout.
+    "resources": ["chatterbox_assets", "whisper_assets", "browser_extension"],
     "iconfile": "icon.icns",
 }
 
