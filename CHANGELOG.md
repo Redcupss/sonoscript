@@ -14,11 +14,13 @@ build number increments once per release regardless of version bump.
   whole-page content detection strips ads/navigation/photo captions the way Firefox's own
   Reader View does (via Readability.js), with a manual "read selection" override for anything it
   gets wrong. If SonoScript isn't already running when a read is requested, the native host now
-  launches it automatically and waits for it to come up — checked against the local listener
-  actually accepting connections, not just a leftover token file from a previous session, which
-  would otherwise look identical to a currently-running instance. The launch itself is silent: no
-  window, no Dock activation, no interruption to whatever the user is doing in the browser. Full
-  technical design in `browser_extension/DESIGN.md`.
+  launches it automatically — checked against the local listener actually accepting connections,
+  not just a leftover token file from a previous session, which would otherwise look identical to
+  a currently-running instance. The launch is silent (no window, no focus stolen from whatever
+  the user is doing in the browser) and the wait for it to finish starting up happens as a
+  bounded retry loop in the extension itself rather than a single long-blocking native-messaging
+  call, which real testing showed Chrome doesn't reliably allow. Full technical design, including
+  two real bugs this went through before landing, in `browser_extension/DESIGN.md`.
 - **In-page floating playback toolbar** — play/pause/skip/scrubber/voice picker, modeled on
   Edge's own Read Aloud bar, with SonoScript's own window no longer jumping to the front on
   every read.

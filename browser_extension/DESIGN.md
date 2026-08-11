@@ -23,20 +23,54 @@ selection aloud," SonoScript reads it. First real usage surfaced two real gaps i
   trigger real generation; the native host correctly implements the messaging protocol and
   returns the live, current token.
 
-**Auto-launch, shipped.** SonoScript no longer has to already be running. `native_host.py` checks
-whether the local listener is actually accepting connections on its known port — not whether the
-token *file* exists, which is never deleted on quit and would otherwise make a stale file from a
-previous session look identical to a currently-running instance. If it isn't up, `open -g -a
-SonoScript --args --browser-launch` starts it and the host polls (with a bounded timeout) until
-the port comes alive, then reads the token. `open -g` only stops macOS from activating/focusing
-the newly launched app; it can't reach into the app to suppress its own window. That's what the
-`--browser-launch` argument does — `main.py` checks for it in `sys.argv` at startup
-(`BROWSER_LAUNCH`) and skips showing the main window entirely on that path, stronger than the
-existing `SONOSCRIPT_DEV_QUIET` env var (which still shows the window, just without stealing
-keyboard focus). Not yet tested against an actual packaged `.app` bundle launched this way end to
-end — the port-detection, launch-and-poll, and `sys.argv` flag logic are each verified directly
-(including against the real running app), but the full path through Launch Services and a frozen
-py2app bundle's argv handling hasn't been exercised outside code review.
+**Auto-launch, shipped — and its first version had two real bugs, found by actually testing it in
+real Chrome rather than trusting the design.**
+
+SonoScript no longer has to already be running. `native_host.py` checks whether the local
+listener is actually accepting connections on its known port — not whether the token *file*
+exists, which is never deleted on quit and would otherwise make a stale file from a previous
+session look identical to a currently-running instance.
+
+*Bug 1 — the launched app still stole focus.* The first version launched via `open -g -a
+SonoScript --args --browser-launch`, relying on `main.py` checking `sys.argv` for
+`--browser-launch` to know to suppress its own window. `open -g` only stops macOS from
+activating/focusing the newly launched app; it can't reach into the app to suppress its own
+window, so the whole scheme depended on `--args` reliably reaching `sys.argv` through Launch
+Services and a frozen py2app bundle — untested, and it turned out not to work reliably in
+practice. Fixed by launching the real binary directly instead of going through `open` at all:
+`native_host.py` resolves the app's actual installed path the same way Finder/Launch Services
+would (`osascript -e 'POSIX path of (path to application "SonoScript")'` — confirmed directly
+this ISN'T always `/Applications/SonoScript.app`; on the actual dev machine it's one directory
+deeper), then `subprocess.Popen([binary_path, "--browser-launch"], ...)`. A plain fork+exec
+delivers argv with zero ambiguity, and — usefully — doesn't get the "activate/focus me" treatment
+a Launch-Services-mediated launch can carry, which was never wanted here in the first place. A
+launch marker file (mtime-based staleness, ~25s) stops the several rapid retries below from each
+independently deciding "nothing's running yet" and triggering their own duplicate launch.
+
+*Bug 2 — the toolbar never appeared and the text never reached the app, even though the app
+itself visibly launched.* The first version had `native_host.py` block for up to 20s, polling
+until the freshly-launched app came up before ever replying to Chrome. Confirmed directly (real
+user testing, not just reading Chrome's docs) that this doesn't work: native-messaging
+connections have a real practical timeout well under 20s, and — separately — an MV3 extension
+service worker can be suspended as idle while a single `sendNativeMessage` call just sits there
+waiting, silently losing the whole request. Fixed by moving the wait to `background.js` instead:
+`native_host.py` now always responds within a fraction of a second — a real token, a real error,
+or `{launching: true}` — and `getTokenWithRetry()` retries every ~1s for up to ~20s as a
+continuously-running async chain kicked off directly from the still-open
+`contextMenus.onClicked` listener (which now `await`s it, rather than firing it and returning
+immediately) rather than a `setTimeout` scheduled after that listener has already returned, which
+risks the worker being suspended before it ever fires. Every individual native-messaging round
+trip is short either way; only the *overall* wait is long, and it now lives somewhere actually
+built to survive that.
+
+Verified directly: real app-binary resolution against the actual installed app, the
+already-running fast path against the real running app (real token, milliseconds), the
+launching→retry→success and launching→timeout paths with simulated delayed startup, duplicate-launch
+prevention across rapid repeated calls, and the JS retry loop's four branches (immediate success,
+retry-through-launching, real error stops immediately, `lastError` stops immediately) against a
+mocked `chrome.runtime`. Not independently verified: the full path through a real right-click →
+real Chrome → real cold app launch → toolbar appearing, end to end in the actual browser — that
+needs a real click-test, which is outside what can be driven from here.
 
 ## Content-detection strategy (revised after first real use)
 

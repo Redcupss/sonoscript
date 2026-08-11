@@ -24,8 +24,13 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  // Actually awaited (not fire-and-forget) — readAloud can now retry for up to ~20s while
+  // SonoScript cold-starts (see getTokenWithRetry's own comment for why that moved here), and
+  // this listener's own returned promise is the clearest signal to Chrome's MV3 service-worker
+  // lifecycle that there's still real work in flight for the whole time that takes, not just
+  // for the single event tick that kicked it off.
   if (info.menuItemId === "sonoscript-read-selection" && info.selectionText) {
-    readAloud(info.selectionText, tab.id);
+    await readAloud(info.selectionText, tab.id);
     return;
   }
   if (info.menuItemId === "sonoscript-read-page") {
@@ -37,7 +42,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       );
       return;
     }
-    readAloud(text, tab.id);
+    await readAloud(text, tab.id);
   }
 });
 
@@ -121,37 +126,85 @@ async function extractPageContent(tabId) {
   return result;
 }
 
-function readAloud(text, tabId) {
-  chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: "get_token" }, (response) => {
-    if (chrome.runtime.lastError || !response || !response.token) {
-      console.error(
-        "SonoScript: couldn't reach the native host — is it registered, and is SonoScript " +
-        "running?",
-        (response && response.error) || chrome.runtime.lastError
-      );
-      return;
+// Wraps sendNativeMessage in a Promise so getTokenWithRetry (below) can await it in a plain
+// loop. Never rejects — chrome.runtime.lastError is folded into the resolved value, same as any
+// other "native_host.py said no" case, so the retry loop only has one shape of failure to
+// handle instead of two.
+function sendNativeMessageAsync(message) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendNativeMessage(NATIVE_HOST, message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ error: chrome.runtime.lastError.message });
+        return;
+      }
+      resolve(response || {});
+    });
+  });
+}
+
+// native_host.py used to block for up to 20s itself, cold-launching SonoScript and polling
+// until it came up before ever replying — confirmed directly (via real user testing, not just
+// reasoning about it) that this doesn't actually work: Chrome's native-messaging connections
+// have a real practical timeout well under 20s, and an MV3 service worker can be suspended as
+// idle while a single sendNativeMessage call just sits there waiting, losing the whole request
+// silently — matching exactly what broke (no toolbar, no text ever reaching the app, despite
+// the app itself visibly launching).
+//
+// Fixed by moving the "wait for cold start" loop to THIS side instead: native_host.py now
+// always responds within a fraction of a second (either a real token, a real error, or
+// {launching: true}), and retrying lives here as a continuously-running async call chain kicked
+// off directly from the contextMenus.onClicked listener that's still actively processing this
+// same user click — not a dangling setTimeout scheduled after that handler has already
+// returned, which risks the service worker being suspended before it ever fires. Each retry is
+// its own short, ordinary native-messaging round trip, so no single call is ever the thing that
+// times out.
+async function getTokenWithRetry() {
+  const MAX_ATTEMPTS = 20;
+  const RETRY_DELAY_MS = 1000;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const response = await sendNativeMessageAsync({ action: "get_token" });
+    if (response.token) return response.token;
+    if (response.error && !response.launching) {
+      // A real, non-transient failure (host not registered, SonoScript genuinely broken) —
+      // retrying the exact same call isn't going to change that outcome.
+      console.error("SonoScript native host error:", response.error);
+      return null;
     }
-    const token = response.token;
-    fetch(BRIDGE_URL, {
+    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+  }
+  console.error("SonoScript: took too long to start.");
+  return null;
+}
+
+async function readAloud(text, tabId) {
+  const token = await getTokenWithRetry();
+  if (!token) {
+    console.error(
+      "SonoScript: couldn't reach the native host — is it registered, and is SonoScript " +
+      "running?"
+    );
+    return;
+  }
+  try {
+    const res = await fetch(BRIDGE_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-SonoScript-Token": token,
       },
       body: JSON.stringify({ text }),
-    }).then((res) => {
-      // fetch() only REJECTS on a network-level failure (caught below) — it resolves normally
-      // for any HTTP status, including a rejection from the bridge itself (e.g. 403 on a stale
-      // token, 413 on oversized text), which would otherwise fail completely silently here.
-      if (!res.ok) {
-        console.error(`SonoScript: the local app rejected this request (HTTP ${res.status}).`);
-        return;
-      }
-      if (tabId !== undefined) showToolbar(tabId, token);
-    }).catch((err) => {
-      console.error("SonoScript: request to the local app failed — is it running?", err);
     });
-  });
+    // fetch() only REJECTS on a network-level failure (caught below) — it resolves normally
+    // for any HTTP status, including a rejection from the bridge itself (e.g. 403 on a stale
+    // token, 413 on oversized text), which would otherwise fail completely silently here.
+    if (!res.ok) {
+      console.error(`SonoScript: the local app rejected this request (HTTP ${res.status}).`);
+      return;
+    }
+    if (tabId !== undefined) showToolbar(tabId, token);
+  } catch (err) {
+    console.error("SonoScript: request to the local app failed — is it running?", err);
+  }
 }
 
 async function showToolbar(tabId, token) {

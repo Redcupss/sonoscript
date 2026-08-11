@@ -4,9 +4,16 @@
 Chrome/Edge only ever spawn this process on behalf of the extension ID listed in this host's
 own manifest (com.sonoscript.bridge.json) — a web page has no way to reach this at all, which is
 the entire point (see browser_bridge.py's docstring for the full trust chain this is one link
-of). Deliberately has zero dependencies beyond the standard library: it hands back whatever token
-SonoScript last wrote to disk, cold-launching the app first if it isn't already running, so it
-never needs this app's much heavier ML dependency stack just to run.
+of). Deliberately has zero dependencies beyond the standard library.
+
+Always responds within a fraction of a second — never blocks waiting for SonoScript to finish
+cold-starting. An earlier version polled here for up to 20s before replying; confirmed directly
+(via real testing, not just reasoning about the docs) that this doesn't actually work: Chrome's
+native-messaging connections have a real practical timeout well under that, and the MV3 extension
+service worker that's waiting on the callback can itself be suspended as idle while the call just
+sits there, losing the whole request silently. The retry loop now lives in background.js instead
+(see getTokenWithRetry there) — every call here is short, and {"launching": true} tells that loop
+to ask again shortly rather than this process itself waiting around.
 """
 import json
 import os
@@ -17,11 +24,19 @@ import sys
 import time
 
 TOKEN_PATH = os.path.expanduser("~/Library/Application Support/SonoScript/bridge_token")
+# A marker this host writes right before triggering a launch, so the NEXT short-lived retry
+# (a few hundred ms to a couple seconds later, chrome.runtime.sendNativeMessage spawns a fresh
+# process per call — there's no shared memory between one invocation of this script and the
+# next) doesn't ALSO see "not running yet" and trigger a second, duplicate launch. A plain
+# existence check isn't enough here either, same reasoning as TOKEN_PATH below — this one's
+# staleness is judged by mtime instead, since a truly stuck/failed launch attempt should still
+# be recoverable on a later request rather than wedged forever.
+LAUNCH_MARKER_PATH = os.path.expanduser("~/Library/Application Support/SonoScript/launching")
+LAUNCH_MARKER_MAX_AGE_SECONDS = 25
 # Must match browser_bridge.py's own PORT constant — this file can't import that module
 # directly without pulling in the app's full dependency stack just to read one integer.
 BRIDGE_PORT = 51823
-LAUNCH_TIMEOUT_SECONDS = 20
-LAUNCH_POLL_SECONDS = 0.25
+APP_NAME = "SonoScript"
 
 
 def read_message():
@@ -52,40 +67,83 @@ def _bridge_is_up():
         return False
 
 
-def _launch_in_background():
-    # `open -g` only stops macOS/Launch Services from ACTIVATING (focusing) the newly launched
-    # app — it has no way to reach into the app itself and tell it not to show its own window.
-    # `--args --browser-launch` is what actually does that: main.py checks sys.argv for exactly
-    # this flag at startup and skips window.orderFront_ entirely on that path (see
-    # BROWSER_LAUNCH and build_window() there) — stronger than the existing SONOSCRIPT_DEV_QUIET
-    # env var, which still shows the window, just without stealing keyboard focus.
+def _launch_recently_triggered():
     try:
-        subprocess.Popen(
-            ["open", "-g", "-a", "SonoScript", "--args", "--browser-launch"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        return (time.time() - os.path.getmtime(LAUNCH_MARKER_PATH)) < LAUNCH_MARKER_MAX_AGE_SECONDS
     except OSError:
-        pass  # surfaces as a timeout below either way — no separate error path needed
+        return False
+
+
+def _mark_launch_triggered():
+    os.makedirs(os.path.dirname(LAUNCH_MARKER_PATH), exist_ok=True)
+    with open(LAUNCH_MARKER_PATH, "w") as f:
+        f.write(str(time.time()))
+
+
+def _find_app_binary():
+    """Resolves the real installed path of SonoScript.app via the same mechanism Launch
+    Services/Finder use (so this works regardless of whether it's in /Applications, an
+    /Applications subfolder, or anywhere else a real install could legitimately live — confirmed
+    directly: on this very machine it's NOT at the /Applications/SonoScript.app path a naive
+    hardcode would have assumed), then returns the path to its actual executable inside the
+    bundle. Returns None if the app can't be found at all."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", f'POSIX path of (path to application "{APP_NAME}")'],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            return None
+        bundle_path = result.stdout.strip()
+        if not bundle_path:
+            return None
+        # CFBundleExecutable matches CFBundleName ("SonoScript") — confirmed directly against
+        # the real built bundle's Info.plist, not assumed.
+        binary_path = os.path.join(bundle_path, "Contents", "MacOS", APP_NAME)
+        return binary_path if os.path.isfile(binary_path) else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _launch_in_background():
+    # Launching the real executable directly (bypassing `open`/Launch Services entirely) gives
+    # guaranteed, unambiguous control over argv — confirmed directly that going through `open -a
+    # SonoScript --args --browser-launch` was NOT reliably reaching sys.argv in the packaged
+    # app (real user testing: the window still appeared and stole focus). A plain fork+exec like
+    # this doesn't get the "activate/focus me" treatment a Launch-Services-mediated launch can,
+    # which is what's actually wanted here anyway — main.py's own BROWSER_LAUNCH check (gated on
+    # this exact argv flag) is what stops it from calling activateIgnoringOtherApps_/
+    # orderFront_ once it's running, not anything about how the process was spawned.
+    binary_path = _find_app_binary()
+    try:
+        if binary_path:
+            subprocess.Popen(
+                [binary_path, "--browser-launch"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        else:
+            # Best-effort fallback if Launch Services couldn't resolve the app by name for some
+            # reason — less certain to correctly deliver --browser-launch, but better than
+            # nothing.
+            subprocess.Popen(
+                ["open", "-g", "-a", APP_NAME, "--args", "--browser-launch"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except OSError:
+        pass  # background.js's own retry loop will simply keep seeing "not up yet"
 
 
 def _get_token():
-    # _bridge_is_up() only confirms the HTTP listener's socket is accepting connections, which
-    # per browser_bridge.py's start() happens a moment BEFORE it writes the token file (the
-    # server socket binds/listens during construction; the token is written as the very next
-    # line, not before). An already-running instance's token is always long since written by the
-    # time this runs, but a freshly launched one could theoretically still be finishing that
-    # write in the same instant the port becomes connectable — a handful of short retries closes
-    # that narrow gap without adding meaningful latency to the overwhelmingly common
-    # already-running case, which succeeds on the very first attempt.
-    for attempt in range(10):
-        try:
-            with open(TOKEN_PATH) as f:
-                return f.read().strip()
-        except OSError:
-            if attempt == 9:
-                return None
-            time.sleep(0.1)
+    try:
+        with open(TOKEN_PATH) as f:
+            return f.read().strip()
+    except OSError:
+        return None
 
 
 def main():
@@ -93,20 +151,21 @@ def main():
     if message is None:
         return
 
-    if not _bridge_is_up():
-        _launch_in_background()
-        deadline = time.monotonic() + LAUNCH_TIMEOUT_SECONDS
-        while time.monotonic() < deadline and not _bridge_is_up():
-            time.sleep(LAUNCH_POLL_SECONDS)
-        if not _bridge_is_up():
-            send_message({"error": "SonoScript didn't start in time."})
+    if _bridge_is_up():
+        token = _get_token()
+        if token is None:
+            # The port is up but the token file read failed — a genuinely unexpected state
+            # (browser_bridge.start() writes it before the port ever becomes connectable), not
+            # something a retry is likely to fix on its own.
+            send_message({"error": "SonoScript doesn't appear to be running."})
             return
-
-    token = _get_token()
-    if token is None:
-        send_message({"error": "SonoScript doesn't appear to be running."})
+        send_message({"token": token})
         return
-    send_message({"token": token})
+
+    if not _launch_recently_triggered():
+        _mark_launch_triggered()
+        _launch_in_background()
+    send_message({"launching": True})
 
 
 if __name__ == "__main__":
