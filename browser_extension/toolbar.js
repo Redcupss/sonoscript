@@ -40,7 +40,7 @@
   // turning knobs against the real toolbar instead of another guess-and-redeploy cycle — left
   // in place, not deleted, since more tuning work is planned (see the presets/master-slider note
   // in memory — project_liquid_glass_presets_roadmap or similar).
-  const SONOSCRIPT_GLASS_TUNING = false;
+  const SONOSCRIPT_GLASS_TUNING = true;
 
   function buildTuningPanel(shadow, lens, overlay) {
     const panel = document.createElement("div");
@@ -53,7 +53,7 @@
     ].join(";");
 
     const fields = [
-      { key: "refraction", label: "Refraction", min: 0, max: 0.1, step: 0.001 },
+      { key: "refraction", label: "Refraction", min: 0, max: 0.01, step: 0.0001 },
       { key: "aberration", label: "Aberration", min: 0, max: 1, step: 0.01 },
       { key: "bevelDepth", label: "Bevel depth", min: 0, max: 0.2, step: 0.001 },
       { key: "bevelWidth", label: "Bevel width", min: 0, max: 0.5, step: 0.001 },

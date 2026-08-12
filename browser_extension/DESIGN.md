@@ -23,7 +23,7 @@ selection aloud," SonoScript reads it. First real usage surfaced two real gaps i
   trigger real generation; the native host correctly implements the messaging protocol and
   returns the live, current token.
 
-**Auto-launch, shipped — three real bugs found by actually testing it in real Chrome rather than
+**Auto-launch, shipped — five real bugs found by actually testing it in real Chrome rather than
 trusting the design, each one only surfacing once the previous fix was live.**
 
 SonoScript no longer has to already be running. `native_host.py` checks whether the local
@@ -109,6 +109,26 @@ either side. Fixed by having both sides resolve the real home directory via
 variables entirely. Verified end-to-end afterward with the same live-process test used for Bug
 3's fix: marker written → `open -g` → app launch → marker consumed → zero windows → frontmost
 app unchanged → bridge port live.
+
+*Bug 5 — the window still stole focus on a real cold launch, even with Bug 4's fix confirmed
+correct in isolation.* `applicationDidFinishLaunching_` and `_consume_pending_browser_launch_marker`
+only ever run once, at genuine process startup. macOS routes an `open`/Launch Services request
+targeting an app that's already running through a *different* delegate,
+`applicationShouldHandleReopen_hasVisibleWindows_` — used for things like clicking a running
+app's Dock icon — and that method unconditionally showed and focused the window with no
+awareness of BROWSER_LAUNCH at all. This is reachable from the browser extension, not just a
+Dock click: this app's own cold start can take several real seconds (loading its ML dependencies
+is the bulk of that), and a second browser-triggered read landing in that window — a realistic
+scenario, not a contrived one, especially under repeated rapid testing — would hit a process
+that's already running but not yet accepting bridge connections, causing another `open -g` call
+that macOS delivers to this reopen path instead of running `applicationDidFinishLaunching_`
+again. Fixed by checking the same marker file here too, freshly on every call rather than only
+once at startup: present means the extension just triggered this reopen and the window stays
+invisible; absent means a real user action (Dock icon, `open` from Terminal) and the window
+behaves exactly as it always has. Verified directly with a temporary diagnostic print (removed
+before shipping) exercising both branches on the real rebuilt app: a marker-less reopen correctly
+fell through to the normal show/focus code, and a marker-present reopen correctly short-circuited
+before touching it, with the marker confirmed consumed either way.
 
 ## Content-detection strategy (revised after first real use)
 

@@ -52,8 +52,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.13.2"
-APP_BUILD = "50"
+APP_VERSION = "1.13.3"
+APP_BUILD = "51"
 
 
 def _consume_pending_browser_launch_marker():
@@ -550,6 +550,21 @@ class AppDelegate(NSObject):
         return False
 
     def applicationShouldHandleReopen_hasVisibleWindows_(self, app, has_visible_windows):
+        # macOS routes an `open`/Launch Services request targeting an ALREADY-RUNNING process
+        # through THIS delegate instead of applicationDidFinishLaunching_, which only ever fires
+        # once, at genuine process startup — a real gap the BROWSER_LAUNCH check there can't
+        # cover. This is reachable from the browser extension, not just a Dock-icon click:
+        # native_host.py can call `open -g` a second time if an earlier browser-triggered launch
+        # is still mid-startup (this app's own cold start can take several real seconds) when a
+        # later request decides the bridge isn't up yet — that second `open -g` targets a process
+        # that's already running (if not yet ready), and macOS delivers it here rather than
+        # re-running applicationDidFinishLaunching_. Checking the same pending-launch marker
+        # here — freshly on every call, not just once at startup — closes that gap: if the
+        # browser extension just triggered this reopen, stay invisible exactly like a genuine
+        # cold launch does. A real Dock-icon click leaves no such marker, so this only ever
+        # suppresses the window for the browser-triggered case, never a genuine user reopen.
+        if _consume_pending_browser_launch_marker():
+            return True
         if not has_visible_windows:
             self.window.makeKeyAndOrderFront_(None)
         AppKit.NSApp.activateIgnoringOtherApps_(True)

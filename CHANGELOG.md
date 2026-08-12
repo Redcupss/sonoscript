@@ -4,6 +4,19 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.13.3] (build 51) — 2026-08-11
+
+### Fixed
+- **Auto-launched app still stole focus, even with the marker mechanism confirmed working.**
+  Root cause was a separate code path: macOS routes an `open`/Launch Services request targeting
+  an app that's *already running* through a different delegate method than the one used for a
+  genuine cold launch, and that method had no awareness of a browser-triggered launch at all. It
+  was reachable in practice — this app's own cold start can take several real seconds, and a
+  second browser-triggered request landing in that window would hit an already-running (if not
+  yet ready) process. That delegate now checks the same silent-launch marker, freshly on every
+  call rather than only once at startup, and stays invisible when it's present. A genuine
+  Dock-icon reopen leaves no such marker and is unaffected.
+
 ## [1.13.2] (build 50) — 2026-08-11
 
 ### Fixed
