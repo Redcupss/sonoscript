@@ -51,14 +51,35 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.13.0"
-APP_BUILD = "48"
-# Set only when native_host.py cold-launches the app on the extension's behalf (see that file's
-# own _launch_in_background()) — `open -a SonoScript --args --browser-launch` forwards this into
-# sys.argv exactly like any other command-line launch. `open -g` (also used there) only stops
-# macOS/Launch Services from ACTIVATING the app; it can't reach into the app to stop it from
-# showing its own window, which is what checking this flag in build_window() actually does.
-BROWSER_LAUNCH = "--browser-launch" in sys.argv
+APP_VERSION = "1.13.1"
+APP_BUILD = "49"
+
+
+def _consume_pending_browser_launch_marker():
+    # native_host.py writes this file (same directory as the bridge token) right before
+    # launching the app on the extension's behalf, then launches via plain `open -g` with no
+    # special arguments — see that file's own _launch_in_background() for why an earlier version
+    # tried to signal this via a --browser-launch argv flag instead, and why that was replaced:
+    # confirmed via real testing that `open --args` wasn't reliably reaching sys.argv in the
+    # packaged app. A file this process directly controls the writing of has none of that
+    # forwarding uncertainty. Removed (not just checked) here, so this only ever affects the ONE
+    # real launch it was written for — a later normal double-click launch must not still find a
+    # stale marker from some earlier browser-triggered one and wrongly suppress its window too.
+    marker_path = os.path.expanduser(
+        "~/Library/Application Support/SonoScript/pending_browser_launch")
+    try:
+        os.remove(marker_path)
+        return True
+    except OSError:
+        return False
+
+
+# True only for the one launch native_host.py triggered on the browser extension's behalf —
+# checked in build_window() to skip showing the main window at all for that launch specifically.
+# The `--browser-launch` argv check is kept alongside the marker file as a harmless fallback
+# (e.g. manually testing via `python3 main.py --browser-launch`), not because the marker file
+# needs the help.
+BROWSER_LAUNCH = _consume_pending_browser_launch_marker() or "--browser-launch" in sys.argv
 GITHUB_REPO = "Redcupss/sonoscript"
 GITHUB_URL = "https://github.com/Redcupss"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -509,6 +530,7 @@ class AppDelegate(NSObject):
                 self._handleBrowserReadRequest, self._handleControlCommand)
         except OSError:
             traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, app):
         # Standard Mac app lifecycle: closing the window is not the same as quitting. Staying

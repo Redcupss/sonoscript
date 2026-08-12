@@ -179,8 +179,31 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
             self._control_conns.add(conn)
 
     def remove_control_connection(self, conn):
+        # The stop must fire from INSIDE the same lock the empty-check runs under, not after
+        # releasing it — confirmed via review this was a real race otherwise: a concurrent
+        # add_control_connection() from a second tab's toolbar (e.g. duplicating a tab, or one
+        # tab closing just as another with the same article opens) could slip in between a
+        # released lock and this call, leaving a live connection that still gets spuriously
+        # stopped by a now-stale "empty" snapshot. Safe to call on_control() while holding the
+        # lock: it dispatches into main.py via performSelectorOnMainThread_withObject_waitUntilDone_
+        # with waitUntilDone=False, which is non-blocking and returns immediately — no deadlock.
         with self._control_lock:
             self._control_conns.discard(conn)
+            now_empty = len(self._control_conns) == 0
+            if now_empty:
+                # The toolbar is the only control surface a browser-triggered read has. If its
+                # connection just dropped — closed tab, navigated away, page reload — and no OTHER
+                # toolbar is still watching this same session (see the class docstring above for
+                # why multiple simultaneously-open toolbars are a real, intended case), there's no
+                # way left to pause or stop playback at all: it would just keep reading
+                # indefinitely with nothing able to reach it. Confirmed directly this was a real
+                # problem, not a hypothetical one — reported after navigating away mid-playback
+                # left it running with no control surface anywhere. toolbar.js's own close (×)
+                # button already sends this same {cmd: "stop"} explicitly before it closes its
+                # connection; this covers every OTHER way the connection can end, where that
+                # explicit send never gets the chance to run because the page itself is already
+                # gone.
+                self.on_control({"cmd": "stop"})
 
     def broadcast_state(self, payload):
         """Best-effort push to every currently-connected control client — a silent no-op if

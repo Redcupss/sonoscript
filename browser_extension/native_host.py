@@ -33,6 +33,15 @@ TOKEN_PATH = os.path.expanduser("~/Library/Application Support/SonoScript/bridge
 # be recoverable on a later request rather than wedged forever.
 LAUNCH_MARKER_PATH = os.path.expanduser("~/Library/Application Support/SonoScript/launching")
 LAUNCH_MARKER_MAX_AGE_SECONDS = 25
+# main.py deletes this on startup to learn "this launch came from the browser extension, stay
+# invisible" — see the long comment on _launch_in_background() for why this replaced an argv
+# flag. Same directory as the other marker files above, kept separate from LAUNCH_MARKER_PATH
+# since that one is scoped to THIS host's own dedup logic and gets checked/written on every
+# call, while this one is scoped to a single real launch and only main.py ever touches it after
+# it's written here.
+PENDING_BROWSER_LAUNCH_PATH = os.path.expanduser(
+    "~/Library/Application Support/SonoScript/pending_browser_launch"
+)
 # Must match browser_bridge.py's own PORT constant — this file can't import that module
 # directly without pulling in the app's full dependency stack just to read one integer.
 BRIDGE_PORT = 51823
@@ -108,29 +117,50 @@ def _find_app_binary():
 
 
 def _launch_in_background():
-    # Launching the real executable directly (bypassing `open`/Launch Services entirely) gives
-    # guaranteed, unambiguous control over argv — confirmed directly that going through `open -a
-    # SonoScript --args --browser-launch` was NOT reliably reaching sys.argv in the packaged
-    # app (real user testing: the window still appeared and stole focus). A plain fork+exec like
-    # this doesn't get the "activate/focus me" treatment a Launch-Services-mediated launch can,
-    # which is what's actually wanted here anyway — main.py's own BROWSER_LAUNCH check (gated on
-    # this exact argv flag) is what stops it from calling activateIgnoringOtherApps_/
-    # orderFront_ once it's running, not anything about how the process was spawned.
-    binary_path = _find_app_binary()
+    # Second design here, not the first — the first launched the resolved binary directly via
+    # subprocess.Popen, bypassing `open`/Launch Services entirely, specifically to get
+    # unambiguous argv delivery after `open -a SonoScript --args --browser-launch` turned out
+    # NOT to reliably reach sys.argv in the packaged app (confirmed via real user testing: the
+    # window still stole focus). That traded one real bug for another, also confirmed via real
+    # testing: launched that way, the app crashed on a Gatekeeper block on a temp .dylib
+    # (llvmlite, extracted fresh on every launch) that a normal launch doesn't hit. The likely
+    # reason: `open`/Launch Services gives a launched app a clean, standard user-session
+    # environment: this file inherits whatever Chrome hands ITS OWN native-messaging host
+    # process, and a subprocess launched directly from that inherits the same — plausibly a
+    # different TMPDIR (or similar) that a Gatekeeper-relevant extraction lands somewhere it
+    # otherwise wouldn't.
+    #
+    # Fixed by going back to `open` for the environment, but replacing the unreliable --args
+    # flag with a marker file instead: this host writes PENDING_BROWSER_LAUNCH_PATH before
+    # launching, and main.py deletes it (not just checks it — see the comment there) at startup
+    # to learn this launch came from the browser extension. A file this host directly controls
+    # the writing of has none of argv's forwarding uncertainty through Launch Services and a
+    # frozen py2app bundle.
     try:
-        if binary_path:
+        os.makedirs(os.path.dirname(PENDING_BROWSER_LAUNCH_PATH), exist_ok=True)
+        with open(PENDING_BROWSER_LAUNCH_PATH, "w"):
+            pass
+    except OSError:
+        pass  # worst case main.py shows its window on this launch — not silently broken either way
+
+    bundle_path = None
+    binary_path = _find_app_binary()
+    if binary_path:
+        # Contents/MacOS/SonoScript -> the .app bundle two directories up.
+        bundle_path = os.path.dirname(os.path.dirname(os.path.dirname(binary_path)))
+    try:
+        if bundle_path:
             subprocess.Popen(
-                [binary_path, "--browser-launch"],
+                ["open", "-g", bundle_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True,
             )
         else:
             # Best-effort fallback if Launch Services couldn't resolve the app by name for some
-            # reason — less certain to correctly deliver --browser-launch, but better than
-            # nothing.
+            # reason — the exact same `open -a NAME` path, just without a resolved bundle path
+            # to hand it directly.
             subprocess.Popen(
-                ["open", "-g", "-a", APP_NAME, "--args", "--browser-launch"],
+                ["open", "-g", "-a", APP_NAME],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

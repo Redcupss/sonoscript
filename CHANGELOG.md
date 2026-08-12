@@ -4,6 +4,34 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.13.1] (build 49) — 2026-08-11
+
+### Fixed
+- **Auto-launch: a Gatekeeper block and a launch-error dialog on cold start.** The previous fix
+  for the auto-launched app stealing focus (launching the app binary directly via `subprocess`
+  instead of through `open`) traded one bug for another: bypassing Launch Services meant the
+  launched app inherited the native-messaging host's own restricted process environment instead
+  of a normal user-session one, which could cause a Gatekeeper block on a temp-extracted shared
+  library the app JIT-loads on every launch. Fixed by going back to `open -g` for the launch
+  itself (restoring a normal environment) while replacing the unreliable `--args` argv signaling
+  with a marker file the native host writes and the app consumes on startup — same "stay silent,
+  don't steal focus" behavior, without the environment problem.
+- **Orphaned playback with no way to stop it.** Navigating away from a page destroyed its
+  toolbar (and the toolbar's only control connection) without stopping playback, leaving audio
+  running indefinitely with no control surface reachable anywhere. The local bridge now stops
+  playback automatically when the last connected toolbar disconnects — scoped correctly so it
+  never fires while another toolbar (e.g. in a different tab) is still legitimately watching the
+  same session.
+- **Playback toolbar sometimes missing after a successful read request.** A subsequent read could
+  start audio with no toolbar appearing and no visible error. The toolbar's in-page injection now
+  retries a few times before giving up, covering a transient timing gap right after a page
+  navigation.
+- **Wrong content read aloud on rankings/hub-style pages.** On pages that are mostly link/card
+  grids rather than a normal article (e.g. an awards-list landing page), automatic whole-page
+  extraction could pick a page-footer methodology/credits section instead of the real page intro,
+  since that boilerplate was often the single densest block of text on the page. Sections headed
+  by "Methodology" or "Credits" are now excluded before content detection runs.
+
 ## [1.13.0] (build 48) — 2026-08-11
 
 ### Added

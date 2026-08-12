@@ -65,6 +65,45 @@ async function extractPageContent(tabId) {
       // cleanly: images can't be read aloud anyway, and a caption/credit is supplementary, not
       // core content. Verified this doesn't remove real article text on the same test page.
       clone.querySelectorAll("figure").forEach((el) => el.remove());
+
+      // Confirmed directly against a real page (Forbes' "50 Over 50" rankings hub) that
+      // Readability can pick an entirely wrong section as "the article" on hub/landing-style
+      // pages: the real content there is mostly name/category cards with almost no body prose,
+      // while a page-footer "Methodology" section was one dense, eleven-sentence paragraph — by
+      // a wide margin the single densest block of text anywhere on the page (the real intro was
+      // two sentences; "Related Coverage" and the category tiles carry no paragraph text at
+      // all). Readability's scoring selects for exactly that density, so it grabbed Methodology
+      // (and the adjacent Credits block, similarly text-heavy in places) over the real intro.
+      // Stripping any section headed by these exact labels before Readability ever scores the
+      // page removes the false-positive candidate outright — same technique the <figure>
+      // stripping above uses for a different false positive. Scoped to each heading's own
+      // immediate parent (nextSibling only ever walks within one parent's child list), so this
+      // can't reach into and remove unrelated content elsewhere on the page — and bounded to stop
+      // at the very next heading element, so it only ever removes the ONE matched section, not
+      // every section that happens to follow it. Confirmed via review this boundary check is
+      // required, not optional: on a flat layout where sections are direct sibling headings under
+      // one wrapping container (a common CMS pattern — Introduction/Methodology/Results/
+      // Discussion as sibling <h2>s, not each wrapped in its own per-section <div>), walking to
+      // the end of the parent's children with no stop condition would delete every real section
+      // after Methodology too, and Readability would still return non-null/non-empty text (the
+      // untouched Introduction survives), so the failure would be silent — an article read back
+      // missing its entire second half with no error surfaced anywhere.
+      const BOILERPLATE_SECTION_HEADINGS = ["methodology", "credits"];
+      const HEADING_TAGS = new Set(["H1", "H2", "H3", "H4", "H5", "H6"]);
+      clone.querySelectorAll("h1, h2, h3, h4, h5, h6").forEach((heading) => {
+        const label = heading.textContent.trim().toLowerCase();
+        if (!BOILERPLATE_SECTION_HEADINGS.includes(label)) return;
+        let node = heading;
+        while (node) {
+          if (node !== heading && node.nodeType === Node.ELEMENT_NODE && HEADING_TAGS.has(node.tagName)) {
+            break; // the next section has started — stop before touching it
+          }
+          const next = node.nextSibling;
+          node.remove();
+          node = next;
+        }
+      });
+
       const article = new Readability(clone).parse();
       if (!article || !article.textContent || !article.textContent.trim()) {
         return null;
@@ -211,17 +250,35 @@ async function showToolbar(tabId, token) {
   // Same two-step "load the file, then call a function it defines" pattern extractPageContent
   // uses for Readability.js — keeps toolbar.js's own ~250 lines out of every call instead of
   // re-injecting them inline each time.
-  try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["liquidGL.js", "toolbar.js"] });
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (t, wsUrl) => window.__sonoscriptInitToolbar(t, wsUrl),
-      args: [token, CONTROL_WS_URL],
-    });
-  } catch (err) {
-    // Not fatal — playback already started via the /read POST above, this only affects the
-    // in-page controls. Fails on restricted pages (chrome://, the Web Store, etc.) where
-    // content-script injection is blocked outright, same limitation extractPageContent has.
-    console.error("SonoScript: couldn't show the playback toolbar on this page.", err);
+  //
+  // Retries a couple of times before giving up: confirmed in real testing that playback can
+  // start (the /read POST above already succeeded) with no toolbar ever appearing and nothing
+  // visible to the user explaining why — the only trace was a console.error in the service
+  // worker's own devtools, which nobody looks at during normal use. executeScript can genuinely
+  // fail transiently right after a navigation (the target frame isn't yet in a state that
+  // accepts injection) — a real, known Chrome timing gap, not something worth treating as fatal
+  // on the first attempt the way a permanently-restricted page (chrome://, the Web Store) is.
+  const MAX_ATTEMPTS = 3;
+  const RETRY_DELAY_MS = 400;
+  let lastErr = null;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["liquidGL.js", "toolbar.js"] });
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (t, wsUrl) => window.__sonoscriptInitToolbar(t, wsUrl),
+        args: [token, CONTROL_WS_URL],
+      });
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MAX_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      }
+    }
   }
+  // Not fatal even after every retry — playback already started via the /read POST above, this
+  // only affects the in-page controls. Genuinely un-injectable pages (chrome://, the Web Store,
+  // etc.) will always end up here, same limitation extractPageContent has.
+  console.error("SonoScript: couldn't show the playback toolbar on this page.", lastErr);
 }

@@ -23,8 +23,8 @@ selection aloud," SonoScript reads it. First real usage surfaced two real gaps i
   trigger real generation; the native host correctly implements the messaging protocol and
   returns the live, current token.
 
-**Auto-launch, shipped — and its first version had two real bugs, found by actually testing it in
-real Chrome rather than trusting the design.**
+**Auto-launch, shipped — three real bugs found by actually testing it in real Chrome rather than
+trusting the design, each one only surfacing once the previous fix was live.**
 
 SonoScript no longer has to already be running. `native_host.py` checks whether the local
 listener is actually accepting connections on its known port — not whether the token *file*
@@ -37,15 +37,13 @@ SonoScript --args --browser-launch`, relying on `main.py` checking `sys.argv` fo
 activating/focusing the newly launched app; it can't reach into the app to suppress its own
 window, so the whole scheme depended on `--args` reliably reaching `sys.argv` through Launch
 Services and a frozen py2app bundle — untested, and it turned out not to work reliably in
-practice. Fixed by launching the real binary directly instead of going through `open` at all:
+practice. First fix: launch the real binary directly instead of going through `open` at all —
 `native_host.py` resolves the app's actual installed path the same way Finder/Launch Services
 would (`osascript -e 'POSIX path of (path to application "SonoScript")'` — confirmed directly
 this ISN'T always `/Applications/SonoScript.app`; on the actual dev machine it's one directory
 deeper), then `subprocess.Popen([binary_path, "--browser-launch"], ...)`. A plain fork+exec
-delivers argv with zero ambiguity, and — usefully — doesn't get the "activate/focus me" treatment
-a Launch-Services-mediated launch can carry, which was never wanted here in the first place. A
-launch marker file (mtime-based staleness, ~25s) stops the several rapid retries below from each
-independently deciding "nothing's running yet" and triggering their own duplicate launch.
+delivers argv with zero ambiguity, and doesn't get the "activate/focus me" treatment a
+Launch-Services-mediated launch can carry. This traded one real bug for another — see Bug 3.
 
 *Bug 2 — the toolbar never appeared and the text never reached the app, even though the app
 itself visibly launched.* The first version had `native_host.py` block for up to 20s, polling
@@ -63,14 +61,39 @@ risks the worker being suspended before it ever fires. Every individual native-m
 trip is short either way; only the *overall* wait is long, and it now lives somewhere actually
 built to survive that.
 
+*Bug 3 — a Gatekeeper block and a py2app launch-error dialog, only after Bug 1's fix shipped.*
+Real testing surfaced macOS blocking a temp-extracted `llvmlite` `.dylib` ("Not Opened — Apple
+could not verify...") immediately followed by a py2app launch-error dialog — on a launch that
+never happens through a normal Finder/`open` path. Root cause: `subprocess.Popen` launching the
+binary directly (Bug 1's fix) bypasses Launch Services entirely, so the child process inherits
+`native_host.py`'s own environment — which is itself whatever restricted/unusual environment
+Chrome hands to its own native-messaging host child process — rather than the clean, standard
+user-session environment `open`/Launch Services normally sets up. `llvmlite` extracts a fresh
+temp shared library on every launch; a different or restricted `TMPDIR` in that inherited
+environment is the likely reason Gatekeeper flagged it here and not on a normal launch. Fixed by
+going back to `open -g` for the actual launch (correct environment restored), while replacing the
+unreliable `--args` argv signaling with a marker file instead: `native_host.py` writes
+`~/Library/Application Support/SonoScript/pending_browser_launch` immediately before launching,
+and `main.py` deletes (consumes) it at startup to learn "this launch came from the browser
+extension, stay invisible." A file `native_host.py` directly controls the writing of has none of
+argv's forwarding uncertainty through Launch Services and a frozen py2app bundle — this sidesteps
+the Bug 1 problem and the Bug 3 problem at the same time, with `open -g` never having been the
+actual source of either.
+
+A separate launch marker file (mtime-based staleness, ~25s) stops the several rapid retries above
+from each independently deciding "nothing's running yet" and triggering their own duplicate
+launch.
+
 Verified directly: real app-binary resolution against the actual installed app, the
 already-running fast path against the real running app (real token, milliseconds), the
 launching→retry→success and launching→timeout paths with simulated delayed startup, duplicate-launch
-prevention across rapid repeated calls, and the JS retry loop's four branches (immediate success,
+prevention across rapid repeated calls, the JS retry loop's four branches (immediate success,
 retry-through-launching, real error stops immediately, `lastError` stops immediately) against a
-mocked `chrome.runtime`. Not independently verified: the full path through a real right-click →
-real Chrome → real cold app launch → toolbar appearing, end to end in the actual browser — that
-needs a real click-test, which is outside what can be driven from here.
+mocked `chrome.runtime`, and — critically, after discovering mid-debug that testing had been
+running against a stale, unrebuilt `.app` bundle the whole time (py2app bundles `main.py` at
+build time; source edits don't reach an already-installed app until rebuilt) — the full real
+chain against a freshly rebuilt and reinstalled app: marker write → `open -g` → app launch →
+marker consumed by `main.py` → bridge starts → port live in ~3s → token returned in 2ms.
 
 ## Content-detection strategy (revised after first real use)
 
@@ -104,6 +127,20 @@ Revised plan:
      state. Since it can appear mid-article (truncation isn't safe there), stripped via an exact
      match on its known text instead of guessing at a DOM rule for something that may not always
      even be present.
+   - Readability picked the wrong section entirely on a hub/landing-style page (Forbes' "50 Over
+     50" rankings page), confirmed directly via real screenshots of the live page rather than
+     assumed from the extracted text alone: the page's actual intro was ~2 sentences, while a
+     page-footer "Methodology" section was one dense, eleven-sentence paragraph — by a wide
+     margin the single densest block of prose anywhere on the page (category tiles and the
+     "Related Coverage" module carry no paragraph text at all, just headline links). Readability
+     scores candidate containers by text density, so it selected Methodology (and the adjacent,
+     similarly text-heavy Credits block) over the real, much shorter intro. Fixed by stripping any
+     section headed by the exact text "Methodology" or "Credits" before Readability ever scores
+     the page, the same technique as the `<figure>` fix above applied to a different false
+     positive. Known tradeoff, accepted deliberately: a genuine article with a real subsection
+     literally headed by just that one word would lose that subsection too — worse than not
+     touching it, but strictly better than the pre-fix failure mode of confidently reading back
+     page-footer boilerplate as if it were the article.
    
    Honest limitation of how this was tested: a plain static HTML fetch (via `curl`) cannot see
    content injected by the page's own JavaScript after load — both the related-articles block
@@ -172,6 +209,32 @@ Live on-page word/phrase highlighting (matching a spoken word back to its exact 
 LIVE page DOM, not just inside the toolbar) is deliberately not in v1 — a harder problem than the
 transport (Readability's extracted text doesn't map 1:1 onto the live page's scattered text
 nodes) — and is the next real piece of this section's original scope once picked back up.
+
+**Two more real bugs found from live multi-page browsing, not single-page testing.** Both only
+surfaced once a user actually navigated across several pages in one session — the original v1
+testing was all single-page.
+
+*Orphaned playback, no way to stop it.* Navigating away from a page destroys its toolbar and the
+toolbar's control WebSocket along with it — but nothing told SonoScript to stop, since the
+toolbar's own close (×) button was the only thing that ever sent `{cmd: "stop"}`. Confirmed
+directly: playback kept running indefinitely with zero control surface reachable anywhere.
+`browser_bridge.py`'s connection tracking already used a `set()` for control connections
+specifically because multiple simultaneously-open toolbars (e.g. across tabs) are meant to share
+one playback session, not race to own it — so the fix has to trigger only when the *last*
+connection drops, not any single one. `remove_control_connection` now checks, immediately after
+discarding a connection, whether the set is empty; if so, it fires the same `{cmd: "stop"}` the
+close button already sends, covering every other way the connection can end (closed tab,
+navigation, reload) where that explicit send never gets the chance to run.
+
+*Toolbar missing on a later read, despite the read itself succeeding.* Confirmed in the same
+session: a subsequent "Read this page aloud" on a different page started audio (the POST /read
+succeeded) with no toolbar appearing at all, and no visible error anywhere a user would see one —
+`showToolbar`'s failure path only ever logged to the invisible service-worker devtools console.
+The likely cause: `chrome.scripting.executeScript` can transiently fail right after a navigation,
+before the target frame is actually ready to accept injection — a real, known Chrome timing gap,
+not treated here as fatal on the first attempt the way a genuinely restricted page (`chrome://`,
+the Web Store) still is. `showToolbar` now retries its injection up to 3 times (400ms apart)
+before giving up.
 
 ### Toolbar visual treatment: real "Liquid Glass" — shipped
 
