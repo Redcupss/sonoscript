@@ -4,6 +4,34 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.13.4] (build 52) — 2026-08-12
+
+Browser extension only — no `.app` rebuild needed for this release, since nothing outside
+`browser_extension/` changed.
+
+### Fixed
+- **Toolbar left a stray element behind on close.** liquidGL's shadow effect appends a separate
+  DOM element straight to the page body (a WebGL canvas can't easily fake a soft CSS box-shadow
+  itself), and neither the library's own teardown nor the SonoScript patch on top of it ever
+  removed it — closing the toolbar left an empty, shadowed rounded rectangle behind on the real
+  page. Fixed at the source in the vendored `liquidGL.js`, verified against the library's own
+  (already-correct) disable-shadow logic rather than writing new cleanup from scratch.
+- **Adaptive text color ignored the gray tint overlay sitting on top of the glass.** The
+  light/dark text logic only ever sampled the raw WebGL canvas, so turning the tint up toward
+  solid never registered — text stayed dark even once the visible backdrop underneath it was
+  fully dark. Now blends the tint's own live color and opacity into the sampled luminance using
+  real alpha-compositing math, and forces light text outright once tint opacity reaches 0.3,
+  since the blend alone doesn't reliably cross the legibility threshold at any single opacity
+  value (that depends on how bright the page underneath happens to be too).
+
+### Changed
+- Second round of real toolbar tuning, replacing the original v1.13.0 glass defaults: less
+  aberration, a touch of real refraction back in, more blur instead, and the gray tint off
+  entirely by default. Previous defaults kept, not lost — see the "Liquid Glass — Saved Configs"
+  note.
+- Gray tint's base color darkened; refraction slider's tuning-panel range narrowed for finer
+  control at the toolbar's small size; scrubber track made more solid.
+
 ## [1.13.3] (build 51) — 2026-08-11
 
 ### Fixed

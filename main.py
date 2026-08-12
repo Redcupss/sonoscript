@@ -52,8 +52,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.13.3"
-APP_BUILD = "51"
+APP_VERSION = "1.13.4"
+APP_BUILD = "52"
 
 
 def _consume_pending_browser_launch_marker():

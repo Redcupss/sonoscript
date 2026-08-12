@@ -4144,6 +4144,15 @@
       }
       this._unbindTiltHandlers();
       this._destroyMirrorCanvas();
+      // SonoScript patch: setShadow(true) appends a separate _shadowEl straight to
+      // document.body (a WebGL canvas can't easily fake a soft CSS box-shadow itself, so this
+      // library uses a plain sibling <div> positioned to match instead) — confirmed directly
+      // that closing the toolbar left this element behind on the real page as an empty white
+      // rounded rectangle with a shadow, since neither destroy() nor removeLens() below ever
+      // touched it. setShadow(false) already contains the exact correct teardown for this element
+      // (removes its resize listener, removes it from the DOM, resets el's own box-shadow) — it
+      // was just never called from here.
+      if (this.options.shadow) this.setShadow(false);
       this.renderer.removeLens(this);
     }
   }

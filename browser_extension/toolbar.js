@@ -74,7 +74,7 @@
     // card" look liquidGL has no option for at all. Read/written directly off the tint element,
     // not lens.options — this one really is a plain CSS layer, not a shader parameter.
     const overlayFields = [
-      { key: "tintOpacity", label: "Gray tint opacity", min: 0, max: 1, step: 0.01, value: 0.08 },
+      { key: "tintOpacity", label: "Gray tint opacity", min: 0, max: 1, step: 0.01, value: 0 },
     ];
 
     let html = `<div style="font-weight:600; margin-bottom:8px;">Glass tuning (temp)</div>`;
@@ -120,7 +120,7 @@
     // Apply the tint's starting value to the actual element — the slider above only seeds its
     // own displayed value/position from the same number, it doesn't independently set anything,
     // so without this the tint would stay invisible until the user first touches the slider.
-    overlay.tintEl.style.background = `rgba(128,128,128,${overlayFields[0].value})`;
+    overlay.tintEl.style.background = `rgba(30,30,30,${overlayFields[0].value})`;
 
     panel.querySelectorAll('input[type="range"][data-key]').forEach((input) => {
       input.addEventListener("input", () => {
@@ -136,7 +136,7 @@
         const value = parseFloat(input.value);
         panel.querySelector(`[data-readout="${key}"]`).textContent = value;
         if (key === "tintOpacity") {
-          overlay.tintEl.style.background = `rgba(128,128,128,${value})`;
+          overlay.tintEl.style.background = `rgba(30,30,30,${value})`;
         }
       });
     });
@@ -202,6 +202,7 @@
     const LIGHT = [245, 245, 247];
     const THRESHOLD = 130;
     const HYSTERESIS = 6; // +/- luminance units around THRESHOLD before actually flipping state
+    const TINT_ALPHA_FORCE_LIGHT = 0.3; // tint opacity at/above which text always goes light
     let isDark = false; // "backdrop is bright enough that we're currently showing DARK text"
     const SAMPLE_MS = 200;
     const SWATCH = 8; // sample size is irrelevant beyond a few px — we only want an average
@@ -209,6 +210,24 @@
     let lastSample = 0;
     let rafId = requestAnimationFrame(tick);
     let taintedCanvasStopped = false;
+    const tintEl = bar.querySelector(".sono-tint");
+
+    // .sono-tint sits ON TOP of the glass canvas in the real DOM composite (see its own CSS
+    // comment) — sampling the canvas alone ignores it, so a fully-opaque dark tint (turned all
+    // the way up in the tuning panel) never gets accounted for: text stays picked for the
+    // UNTINTED glass underneath even though the tint has visually darkened everything on top of
+    // it. Reads the tint's own COMPUTED style rather than tracking a separate JS variable, so
+    // this can't drift out of sync with whatever the tint is actually set to right now, whether
+    // that's the CSS default or a live tuning-panel slider.
+    function tintLuminanceAndAlpha() {
+      if (!tintEl) return [0, 0];
+      const computed = getComputedStyle(tintEl).backgroundColor;
+      const match = /rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)/.exec(computed);
+      if (!match) return [0, 0];
+      const [, r, g, b, a] = match;
+      const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+      return [luminance, a !== undefined ? parseFloat(a) : 1];
+    }
 
     function tick(ts) {
       rafId = requestAnimationFrame(tick);
@@ -246,13 +265,29 @@
           count++;
         }
         if (count === 0) return;
-        const luminance = total / count;
-        // Bright backdrop -> DARK text, dark backdrop -> LIGHT text. Hysteresis only shifts WHEN
-        // the flip happens, not what it flips between — DARK requires clearing THRESHOLD +
-        // HYSTERESIS, switching back to LIGHT requires dropping below THRESHOLD - HYSTERESIS, so a
-        // value hovering right at 130 doesn't rapidly toggle back and forth every tick.
-        if (!isDark && luminance > THRESHOLD + HYSTERESIS) isDark = true;
-        else if (isDark && luminance < THRESHOLD - HYSTERESIS) isDark = false;
+        const canvasLuminance = total / count;
+        const [tintLuminance, tintAlpha] = tintLuminanceAndAlpha();
+        // Standard "over" alpha compositing — the same math the browser itself uses to actually
+        // paint the tint on top of the canvas, so this reads what's REALLY visible rather than
+        // just the untinted glass underneath it.
+        const luminance = canvasLuminance * (1 - tintAlpha) + tintLuminance * tintAlpha;
+        if (tintAlpha >= TINT_ALPHA_FORCE_LIGHT) {
+          // The blend above alone doesn't guarantee white text at any fixed opacity — how dark
+          // the RESULT reads still depends on how bright the page underneath happens to be (a
+          // near-white page needs roughly 0.58 tint opacity before the blended luminance alone
+          // crosses the threshold, confirmed by working the compositing formula backwards). Past
+          // this opacity the tint itself is dark enough that text should just always go light,
+          // independent of whatever's under the glass.
+          isDark = false;
+        } else if (!isDark && luminance > THRESHOLD + HYSTERESIS) {
+          // Bright backdrop -> DARK text, dark backdrop -> LIGHT text. Hysteresis only shifts WHEN
+          // the flip happens, not what it flips between — DARK requires clearing THRESHOLD +
+          // HYSTERESIS, switching back to LIGHT requires dropping below THRESHOLD - HYSTERESIS, so
+          // a value hovering right at 130 doesn't rapidly toggle back and forth every tick.
+          isDark = true;
+        } else if (isDark && luminance < THRESHOLD - HYSTERESIS) {
+          isDark = false;
+        }
         const [r, g, b] = isDark ? DARK : LIGHT;
         bar.style.setProperty("--sono-fg", `${r},${g},${b}`);
       } catch (err) {
@@ -333,8 +368,9 @@
       /* Baked in directly rather than left at 0 and relying on buildTuningPanel to apply it —
          that only runs when SONOSCRIPT_GLASS_TUNING is true, and it's false by default now, so a
          CSS-only default here is what actually ships when the panel is off. Keep this in sync
-         with overlayFields' tintOpacity value above if the panel gets re-enabled later. */
-      background: rgba(128, 128, 128, 0.08);
+         with overlayFields' tintOpacity value and the rgba() literal in buildTuningPanel above
+         if either changes later. */
+      background: rgba(30, 30, 30, 0);
     }
     /* DOM order alone (prepended first) turned out NOT to be enough to keep the real controls
        crisp when this was still paired with a blur layer — confirmed directly with a live A/B
@@ -400,11 +436,11 @@
       /* Reads --sono-fg same as the text/icons — this was missed entirely in the first adaptive
          pass (only text/icon .color was wired up), confirmed directly: over a light backdrop the
          scrubber stayed a fixed white-based translucent fill and didn't react at all. */
-      background: rgba(var(--sono-fg), 0.16);
+      background: rgba(var(--sono-fg), 0.31);
       transition: background-color 0.15s ease; /* ScrubberView: track brightens on hover/drag */
     }
     .scrubber-wrap.hovering .scrubber-track, .scrubber-wrap.dragging .scrubber-track {
-      background: rgba(var(--sono-fg), 0.26);
+      background: rgba(var(--sono-fg), 0.41);
     }
     .scrubber-fill { position: absolute; left: 0; height: 4px; border-radius: 999px; background: rgba(var(--sono-fg), 0.62); width: 0; }
     .scrubber-thumb {
@@ -587,17 +623,22 @@
       // not a guess — bevelWidth in particular: it's a fraction of min(width, height) (confirmed
       // directly in liquidGL.js's own shader code), and this bar is ~628px wide but only ~50-64px
       // tall, so a "normal"-looking bevelWidth for a squarer element ate 30-55% of the bar's
-      // total height. 0.335 here looks right specifically because bevelDepth is also nearly zero
+      // total height. 0.309 here looks right specifically because bevelDepth is also nearly zero
       // (0.001) — the two trade off against each other, so don't tune one without the other.
+      // Second real round of tuning (2026-08-11), replacing the original v1.13.0 defaults —
+      // refraction brought back up slightly from 0 to a near-zero 0.0015, aberration down to
+      // 0.08 (was 0.19), leaning more on ourFrost for the blur instead (3.4, was 1.2). The
+      // previous defaults are saved, not lost, in the "Liquid Glass — Saved Configs" Obsidian
+      // note in case they're worth returning to.
       glassLens = window.liquidGL({
         target: bar, // an Element, not a selector string — see liquidGL.js's own patch notes
         snapshot: "body",
-        refraction: 0,
-        aberration: 0.19,
+        refraction: 0.0015,
+        aberration: 0.08,
         bevelDepth: 0.001,
-        bevelWidth: 0.335,
+        bevelWidth: 0.309,
         frost: 0,
-        ourFrost: 1.2, // not a real liquidGL option — see the sampleOurBlur() patch in liquidGL.js
+        ourFrost: 3.4, // not a real liquidGL option — see the sampleOurBlur() patch in liquidGL.js
         shadow: true,
         specular: true,
         tilt: false,
