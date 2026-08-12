@@ -95,6 +95,21 @@ build time; source edits don't reach an already-installed app until rebuilt) —
 chain against a freshly rebuilt and reinstalled app: marker write → `open -g` → app launch →
 marker consumed by `main.py` → bridge starts → port live in ~3s → token returned in 2ms.
 
+*Bug 4 — the window still appeared on a genuine cold-launch, despite the above all checking out.*
+Real testing surfaced the window showing again even with the marker mechanism itself confirmed
+working in isolation. Root cause: both `native_host.py` and `main.py` resolved the marker file's
+path via `os.path.expanduser("~/...")`, which depends on the `HOME` environment variable —
+and `native_host.py` is spawned by Chrome with a different, more restricted environment than
+`main.py` gets from a normal Launch-Services launch (already the confirmed source of Bug 3's
+Gatekeeper failure). If `HOME` ever differed between the two rather than just being unset (where
+`expanduser`'s own fallback to the OS user database would still cover it), the two processes
+could silently compute two different paths and never find each other, with no error raised on
+either side. Fixed by having both sides resolve the real home directory via
+`pwd.getpwuid(os.getuid()).pw_dir` instead — the OS user database directly, bypassing environment
+variables entirely. Verified end-to-end afterward with the same live-process test used for Bug
+3's fix: marker written → `open -g` → app launch → marker consumed → zero windows → frontmost
+app unchanged → bridge port live.
+
 ## Content-detection strategy (revised after first real use)
 
 Original plan (manual text selection) works mechanically but fails the actual usability goal:
@@ -128,19 +143,38 @@ Revised plan:
      match on its known text instead of guessing at a DOM rule for something that may not always
      even be present.
    - Readability picked the wrong section entirely on a hub/landing-style page (Forbes' "50 Over
-     50" rankings page), confirmed directly via real screenshots of the live page rather than
-     assumed from the extracted text alone: the page's actual intro was ~2 sentences, while a
-     page-footer "Methodology" section was one dense, eleven-sentence paragraph — by a wide
-     margin the single densest block of prose anywhere on the page (category tiles and the
-     "Related Coverage" module carry no paragraph text at all, just headline links). Readability
-     scores candidate containers by text density, so it selected Methodology (and the adjacent,
-     similarly text-heavy Credits block) over the real, much shorter intro. Fixed by stripping any
-     section headed by the exact text "Methodology" or "Credits" before Readability ever scores
-     the page, the same technique as the `<figure>` fix above applied to a different false
-     positive. Known tradeoff, accepted deliberately: a genuine article with a real subsection
-     literally headed by just that one word would lose that subsection too — worse than not
-     touching it, but strictly better than the pre-fix failure mode of confidently reading back
-     page-footer boilerplate as if it were the article.
+     50" rankings page): the page's actual intro was ~2 sentences, while a page-footer
+     "Methodology" section was one dense, eleven-sentence paragraph — by a wide margin the single
+     densest block of prose anywhere on the page (category tiles and the "Related Coverage"
+     module carry no paragraph text at all, just headline links). Readability scores candidate
+     containers by text density, so it selected Methodology (and the adjacent, similarly
+     text-heavy Credits block) over the real, much shorter intro.
+
+     Took three real rounds to actually fix, each verified (or disproven) against the real page
+     rather than assumed:
+     1. First attempt: strip a matched heading and every DOM sibling that follows it. Shipped,
+        then disproven by real testing — the wrong content still got read.
+     2. Second attempt, after a code review caught the first version could also over-delete real
+        content on a different DOM shape: bound that same sibling-walk to stop at the next
+        heading element. Still shipped without checking the *actual* Forbes DOM — confirmed
+        wrong again in real testing, still reading Credits.
+     3. Only after getting the real saved page HTML (not a screenshot) was the actual cause
+        clear: this is a React/CSS-Modules site, and it renders a section's heading and its real
+        content as SEPARATE SIBLING elements under one shared wrapper —
+        `<section><div class="Title..."><h2>credits</h2></div><div class="RowContainer...">
+        ...the real rows...</div></section>` — not a heading directly followed by its own
+        content. Walking the heading's own siblings only ever found the empty title wrapper; the
+        real content one level over was never touched. Fixed by removing the nearest ancestor
+        `<section>` instead (HTML5's own semantic section boundary, independent of any specific
+        site's component/class structure) — falls back to the immediate parent when no
+        `<section>` ancestor exists. Verified end-to-end this time: ran the actual vendored
+        Readability.js against the real saved page's HTML (via jsdom) and confirmed the output is
+        the real intro paragraph, not Credits or Methodology, before shipping.
+
+     Known tradeoff, accepted deliberately: a genuine article with a real subsection literally
+     headed by just "Methodology" or "Credits" would lose that whole section — worse than not
+     touching it, but strictly better than the failure mode this replaces: confidently reading
+     back page-footer boilerplate as if it were the article.
    
    Honest limitation of how this was tested: a plain static HTML fetch (via `curl`) cannot see
    content injected by the page's own JavaScript after load — both the related-articles block

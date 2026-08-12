@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import pwd
 import queue
 import re
 import shlex
@@ -51,8 +52,8 @@ from widgets import (
 )
 
 APP_NAME = "SonoScript"
-APP_VERSION = "1.13.1"
-APP_BUILD = "49"
+APP_VERSION = "1.13.2"
+APP_BUILD = "50"
 
 
 def _consume_pending_browser_launch_marker():
@@ -65,8 +66,17 @@ def _consume_pending_browser_launch_marker():
     # forwarding uncertainty. Removed (not just checked) here, so this only ever affects the ONE
     # real launch it was written for — a later normal double-click launch must not still find a
     # stale marker from some earlier browser-triggered one and wrongly suppress its window too.
-    marker_path = os.path.expanduser(
-        "~/Library/Application Support/SonoScript/pending_browser_launch")
+    #
+    # Resolved via pwd.getpwuid() rather than os.path.expanduser("~"), matching native_host.py's
+    # own resolution exactly — that file is spawned by Chrome with a different, more restricted
+    # environment than this normally-launched app gets (already confirmed responsible for a real
+    # Gatekeeper failure earlier), so if HOME ever differed between the two processes rather than
+    # just being unset, expanduser's env-var-based resolution could silently compute two
+    # different paths here and there, and this process would never find a marker that was
+    # genuinely written. Both sides resolving home via the OS user database instead removes that
+    # possibility regardless of either process's actual environment.
+    home_dir = pwd.getpwuid(os.getuid()).pw_dir
+    marker_path = os.path.join(home_dir, "Library/Application Support/SonoScript/pending_browser_launch")
     try:
         os.remove(marker_path)
         return True

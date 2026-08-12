@@ -4,6 +4,28 @@ All notable changes to SonoScript are tracked here, newest first. Versioning
 follows [Semantic Versioning](https://semver.org) (MAJOR.MINOR.PATCH); the
 build number increments once per release regardless of version bump.
 
+## [1.13.2] (build 50) — 2026-08-11
+
+### Fixed
+- **Wrong content still read aloud on rankings/hub-style pages, even after the previous fix.**
+  The 1.13.1 fix (stripping a matched heading and its own following siblings) was verified
+  against the real, saved page and found to genuinely fail: modern component-based sites often
+  render a section's heading and its actual content as *separate sibling elements* under a
+  shared wrapper (a common React/CSS-Modules pattern), not as a heading followed directly by its
+  content. Walking the heading's own (empty) siblings only ever removed the heading itself,
+  leaving the real boilerplate content untouched one level over. Now removes the nearest
+  ancestor section instead, matching how the real page is actually structured — confirmed
+  end-to-end against the real page's saved HTML and this project's own vendored extraction
+  library, not inferred from a screenshot.
+- **Auto-launch silent-launch signal could be missed by the app.** The marker file the native
+  host writes and the app consumes to know "stay invisible" was resolved via the `HOME`
+  environment variable on both sides. Since the native host runs in a different, more
+  restricted process environment than the app itself (already the source of a previous
+  Gatekeeper issue), a divergent `HOME` between the two could in principle make them compute two
+  different file paths and never find each other. Both sides now resolve the real home directory
+  through the OS user database instead, which can't be affected by either process's environment
+  variables.
+
 ## [1.13.1] (build 49) — 2026-08-11
 
 ### Fixed

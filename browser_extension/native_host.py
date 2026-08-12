@@ -17,13 +17,26 @@ to ask again shortly rather than this process itself waiting around.
 """
 import json
 import os
+import pwd
 import socket
 import struct
 import subprocess
 import sys
 import time
 
-TOKEN_PATH = os.path.expanduser("~/Library/Application Support/SonoScript/bridge_token")
+# Resolves the real OS-registered home directory via the user database, bypassing the HOME
+# environment variable entirely. Confirmed elsewhere in this file (see _launch_in_background()'s
+# own comment) that Chrome hands this process a different, restricted environment than a normal
+# Launch-Services-launched app gets — that's what caused a real Gatekeeper failure earlier. If
+# HOME were ALSO different in that environment — not just unset, where os.path.expanduser's own
+# pwd-database fallback would already cover it, but set to something else — this file and main.py
+# (which DOES get a normal HOME, launched via Launch Services) could silently compute two
+# different marker-file paths and never find each other, with no error raised anywhere. Resolving
+# home the same OS-user-database way on both sides removes that possibility regardless of
+# whatever environment variables either process happens to be handed.
+_HOME = pwd.getpwuid(os.getuid()).pw_dir
+
+TOKEN_PATH = os.path.join(_HOME, "Library/Application Support/SonoScript/bridge_token")
 # A marker this host writes right before triggering a launch, so the NEXT short-lived retry
 # (a few hundred ms to a couple seconds later, chrome.runtime.sendNativeMessage spawns a fresh
 # process per call — there's no shared memory between one invocation of this script and the
@@ -31,7 +44,7 @@ TOKEN_PATH = os.path.expanduser("~/Library/Application Support/SonoScript/bridge
 # existence check isn't enough here either, same reasoning as TOKEN_PATH below — this one's
 # staleness is judged by mtime instead, since a truly stuck/failed launch attempt should still
 # be recoverable on a later request rather than wedged forever.
-LAUNCH_MARKER_PATH = os.path.expanduser("~/Library/Application Support/SonoScript/launching")
+LAUNCH_MARKER_PATH = os.path.join(_HOME, "Library/Application Support/SonoScript/launching")
 LAUNCH_MARKER_MAX_AGE_SECONDS = 25
 # main.py deletes this on startup to learn "this launch came from the browser extension, stay
 # invisible" — see the long comment on _launch_in_background() for why this replaced an argv
@@ -39,8 +52,8 @@ LAUNCH_MARKER_MAX_AGE_SECONDS = 25
 # since that one is scoped to THIS host's own dedup logic and gets checked/written on every
 # call, while this one is scoped to a single real launch and only main.py ever touches it after
 # it's written here.
-PENDING_BROWSER_LAUNCH_PATH = os.path.expanduser(
-    "~/Library/Application Support/SonoScript/pending_browser_launch"
+PENDING_BROWSER_LAUNCH_PATH = os.path.join(
+    _HOME, "Library/Application Support/SonoScript/pending_browser_launch"
 )
 # Must match browser_bridge.py's own PORT constant — this file can't import that module
 # directly without pulling in the app's full dependency stack just to read one integer.

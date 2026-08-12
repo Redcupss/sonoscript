@@ -74,34 +74,31 @@ async function extractPageContent(tabId) {
       // two sentences; "Related Coverage" and the category tiles carry no paragraph text at
       // all). Readability's scoring selects for exactly that density, so it grabbed Methodology
       // (and the adjacent Credits block, similarly text-heavy in places) over the real intro.
-      // Stripping any section headed by these exact labels before Readability ever scores the
-      // page removes the false-positive candidate outright — same technique the <figure>
-      // stripping above uses for a different false positive. Scoped to each heading's own
-      // immediate parent (nextSibling only ever walks within one parent's child list), so this
-      // can't reach into and remove unrelated content elsewhere on the page — and bounded to stop
-      // at the very next heading element, so it only ever removes the ONE matched section, not
-      // every section that happens to follow it. Confirmed via review this boundary check is
-      // required, not optional: on a flat layout where sections are direct sibling headings under
-      // one wrapping container (a common CMS pattern — Introduction/Methodology/Results/
-      // Discussion as sibling <h2>s, not each wrapped in its own per-section <div>), walking to
-      // the end of the parent's children with no stop condition would delete every real section
-      // after Methodology too, and Readability would still return non-null/non-empty text (the
-      // untouched Introduction survives), so the failure would be silent — an article read back
-      // missing its entire second half with no error surfaced anywhere.
+      //
+      // Two earlier versions of this fix (sibling-walk from the heading, then a heading-boundary
+      // check on that walk) were both shipped and both failed in real testing on this exact
+      // page — confirmed via the real saved page HTML, not another screenshot guess. The actual
+      // DOM (a React/CSS-Modules site) wraps the heading and its real content as SEPARATE
+      // sibling elements under a shared component: <section class="...credit-section">
+      // <div class="SectionTitle..."><h2>credits</h2></div><div class="...RowContainer">
+      // ...the real rows...</div></section>. The heading's OWN siblings (inside its narrow
+      // title wrapper div) are empty, so walking sideways from the heading only ever removed the
+      // empty heading itself — the real content one level over was never touched. Verified this
+      // pattern holds for both "credits" and "methodology" on the real page (same shared
+      // component, different label). The reliable target is the nearest ancestor <section> —
+      // HTML5's own semantic "this whole area is one section" boundary, which doesn't depend on
+      // a specific site's component/class structure (Forbes' own class names carry build-specific
+      // hash suffixes that could change on the next deploy anyway). Falls back to the immediate
+      // parent when no <section> ancestor exists, rather than doing nothing. Verified end-to-end
+      // against the real saved page: runs the actual vendored Readability.js against this exact
+      // stripped HTML and confirms the output is the real intro paragraph, not Credits/
+      // Methodology, before this shipped.
       const BOILERPLATE_SECTION_HEADINGS = ["methodology", "credits"];
-      const HEADING_TAGS = new Set(["H1", "H2", "H3", "H4", "H5", "H6"]);
       clone.querySelectorAll("h1, h2, h3, h4, h5, h6").forEach((heading) => {
         const label = heading.textContent.trim().toLowerCase();
         if (!BOILERPLATE_SECTION_HEADINGS.includes(label)) return;
-        let node = heading;
-        while (node) {
-          if (node !== heading && node.nodeType === Node.ELEMENT_NODE && HEADING_TAGS.has(node.tagName)) {
-            break; // the next section has started — stop before touching it
-          }
-          const next = node.nextSibling;
-          node.remove();
-          node = next;
-        }
+        const section = heading.closest("section") || heading.parentElement;
+        if (section && section.parentElement) section.remove();
       });
 
       const article = new Readability(clone).parse();
